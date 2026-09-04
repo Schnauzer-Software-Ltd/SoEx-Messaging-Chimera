@@ -318,18 +318,30 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// flight. Reading the counts where the row is written makes the answer the caller is given the one that
     /// was true when it was written.
     /// </remarks>
-    /// <returns>The row that was written, and what it was filed as — which is dead if a deferral did not fit.</returns>
-    internal async ValueTask<(long AsideId, SetAsideKind Kind)> SetAsideAsync(SetAsideKind kind, string topic,
+    /// <returns>
+    /// The row that was written and what it was filed as — which is dead if a deferral did not fit — or a
+    /// refusal, when what it would have been filed as is something this subscriber cannot keep.
+    /// </returns>
+    /// <remarks>
+    /// A refusal is returned rather than thrown from inside the write. The exception belongs to the caller
+    /// that caused it, and throwing here would roll the whole batch back: everyone else's work would fail
+    /// with somebody else's refusal, and a bound being reached is an ordinary thing that happens under load
+    /// rather than a fault. The decision is still made inside the transaction, against the set the row would
+    /// have joined.
+    /// </remarks>
+    internal async ValueTask<SetAsideOutcome> SetAsideAsync(SetAsideKind kind, string topic,
         EntrySource source, long id, string messageId, DateTimeOffset enqueuedAt, long attempts, string? reason,
         ReadOnlyMemory<byte> payload, SetAsidePolicy bounds, CancellationToken ct = default)
     {
         byte[] bytes = payload.ToArray();
         string origin = $"{source.ToString().ToLowerInvariant()}:{id}";
         SetAsideKind filedAs = kind;
+        bool refused = false;
 
         long asideId = await _writer.EnqueueAsync((connection, transaction) =>
         {
             filedAs = kind;
+            refused = false;
             string? why = reason;
 
             // Nothing is ever dropped to make room: a message that vanished because a bound was reached is
@@ -351,6 +363,18 @@ internal sealed class SubscriberStore : IAsyncDisposable
                     filedAs = SetAsideKind.Dead;
                     why = $"deferring would exceed the deferred byte bound ({maxBytes} bytes); filed dead";
                 }
+            }
+
+            // Filed dead and too big to be kept: this subscriber destroys the oldest to stay inside its byte
+            // bound, and a row larger than the whole bound is the oldest the moment it lands. Writing it and
+            // deleting it in the same breath would answer the caller with a settle that succeeded and a
+            // message that no longer exists.
+            if (filedAs == SetAsideKind.Dead
+                && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
+                && bounds.MaxDeadBytes is { } maxDead && bytes.Length > maxDead)
+            {
+                refused = true;
+                return 0;
             }
 
             long written;
@@ -388,7 +412,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return written;
         }, ct).ConfigureAwait(false);
 
-        return (asideId, filedAs);
+        return new SetAsideOutcome(asideId, filedAs, refused);
     }
 
     /// <summary>Lists what is set aside. Reads go through the writer, which keeps one connection per file.</summary>
@@ -943,6 +967,11 @@ internal readonly record struct Attachment(string Topic, string LogUuid, StartAt
 
 /// <summary>A subscriber's whole view of one topic at a moment in time.</summary>
 internal sealed record StoreSnapshot(long Mark, Dictionary<long, EntryState> Entries, List<string> SetAsideOrigins);
+
+/// <summary>What became of a row this subscriber tried to set aside.</summary>
+/// <param name="Refused">Nothing was written: what it would have been filed as is something this subscriber
+/// cannot keep, so the caller is told instead of being answered with a row that is already gone.</param>
+internal readonly record struct SetAsideOutcome(long AsideId, SetAsideKind Kind, bool Refused);
 
 /// <summary>What one subscriber has set aside: a count and a payload total for each of the two sets.</summary>
 internal readonly record struct SetAsideSizes(long Deferred, long Dead, long DeferredBytes, long DeadBytes);

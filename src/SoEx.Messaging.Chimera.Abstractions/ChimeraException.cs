@@ -88,13 +88,10 @@ public sealed class PayloadTooLargeException : ChimeraException
     public int Limit { get; }
 }
 
-/// <summary>Which bound on the dead-letter set was reached.</summary>
-public enum DeadLetterBound
+/// <summary>Which kind of limit a store reached: how many rows it holds, or how many bytes.</summary>
+public enum SizeBound
 {
-    /// <summary><see cref="SetAsidePolicy.MaxDeadCount"/>.</summary>
     Count = 0,
-
-    /// <summary><see cref="SetAsidePolicy.MaxDeadBytes"/>.</summary>
     Bytes = 1,
 }
 
@@ -106,7 +103,7 @@ public enum DeadLetterBound
 public sealed class SubscriberStoppedException : ChimeraException
 {
     public SubscriberStoppedException(string topic, string subscriber, long deadLetters, long deadBytes,
-        long limit, DeadLetterBound bound)
+        long limit, SizeBound bound)
         : base(Describe(topic, subscriber, deadLetters, deadBytes, limit, bound))
     {
         Topic = topic;
@@ -129,13 +126,87 @@ public sealed class SubscriberStoppedException : ChimeraException
     /// <summary>The limit that was reached, in the units of <see cref="Bound"/>.</summary>
     public long Limit { get; }
 
-    public DeadLetterBound Bound { get; }
+    public SizeBound Bound { get; }
 
     private static string Describe(string topic, string subscriber, long deadLetters, long deadBytes,
-        long limit, DeadLetterBound bound)
-        => bound == DeadLetterBound.Bytes
+        long limit, SizeBound bound)
+        => bound == SizeBound.Bytes
             ? $"Subscriber '{subscriber}' has stopped reading topic '{topic}': {deadBytes} bytes across " +
               $"{deadLetters} dead letters reaches the limit of {limit} bytes. Replay or discard them to continue."
             : $"Subscriber '{subscriber}' has stopped reading topic '{topic}': {deadLetters} dead letters " +
               $"reaches the limit of {limit}. Replay or discard them to continue.";
+}
+
+/// <summary>
+/// A dead letter could not be filed, because it could not then be kept. Only ever raised by a subscriber set
+/// to drop the oldest with a byte bound smaller than the message: the row would be destroyed as it arrived,
+/// and a settle that says a message is filed when it has just been destroyed is worse than a refusal.
+/// </summary>
+/// <remarks>
+/// The delivery is still outstanding, exactly as after any settle that threw. There are two ways on:
+/// complete it, which loses the message knowingly, or raise <see cref="SetAsidePolicy.MaxDeadBytes"/> above
+/// the topic's payload limit and settle it again. Trying the same settle again will be refused again — the
+/// bound cannot hold this message however many times it is asked.
+/// </remarks>
+public sealed class DeadLetterTooLargeException : ChimeraException
+{
+    public DeadLetterTooLargeException(string topic, string subscriber, int size, long limit)
+        : base($"Subscriber '{subscriber}' cannot file a {size}-byte dead letter on topic '{topic}': its " +
+               $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so the row " +
+               "would be destroyed as it arrived. Complete the delivery to lose the message deliberately, or " +
+               "raise MaxDeadBytes above the topic's payload limit.")
+    {
+        Topic = topic;
+        Subscriber = subscriber;
+        Size = size;
+        Limit = limit;
+    }
+
+    public string Topic { get; }
+    public string Subscriber { get; }
+    public int Size { get; }
+    public long Limit { get; }
+}
+
+/// <summary>
+/// A scheduled message was refused because the topic's scheduled table is at the bound the retention policy
+/// sets. Back-pressure at publish, because the alternative is not available here: a scheduled message is work
+/// somebody asked for at a time that has not arrived, and removing it to stay under a size bound would be
+/// cancelling the future rather than trimming history.
+/// </summary>
+/// <remarks>
+/// Service Bus does the same thing for the same reason — scheduled messages count against the entity quota
+/// and the send is refused. What clears it is the same as there: due times arriving and the messages being
+/// consumed, or cancelling ones that are no longer wanted.
+/// </remarks>
+public sealed class ScheduleRefusedException : ChimeraException
+{
+    public ScheduleRefusedException(string topic, long scheduled, long bytes, long limit, SizeBound bound)
+        : base(bound == SizeBound.Bytes
+            ? $"Topic '{topic}' holds {bytes} bytes of scheduled messages, which is its bound of {limit} " +
+              "bytes. Scheduled messages are not trimmed by retention, so the schedule is refused rather " +
+              "than accepted into a table nothing will empty."
+            : $"Topic '{topic}' holds {scheduled} scheduled message(s), which is its bound of {limit}. " +
+              "Scheduled messages are not trimmed by retention, so the schedule is refused rather than " +
+              "accepted into a table nothing will empty.")
+    {
+        Topic = topic;
+        Scheduled = scheduled;
+        Bytes = bytes;
+        Limit = limit;
+        Bound = bound;
+    }
+
+    public string Topic { get; }
+
+    /// <summary>Scheduled messages the topic holds.</summary>
+    public long Scheduled { get; }
+
+    /// <summary>Payload bytes they hold between them.</summary>
+    public long Bytes { get; }
+
+    /// <summary>The limit that was reached, in the units of <see cref="Bound"/>.</summary>
+    public long Limit { get; }
+
+    public SizeBound Bound { get; }
 }

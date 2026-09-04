@@ -54,13 +54,24 @@ retention removed the record while you were holding it, which is the one case no
 One subscriber reading several topics is one `SqliteSubscription` per topic, all sharing that subscriber's
 file and its set-aside store. Open them freely: they do not disturb each other's deliveries. Do not open two
 for the same subscriber and topic, though nothing stops you — that is two writers on one file, and the rule
-that there is only ever one is what removes the need for a lease or a visibility timeout anywhere here. A
+that there is only ever one is what removes the need for a lease or a visibility timeout anywhere here. It
+holds across processes as well as inside one: a publisher here and its subscribers over there is a supported
+shape, tested that way, because those are separate files with one writer each. Two processes on the *same*
+file is the thing to avoid, and what it costs when you do it is duplicate handling rather than damage —
+measured at around 210 deliveries for 200 messages, none lost. A
 root written two ways is one root: paths are resolved before they are compared, so `/var/events` and
 `/var/./events` are the same files to every part of this. Symbolic links are not resolved.
 
 Disposing a subscription that is still holding deliveries hands them back rather than stranding them. They go
 out again on the next read, counted as further attempts, which is what the process stopping would have done
 to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach.
+
+`ScheduleAsync` refuses rather than stores when the topic's scheduled table is at the bound its retention
+policy sets, throwing `ScheduleRefusedException`. `DeadLetterAsync` and `FailAsync` refuse in one narrow case
+too: a subscriber set to drop the oldest, with a dead-letter byte bound smaller than the message, cannot keep
+the row it is being asked to file, so it throws `DeadLetterTooLargeException` instead of filing and
+destroying it in the same breath. A settle that threw has settled nothing, so the delivery is still yours —
+complete it to lose the message knowingly, or raise the bound.
 
 `DeferredAsync` and `DeadLettersAsync` list what is set aside. `ReplayAsync(asideId)` makes one deliverable
 again from its own stored copy, so it works even after the log has dropped the original. `DiscardAsync`

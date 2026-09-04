@@ -8,11 +8,15 @@ you start with does not lose your messages the moment the process restarts.
 
 ## What it is for
 
-Use it while you have **one process on one machine, where the publisher and its subscribers stop
+Use it while you have **one machine, one writer per file, and a publisher and subscribers that stop
 and start together**. That is the whole boundary. Inside it, messages survive a crash, each
-subscriber keeps its own position, and nothing is lost quietly. Outside it — a second node, a
-second process that must keep running while the first is down, anything that has to scale
-horizontally — you want a real broker such as NATS or Azure Service Bus.
+subscriber keeps its own position, and nothing is lost quietly. Outside it — a second node,
+anything that has to scale horizontally — you want a real broker such as NATS or Azure Service Bus.
+
+Usually that means one process, and it is what the design is aimed at. It does not have to: a
+publisher in one process and its subscribers in another is a supported shape and is tested that
+way, because those are separate files with one writer each. Two processes writing the *same* file
+is the thing to avoid.
 
 Behaviour is deliberately held to what those brokers also do, so code written against this keeps
 working when you move to one.
@@ -50,7 +54,8 @@ system is running, without disturbing it.
 
 ## Limits, stated plainly
 
-- One writer per file, one machine. Not a network broker and not a cluster.
+- One writer per file, one machine. Processes may differ — a publisher here, its subscribers there — but two
+  writers on one file is a rule you are trusted to keep. Not a network broker and not a cluster.
 - The log is trimmed on retention, not on consumption. A subscriber that stops for longer than the
   retention window loses messages — it will tell you exactly how many, and it warns you before it
   happens, but it does not stop the publisher to save you.

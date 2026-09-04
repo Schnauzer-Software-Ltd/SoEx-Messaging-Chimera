@@ -57,8 +57,11 @@ public sealed record SetAsidePolicy
     /// grew past it unchecked, one payload at a time, while the option said it was bounded.
     /// <para>
     /// Under <see cref="DeadLetterOverflow.DropOldest"/> a single dead letter larger than this whole bound
-    /// cannot be kept: it is destroyed on arrival and counted in
-    /// <see cref="SetAsideReport.DeadDropped"/>. Size the bound above the topic's payload limit.
+    /// cannot be kept at all: it would be the oldest row the moment it landed. Filing one is refused with
+    /// <c>DeadLetterTooLargeException</c> rather than performed and undone, so the settle says what happened
+    /// instead of reporting a message as filed that no longer exists. Size the bound above the topic's
+    /// payload limit; under <see cref="DeadLetterOverflow.StopDelivering"/> nothing is destroyed and nothing
+    /// is refused.
     /// </para>
     /// </remarks>
     public long? MaxDeadBytes { get; init; } = 64L * 1024 * 1024;

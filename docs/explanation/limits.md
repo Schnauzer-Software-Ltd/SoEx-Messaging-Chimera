@@ -1,7 +1,16 @@
 # Limits, and how you find out
 
-This library works while you have one process on one machine, and the publisher and its subscribers stop and
-start together. Everything below follows from that, and nothing below is hidden.
+This library works while you have one machine and one writer per file, and the publisher and its subscribers
+stop and start together. Everything below follows from that, and nothing below is hidden.
+
+One writer per file is the constraint, not one process. A publisher in one process and its subscribers in
+another is a supported shape — separate files, one writer each — and there are tests that run it that way:
+a publisher writing five hundred messages from another process, subscribers in other processes reading them,
+and two subscribers in two processes both getting everything. What is not supported is two writers on one
+file, and that is a rule rather than something the library refuses. Measured, breaking it costs duplicate
+handling and not corruption: two processes on one subscriber file handled 200 messages in about 210
+deliveries, with none lost and the file readable afterwards. At-least-once already allows that, which is why
+it is a rule you can break and not notice.
 
 ## Messages can be removed before they are read
 
@@ -53,11 +62,19 @@ table, in due-time order, exactly as it keeps a position in the log.
 Three consequences worth knowing. A scheduled row occupies disk until retention removes it, which is
 `RetentionPolicy.MaxAge` measured from the due time, and never if you have set the policy to unbounded.
 
-`MaxBytes` and `MaxCount` do not touch these rows at all — they trim the log. That is deliberate: a scheduled
+`MaxBytes` and `MaxCount` never *remove* these rows — they trim the log. That is deliberate: a scheduled
 message is work somebody asked for at a time that has not arrived, and destroying it to stay under a size
-bound is not trimming history, it is cancelling the future. It does mean a byte bound is not a bound on the
-file. A publisher scheduling a long way ahead grows the scheduled table for as long as those due times are in
-front of it, and nothing here will stop it, so bound that where the messages are created.
+bound is not trimming history, it is cancelling the future. So the same two settings are answered at the
+other end instead. When the scheduled table is at the bound, `ScheduleAsync` throws
+`ScheduleRefusedException` and the message is not stored. Service Bus does exactly this — scheduled messages
+count against the entity quota and the send is refused — and it is the only answer that neither destroys
+work nor lets the table grow without limit.
+
+Two consequences. Ordinary appends are unaffected while schedules are being refused: the log answers those
+settings by trimming, as it always did, so a full scheduled table does not stop anything being published.
+And the file's ceiling is the two bounds added together rather than either one — the log held at its bound by
+trimming, the scheduled table at its bound by refusing. What clears a refusal is due times arriving and the
+messages being consumed, or cancelling ones nobody wants any more.
 
 And a due time already in the past means due now, and is stored as now: a row that arrived behind a position
 already passed would sit below it and never be offered. Service Bus reads a scheduled enqueue time that has

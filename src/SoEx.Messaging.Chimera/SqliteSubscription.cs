@@ -536,7 +536,12 @@ public sealed class SqliteSubscription : ISubscription
             // Already in this subscriber's store; it only changes what it is filed as. The bounds below are
             // not consulted, and that is the point: re-filing a row adds neither a row nor a byte, so a
             // message replayed and deferred again at the bound was being measured against itself and
-            // dead-lettered for a set that was not growing.
+            // dead-lettered for a set that was not growing. The one bound that still applies is the one this
+            // row cannot satisfy by staying where it is: a payload larger than the whole dead byte bound
+            // cannot be a dead letter here, wherever it is coming from.
+            if (kind == SetAsideKind.Dead)
+                EnsureKeepable(envelope.Payload.Length);
+
             await _store.SettleSetAsideAsync(envelope.Tag.Id, SetAsideDelivery.Held, ct).ConfigureAwait(false);
             if (kind == SetAsideKind.Dead)
                 await MakeDeadAsync(envelope.Tag.Id, reason ?? "dead-lettered", ct).ConfigureAwait(false);
@@ -546,13 +551,38 @@ public sealed class SqliteSubscription : ISubscription
         // The bounds go with the row rather than being checked here: two handlers deferring at once would
         // both read a set with room in it and both insert into it, and the bound the consumer configured
         // would hold only as long as nothing happened concurrently.
-        (_, SetAsideKind filed) = await _store.SetAsideAsync(kind, Topic, envelope.Tag.Source, envelope.Tag.Id,
+        SetAsideOutcome outcome = await _store.SetAsideAsync(kind, Topic, envelope.Tag.Source, envelope.Tag.Id,
             envelope.MessageId, envelope.EnqueuedAt, envelope.Attempt, reason, envelope.Payload,
             _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
 
-        if (filed == SetAsideKind.Dead)
+        // Refused inside the write, thrown out here: nothing was stored, so this settle has done nothing and
+        // the delivery is still the caller's, exactly as after any settle that threw.
+        if (outcome.Refused)
+            throw Unkeepable(envelope.Payload.Length);
+
+        if (outcome.Kind == SetAsideKind.Dead)
             await EnforceDeadBoundAsync(ct).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Refuses a dead letter this subscriber could not then keep. A byte bound smaller than the message, with
+    /// dropping the oldest to stay inside it, makes the row the oldest as it lands: filing it would destroy
+    /// it, and answering a settle with "filed" for a message that no longer exists is the sort of lie the
+    /// rest of this library goes to some length to avoid. The caller can complete the delivery instead and
+    /// lose the message knowingly, which is a decision rather than an accident.
+    /// </summary>
+    private void EnsureKeepable(int size)
+    {
+        SetAsidePolicy policy = _subscriptionOptions.SetAside;
+        if (policy.DeadOverflow == DeadLetterOverflow.DropOldest
+            && policy.MaxDeadBytes is { } maxDead && size > maxDead)
+        {
+            throw Unkeepable(size);
+        }
+    }
+
+    private DeadLetterTooLargeException Unkeepable(int size)
+        => new(Topic, Subscriber, size, _subscriptionOptions.SetAside.MaxDeadBytes ?? 0);
 
     /// <summary>
     /// Files a message already in this subscriber's store as dead, and holds the dead bound to it.
@@ -617,11 +647,11 @@ public sealed class SqliteSubscription : ISubscription
 
         if (policy.MaxDeadCount is { } count && size.Dead >= count)
             return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, count,
-                DeadLetterBound.Count);
+                SizeBound.Count);
 
         if (policy.MaxDeadBytes is { } bytes && size.DeadBytes >= bytes)
             return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, bytes,
-                DeadLetterBound.Bytes);
+                SizeBound.Bytes);
 
         return null;
     }

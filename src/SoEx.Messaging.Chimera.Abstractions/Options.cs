@@ -21,10 +21,15 @@ public enum Durability
 /// somebody asked for at a time that has not arrived, and destroying it to stay under a size bound is not
 /// retention of history, it is cancelling the future. <see cref="MaxAge"/> is the one that reaches both, and
 /// on the scheduled side it is measured from the due time, so a message removes itself a retention window
-/// after it came due rather than after it was published. What follows from that is worth knowing before you
-/// rely on a byte bound: **scheduled payloads are not bounded by these settings**, so a publisher scheduling
-/// far into the future grows the file for as long as those due times are ahead of it. Bound it where it is
-/// created, and watch <see cref="RetentionReport.ScheduledRemoved"/>.
+/// after it came due rather than after it was published.
+/// <para>
+/// <see cref="MaxBytes"/> and <see cref="MaxCount"/> still bound the scheduled table, but by refusing rather
+/// than by removing: when it is at the bound, <c>ScheduleAsync</c> throws <c>ScheduleRefusedException</c> and
+/// stores nothing. Destroying a scheduled message to stay under a size bound would be cancelling the future
+/// rather than trimming history, so the pressure goes back to the publisher, which is where Service Bus puts
+/// it too. Ordinary appends are unaffected. The file's ceiling is therefore these bounds counted twice — once
+/// for the log, held there by trimming, and once for the scheduled table, held there by refusing.
+/// </para>
 /// </remarks>
 public sealed record RetentionPolicy
 {
@@ -35,14 +40,14 @@ public sealed record RetentionPolicy
     public TimeSpan? MaxAge { get; init; } = TimeSpan.FromDays(7);
 
     /// <summary>
-    /// Remove oldest log records once their stored payload exceeds this. Null leaves size unbounded.
-    /// Scheduled messages are not counted and not removed — see the remarks on this type.
+    /// Remove oldest log records once their stored payload exceeds this, and refuse a scheduled message once
+    /// the scheduled table holds this many bytes. Null leaves size unbounded — see the remarks on this type.
     /// </summary>
     public long? MaxBytes { get; init; }
 
     /// <summary>
-    /// Remove oldest log records once this many are stored. Null leaves count unbounded. Scheduled messages
-    /// are not counted and not removed — see the remarks on this type.
+    /// Remove oldest log records once this many are stored, and refuse a scheduled message once the scheduled
+    /// table holds this many. Null leaves count unbounded — see the remarks on this type.
     /// </summary>
     public long? MaxCount { get; init; }
 

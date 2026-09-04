@@ -99,15 +99,17 @@ public sealed class SqliteTopicLog : ITopicLog
         }, cancellationToken);
     }
 
-    public ValueTask<long> ScheduleAsync(ReadOnlyMemory<byte> payload, DateTimeOffset dueAt,
+    public async ValueTask<long> ScheduleAsync(ReadOnlyMemory<byte> payload, DateTimeOffset dueAt,
         CancellationToken cancellationToken = default)
     {
         EnsureWithinLimit(payload);
         byte[] bytes = payload.ToArray();
         string messageId = Sqlite.NewMessageId();
+        ScheduleRefusedException? refused = null;
 
-        return _writer.EnqueueAsync((connection, transaction) =>
+        long id = await _writer.EnqueueAsync((connection, transaction) =>
         {
+            refused = null;
             // The clock is read here, on the writer thread, and not where this was called. A row becomes
             // visible when its batch commits, and a busy writer puts an arbitrary distance between the two: a
             // due time read at the call can have passed by the time the row lands, below a position another
@@ -124,6 +126,19 @@ public sealed class SqliteTopicLog : ITopicLog
             // sit below that position and never be offered.
             long due = Sqlite.ToUnixMs(dueAt < now ? now : dueAt);
 
+            // The bound is answered here rather than by retention, because retention has no answer to give:
+            // these rows are work somebody asked for at a time that has not arrived, and removing them to
+            // stay under a size bound would be cancelling the future rather than trimming history. So the
+            // pressure goes back to the publisher, which is where Service Bus puts it too — scheduled
+            // messages count against the entity quota and the send is refused. Measured inside the write for
+            // the same reason every other bound here is: two schedules arriving together would otherwise both
+            // find room in a table neither had joined yet.
+            if (Refusal(connection, transaction, bytes.Length) is { } stopped)
+            {
+                refused = stopped;
+                return 0;
+            }
+
             using SqliteCommand command = Sqlite.Command(connection, transaction,
                 "INSERT INTO scheduled (msg_id, enqueued_at, due_at, size, payload) " +
                 "VALUES ($m, $e, $d, $s, $p) RETURNING id;");
@@ -133,7 +148,41 @@ public sealed class SqliteTopicLog : ITopicLog
             command.Parameters.AddWithValue("$s", bytes.Length);
             command.Parameters.AddWithValue("$p", bytes);
             return (long)command.ExecuteScalar()!;
-        }, cancellationToken);
+        }, cancellationToken).ConfigureAwait(false);
+
+        // Thrown out here rather than from inside the write. A refusal belongs to the caller that caused it,
+        // and a batch rolled back by one would fail everybody else's appends with somebody else's bound.
+        return refused is null ? id : throw refused;
+    }
+
+    /// <summary>
+    /// Whether the scheduled table is at a bound the retention policy sets. It is the same pair of settings
+    /// that trims the log, read here as a quota instead: what the log answers by removing its oldest, this
+    /// answers by refusing the newest. Which means the file's ceiling is the two bounds added together, not
+    /// either one of them — the log is held at its bound by trimming and the scheduled table by refusing.
+    /// </summary>
+    private ScheduleRefusedException? Refusal(SqliteConnection connection, SqliteTransaction transaction,
+        int size)
+    {
+        RetentionPolicy retention = _topicOptions.Retention;
+        if (retention.MaxCount is null && retention.MaxBytes is null)
+            return null;
+
+        using var command = Sqlite.Command(connection, transaction,
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM scheduled;");
+        using SqliteDataReader reader = command.ExecuteReader();
+        if (!reader.Read())
+            return null;
+
+        long count = reader.GetInt64(0);
+        long bytes = reader.GetInt64(1);
+
+        if (retention.MaxCount is { } maxCount && count >= maxCount)
+            return new ScheduleRefusedException(Topic, count, bytes, maxCount, SizeBound.Count);
+
+        return retention.MaxBytes is { } maxBytes && bytes + size > maxBytes
+            ? new ScheduleRefusedException(Topic, count, bytes, maxBytes, SizeBound.Bytes)
+            : null;
     }
 
     public async ValueTask<bool> CancelScheduledAsync(long scheduledId, CancellationToken cancellationToken = default)
