@@ -27,7 +27,7 @@ internal sealed class SingleWriter : IAsyncDisposable
     internal SingleWriter(SqliteConnection connection, int maxBatch)
     {
         _connection = connection;
-        _maxBatch = Math.Max(1, maxBatch);
+        _maxBatch = maxBatch;
         _loop = Task.Factory.StartNew(RunAsync, TaskCreationOptions.LongRunning).Unwrap();
     }
 

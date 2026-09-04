@@ -73,12 +73,17 @@ a handler would make everything it is told afterwards untrue. Wait for the deliv
 `ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Its report also
 carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
 the set under `DropOldest` causes real loss too, and it would be misleading to put a number next to one path
-and a silence next to the other.
+and a silence next to the other. That count lives in the subscriber's file rather than in memory, so a
+process that closes or dies before running a pass does not take it with it.
 
 ## Settings worth knowing
 
 `ChimeraOptions.Durability` — `ProcessCrash` by default, which survives a crash but not a power cut.
 `PowerLoss` costs an fsync per commit.
+
+`ChimeraOptions.MaxAppendBatch` — how many queued operations one transaction may commit together, 128 by
+default. Concurrent appends cost one commit between them rather than one each, which is most of the
+throughput here. It must be at least one and is refused below that rather than rounded up to it.
 
 `ChimeraOptions.BusyTimeout` — how long a connection waits for a lock before giving up, five seconds by
 default. It has to be greater than zero, and anything less is refused when a file is opened: SQLite reads

@@ -61,7 +61,11 @@ public sealed record ChimeraOptions
     /// <summary>How long a connection waits for a lock before failing. Also covers checkpointing pauses.</summary>
     public TimeSpan BusyTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>Appends waiting at the moment the writer wakes are committed in one transaction, up to this many.</summary>
+    /// <summary>
+    /// Appends waiting at the moment the writer wakes are committed in one transaction, up to this many. At
+    /// least one, and refused below that rather than raised to it: a value that is quietly overridden is a
+    /// setting whose effect nobody can see, and here the effect is one commit per operation.
+    /// </summary>
     public int MaxAppendBatch { get; init; } = 128;
 
     /// <summary>

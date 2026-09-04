@@ -71,8 +71,10 @@ public sealed record SetAsidePolicy
 /// <param name="DeadDropped">Dead letters destroyed to stay within the bound, by this pass and by any settle
 /// since the last one. Only ever non-zero under <see cref="DeadLetterOverflow.DropOldest"/>, and worth
 /// alarming on: it is real loss, and a dead letter arriving is as likely to cause it as a maintenance pass.
-/// Counted rather than raised, so a subscriber that never runs a pass never learns of it — which is the
-/// trade the drop-oldest setting is.</param>
+/// The count is kept in the subscriber's file beside the rows it destroyed, so closing the subscription or
+/// losing the process does not lose it; it is reported once, to whichever pass asks first. Counted rather
+/// than raised, so a subscriber that never runs a pass never learns of it — which is the trade the
+/// drop-oldest setting is.</param>
 public readonly record struct SetAsideReport(long DeferredAgedOut, long DeadDropped)
 {
     public bool DidAnything => DeferredAgedOut > 0 || DeadDropped > 0;

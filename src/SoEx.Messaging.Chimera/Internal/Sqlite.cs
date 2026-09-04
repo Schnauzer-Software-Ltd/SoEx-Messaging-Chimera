@@ -7,6 +7,16 @@ internal static class Sqlite
 {
     internal static SqliteConnection OpenWriter(string path, ChimeraOptions options)
     {
+        // Checked here rather than where a batch is drained, for the same reason the busy timeout is: it
+        // fails quietly. A batch size below one used to be clamped to one, so the setting a caller wrote was
+        // not the setting they got and nothing said so — a burst of concurrent appends then cost one commit
+        // each rather than one between them, which is a throughput cliff with no signal at the bottom of it.
+        if (options.MaxAppendBatch < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), options.MaxAppendBatch,
+                "At least one operation must be committed at a time.");
+        }
+
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = path,

@@ -827,6 +827,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
+            long dropped;
             // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
             // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
             // totalled like any other — it still occupies the set — but it is never the row deleted.
@@ -848,8 +849,44 @@ internal sealed class SubscriberStore : IAsyncDisposable
             command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
             command.Parameters.AddWithValue("$count", (object?)count ?? DBNull.Value);
             command.Parameters.AddWithValue("$bytes", (object?)bytes ?? DBNull.Value);
-            return command.ExecuteNonQuery();
+            dropped = command.ExecuteNonQuery();
+
+            // Recorded in the same write that destroyed them. A count held in memory is a count a close or a
+            // crash takes with it, and what it was counting is loss nobody can reconstruct afterwards: the
+            // rows are gone. Kept in the file, it belongs to the subscriber rather than to whichever object
+            // happened to be settling at the time, and the next pass reports it whoever runs it.
+            if (dropped > 0)
+            {
+                using var record = Sqlite.Command(connection, transaction,
+                    """
+                    INSERT INTO meta (key, value) VALUES ($k, $n)
+                    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + $n AS TEXT);
+                    """);
+                record.Parameters.AddWithValue("$k", DroppedKey(topic));
+                record.Parameters.AddWithValue("$n", dropped.ToString());
+                record.ExecuteNonQuery();
+            }
+
+            return dropped;
         }, ct);
+
+    /// <summary>How many dead letters have been destroyed for this topic since anyone last asked.</summary>
+    /// <remarks>
+    /// Read and reset in one write, so two passes cannot both report the same drops and a pass that reports
+    /// them cannot leave them behind to be reported again.
+    /// </remarks>
+    internal ValueTask<long> TakeDroppedAsync(string topic, CancellationToken ct = default)
+        => _writer.EnqueueAsync((connection, transaction) =>
+        {
+            using var command = Sqlite.Command(connection, transaction,
+                "DELETE FROM meta WHERE key = $k RETURNING value;");
+            command.Parameters.AddWithValue("$k", DroppedKey(topic));
+            return command.ExecuteScalar() is string value && long.TryParse(value, out long dropped)
+                ? dropped
+                : 0;
+        }, ct);
+
+    private static string DroppedKey(string topic) => $"dead_dropped:{topic}";
 
     /// <summary>Everything this subscriber knows about a topic, for checking the invariant in one go.</summary>
     internal async ValueTask<StoreSnapshot> SnapshotAsync(string topic, CancellationToken ct = default)

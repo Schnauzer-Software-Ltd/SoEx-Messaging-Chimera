@@ -17,7 +17,6 @@ public sealed class SqliteSubscription : ISubscription
     private bool _attached;
     private bool _boundEvaluated;
     private long _seenMinimum;
-    private long _dropped;
     private volatile SubscriberStoppedException? _stopped;
 
     private SqliteSubscription(string subscriber, string topic, ChimeraOptions options,
@@ -188,8 +187,13 @@ public sealed class SqliteSubscription : ISubscription
         {
             // Recheck rather than latch: replaying or discarding the dead letters is how someone clears this,
             // and it would be unhelpful to make them restart the process as well.
-            _boundEvaluated = true;
             SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
+
+            // Spent only once it has an answer. Marking it before the read means an interrupted first poll —
+            // a consumer cancelling one is ordinary — counts as the evaluation that never happened, and this
+            // subscription then delivers past a full dead set for the rest of its life. Asking again is safe
+            // because asking is all it does.
+            _boundEvaluated = true;
             if (StoppedBy(size) is { } still)
             {
                 _stopped = still;
@@ -583,11 +587,10 @@ public sealed class SqliteSubscription : ISubscription
         {
             // The store is handed the limits rather than an excess worked out here: settles land
             // concurrently, and an excess measured before the delete is an excess several of them would each
-            // destroy in full.
-            long dropped = await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes, ct)
+            // destroy in full. What it destroyed is recorded where it destroyed it, for the next pass to
+            // report.
+            await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes, ct)
                 .ConfigureAwait(false);
-            if (dropped > 0)
-                Interlocked.Add(ref _dropped, dropped);
             return;
         }
 
@@ -634,12 +637,11 @@ public sealed class SqliteSubscription : ISubscription
                 $"deferred longer than {maxAge}", cancellationToken).ConfigureAwait(false);
         }
 
-        long dropped = 0;
         if (policy.MaxDeadCount is not null || policy.MaxDeadBytes is not null)
         {
             if (policy.DeadOverflow == DeadLetterOverflow.DropOldest)
             {
-                dropped = await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes,
+                await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes,
                     cancellationToken).ConfigureAwait(false);
             }
             else
@@ -654,9 +656,11 @@ public sealed class SqliteSubscription : ISubscription
             }
         }
 
-        // Drops made while settling are counted here too. They are the same loss for the same reason, and a
-        // report that only mentioned the ones this pass made would put a number next to a silence.
-        return new SetAsideReport(agedOut, dropped + Interlocked.Exchange(ref _dropped, 0));
+        // Everything destroyed since the last pass, not only what this one destroyed. A dead letter arriving
+        // is as likely to cause a drop as a maintenance pass is, and they are the same loss for the same
+        // reason: reporting one and not the other would put a number next to a silence.
+        return new SetAsideReport(agedOut,
+            await _store.TakeDroppedAsync(Topic, cancellationToken).ConfigureAwait(false));
     }
 
     public async ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default)
