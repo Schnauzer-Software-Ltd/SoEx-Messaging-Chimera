@@ -70,7 +70,10 @@ a handler would make everything it is told afterwards untrue. Wait for the deliv
 
 `LagAsync()` reports how far behind this subscriber is, as a count and as a duration.
 
-`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bound.
+`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Its report also
+carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
+the set under `DropOldest` causes real loss too, and it would be misleading to put a number next to one path
+and a silence next to the other.
 
 ## Settings worth knowing
 
@@ -95,7 +98,26 @@ setting applies once, when the position is first recorded; after that the stored
 changing this does not move it.
 
 `SetAsidePolicy` — bounds on what one subscriber may set aside. Set-aside rows carry payload copies, so
-without these a consumer that defers freely fills the disk. Breaching a bound files the message as a dead
-letter rather than dropping it. When the dead-letter bound is reached the subscriber stops, by default,
-rather than destroying anything: it keeps its position, blocks nobody else, and starts again when the dead
-letters are dealt with.
+without these a consumer that defers freely fills the disk. There are four: `MaxDeferredCount` and
+`MaxDeferredBytes` on what may be deferred, `MaxDeadCount` and `MaxDeadBytes` on what may be dead-lettered.
+Breaching a deferred bound files the message as a dead letter rather than dropping it, and says so in the
+row's reason.
+
+The bytes are counted per set rather than across both, because the two sets can answer a bound differently. A
+deferral that does not fit has somewhere to go; dead is where passing a message along stops, so the only
+answers there are to stop the subscriber or to destroy something, which is what `DeadOverflow` chooses
+between. A single number spanning both could only mean the first, and the dead set would grow past it one
+payload at a time while the setting said it was bounded.
+
+When a dead-letter bound is reached the subscriber stops, by default, rather than destroying anything: it
+keeps its position, blocks nobody else, and starts again when the dead letters are dealt with. That is a
+property of the stored set and not of the object, so closing the subscription and opening it again does not
+buy another crop of deliveries — replaying or discarding the dead letters is what clears it. Under
+`DropOldest` the oldest are destroyed instead, and a dead letter being handled right now is never one of
+them; it still counts towards the bound, so the set can sit briefly above it until that delivery settles.
+
+Every one of these values is checked when the subscription is opened, as retention's are when the log is
+opened. A negative or zero bound fails silently and destructively otherwise — a retention age below zero puts
+the cutoff in the future and removes the whole log — so `null` is how you say a bound is not wanted. Zero is
+allowed for `MaxDeferredAge` alone, where it means "age this out the next time a pass looks" and files the
+message dead rather than destroying it.

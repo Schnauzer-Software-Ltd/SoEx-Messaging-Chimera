@@ -87,9 +87,15 @@ public static class ChimeraInspector
         // asking that first would answer "completed" for a message somebody is still holding a copy of.
         if (SetAside(connection, topic, messageId) is { } aside)
         {
-            MessageState state = aside.Kind == SetAsideKind.Dead
-                ? MessageState.DeadLettered
-                : MessageState.Deferred;
+            // A replayed row being handled right now is in flight, whatever it is filed as. Reading the kind
+            // alone answers "deferred" for a message a handler is holding, which contradicts the overview:
+            // that one keeps a subscriber unsettled while a replay is running, and the two have to agree or
+            // a test waits for quiet on one number while the other says the work is parked.
+            MessageState state = aside.Delivery == SetAsideDelivery.InFlight
+                ? MessageState.InFlight
+                : aside.Kind == SetAsideKind.Dead
+                    ? MessageState.DeadLettered
+                    : MessageState.Deferred;
             return Status(messageId, topic, subscriber, state, aside.Attempts, aside.Reason, aside.AsideAt);
         }
 
@@ -276,13 +282,13 @@ public static class ChimeraInspector
             : (0, ScheduledFloor.Start);
     }
 
-    private static (SetAsideKind Kind, long Attempts, string? Reason, DateTimeOffset AsideAt)? SetAside(
-        SqliteConnection connection, string topic, string messageId)
+    private static (SetAsideKind Kind, SetAsideDelivery Delivery, long Attempts, string? Reason,
+        DateTimeOffset AsideAt)? SetAside(SqliteConnection connection, string topic, string messageId)
     {
         // Matched on the message id the row already carries. The origin column is provenance for a human
         // reading the file, and parsing it here would quietly make it load-bearing.
         using SqliteCommand command = Sqlite.Command(connection, null,
-            "SELECT kind, attempts, reason, aside_at FROM set_aside " +
+            "SELECT kind, delivery, attempts, reason, aside_at FROM set_aside " +
             "WHERE topic = $t AND msg_id = $m ORDER BY aside_id DESC LIMIT 1;");
         command.Parameters.AddWithValue("$t", topic);
         command.Parameters.AddWithValue("$m", messageId);
@@ -290,9 +296,9 @@ public static class ChimeraInspector
         if (!reader.Read())
             return null;
 
-        return ((SetAsideKind)reader.GetInt32(0), reader.GetInt64(1),
-            reader.IsDBNull(2) ? null : reader.GetString(2),
-            DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(3)));
+        return ((SetAsideKind)reader.GetInt32(0), (SetAsideDelivery)reader.GetInt32(1), reader.GetInt64(2),
+            reader.IsDBNull(3) ? null : reader.GetString(3),
+            DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(4)));
     }
 
     private static (EntryState State, long Attempts, DateTimeOffset Updated)? Entry(SqliteConnection connection,

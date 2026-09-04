@@ -15,8 +15,10 @@ public sealed class SqliteSubscription : ISubscription
     private readonly ConcurrentDictionary<DeliveryTag, byte> _outstanding = new();
     private readonly StartAt _start;
     private bool _attached;
+    private bool _boundEvaluated;
     private long _seenMinimum;
-    private SubscriberStoppedException? _stopped;
+    private long _dropped;
+    private volatile SubscriberStoppedException? _stopped;
 
     private SqliteSubscription(string subscriber, string topic, ChimeraOptions options,
         SubscriptionOptions subscriptionOptions, SubscriberStore store, TopicReader reader, StartAt start,
@@ -61,6 +63,27 @@ public sealed class SqliteSubscription : ISubscription
         if (subscriptionOptions.PollInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(subscriptionOptions),
                 subscriptionOptions.PollInterval, "The poll interval must be greater than zero.");
+
+        // Same reason, on the bounds that decide what this subscriber may keep. Null means unbounded, so only
+        // supplied values are checked, and zero or less is not a tight bound but a nonsensical one: a set
+        // bounded at nothing dead-letters or stops on the very first row. The deferred age is the exception
+        // and only refuses a negative — zero there means "age out the next time a pass sees it", which files
+        // the message dead rather than destroying it, and is a legitimate thing to ask for.
+        SetAsidePolicy setAside = subscriptionOptions.SetAside;
+        if (setAside.MaxDeferredAge is { } deferredAge && deferredAge < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(subscriptionOptions), deferredAge,
+                "A deferred age cannot be negative. Use null for no age bound.");
+        Positive(setAside.MaxDeferredCount, "A deferred count bound");
+        Positive(setAside.MaxDeadCount, "A dead-letter count bound");
+        Positive(setAside.MaxDeferredBytes, "A deferred byte bound");
+        Positive(setAside.MaxDeadBytes, "A dead-letter byte bound");
+
+        static void Positive<T>(T? value, string what) where T : struct, IComparable<T>
+        {
+            if (value is { } supplied && supplied.CompareTo(default) <= 0)
+                throw new ArgumentOutOfRangeException(nameof(subscriptionOptions), supplied,
+                    $"{what} must be greater than zero. Use null for no bound.");
+        }
 
         // The position is bound here, while the subscription is being created, rather than at its first read.
         // That is what makes a starting position mean anything: what a subscriber is entitled to is decided by
@@ -156,13 +179,22 @@ public sealed class SqliteSubscription : ISubscription
     /// </summary>
     private async ValueTask<EventEnvelope?> NextAsync(CancellationToken ct)
     {
-        if (_stopped is not null)
+        // The bound is on the stored set, so the stop belongs to the set and not to this object. A subscriber
+        // that stopped at a full dead set, was closed and opened again used to deliver until the next dead
+        // letter re-armed a flag the old process took with it — which meant a restart bought another crop of
+        // deliveries, and a set that was already at its limit crept past it once per process. Asking the set
+        // on the first read is what makes "stopped until somebody deals with them" outlive the instance.
+        if (_stopped is not null || (!_boundEvaluated && StopsAtBound))
         {
             // Recheck rather than latch: replaying or discarding the dead letters is how someone clears this,
             // and it would be unhelpful to make them restart the process as well.
-            (_, long dead, _) = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
-            if (_subscriptionOptions.SetAside.MaxDeadCount is { } limit && dead >= limit)
-                throw _stopped;
+            _boundEvaluated = true;
+            SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
+            if (StoppedBy(size) is { } still)
+            {
+                _stopped = still;
+                throw still;
+            }
             _stopped = null;
         }
 
@@ -265,6 +297,13 @@ public sealed class SqliteSubscription : ISubscription
     /// it would report this subscriber as having nothing left to do while a handler is running, and the settle
     /// that follows would write the entry straight back. Once that settle lands the next poll takes it.
     /// </para>
+    /// <para>
+    /// One of the entries it forgets is not a tidy-up but a loss, and is reported as one. An entry left
+    /// available is a delivery that failed and was told it would come again, and the row it would have come
+    /// from has gone. There is no position on this path to infer a loss from — which is why a scheduled
+    /// message nobody ever read goes unremarked — but an entry is not an inference: it is this subscriber's
+    /// own record that the message reached it and is still owed.
+    /// </para>
     /// </remarks>
     private async ValueTask ForgetRemovedScheduledAsync(Dictionary<long, EntryState> states, CancellationToken ct)
     {
@@ -282,9 +321,16 @@ public sealed class SqliteSubscription : ISubscription
         if (gone.Count == 0)
             return;
 
+        List<long> owed = gone.Where(id => states[id] == EntryState.Available).ToList();
+
+        // Forgotten first, reported second: the report is the only one there will ever be, and an entry left
+        // behind by a cancelled throw would be counted again by every poll after it.
         await _store.ForgetScheduledAsync(Topic, gone, ct).ConfigureAwait(false);
         foreach (long id in gone)
             states.Remove(id);
+
+        if (owed.Count > 0)
+            throw new MessagesLostException(Topic, Subscriber, owed.Count, owed.Min(), owed.Max(), scheduled: true);
     }
 
     /// <summary>
@@ -327,8 +373,9 @@ public sealed class SqliteSubscription : ISubscription
         if (min <= mark + 1 || min <= _seenMinimum)
             return mark;
 
-        // Records this subscriber was handed and is still settling are not lost to it, however they left the
-        // log. Counting them would name messages a handler has in its hands as ones that never arrived.
+        // Records a handler is holding, or has already settled, are not lost to this subscriber however they
+        // left the log: counting them would name messages someone has in their hands as ones that never
+        // arrived. A delivery that failed and was handed back is not one of those — see HeldBetweenAsync.
         long held = await _store.HeldBetweenAsync(Topic, EntrySource.Log, mark, min, ct).ConfigureAwait(false);
         long lost = min - mark - 1 - held;
 
@@ -526,22 +573,54 @@ public sealed class SqliteSubscription : ISubscription
     /// </summary>
     private async ValueTask EnforceDeadBoundAsync(CancellationToken ct)
     {
-        if (_subscriptionOptions.SetAside.MaxDeadCount is not { } limit)
+        SetAsidePolicy policy = _subscriptionOptions.SetAside;
+        if (policy.MaxDeadCount is null && policy.MaxDeadBytes is null)
             return;
 
-        (_, long dead, _) = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
-
-        // The limit is a maximum, so dropping trims back to it and stopping happens on reaching it — a
+        // A limit is a maximum, so dropping trims back to it and stopping happens on reaching it — a
         // subscriber that stops has no way to take another one anyway.
-        if (_subscriptionOptions.SetAside.DeadOverflow == DeadLetterOverflow.DropOldest)
+        if (policy.DeadOverflow == DeadLetterOverflow.DropOldest)
         {
-            if (dead > limit)
-                await _store.DropOldestDeadAsync(Topic, dead - limit, ct).ConfigureAwait(false);
+            // The store is handed the limits rather than an excess worked out here: settles land
+            // concurrently, and an excess measured before the delete is an excess several of them would each
+            // destroy in full.
+            long dropped = await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes, ct)
+                .ConfigureAwait(false);
+            if (dropped > 0)
+                Interlocked.Add(ref _dropped, dropped);
             return;
         }
 
-        if (dead >= limit)
-            _stopped = new SubscriberStoppedException(Topic, Subscriber, dead, limit);
+        SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
+        _stopped = StoppedBy(size) ?? _stopped;
+    }
+
+    /// <summary>Whether this subscriber is one a full dead set stops at all.</summary>
+    private bool StopsAtBound
+        => _subscriptionOptions.SetAside.DeadOverflow == DeadLetterOverflow.StopDelivering
+        && (_subscriptionOptions.SetAside.MaxDeadCount is not null
+            || _subscriptionOptions.SetAside.MaxDeadBytes is not null);
+
+    /// <summary>
+    /// Whether a dead set of this size is one the subscriber should stop on. Both bounds answer the same
+    /// question and reaching either is enough, so they are asked in the one place rather than at each of the
+    /// three moments a dead letter can arrive.
+    /// </summary>
+    private SubscriberStoppedException? StoppedBy(SetAsideSizes size)
+    {
+        SetAsidePolicy policy = _subscriptionOptions.SetAside;
+        if (policy.DeadOverflow != DeadLetterOverflow.StopDelivering)
+            return null;
+
+        if (policy.MaxDeadCount is { } count && size.Dead >= count)
+            return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, count,
+                DeadLetterBound.Count);
+
+        if (policy.MaxDeadBytes is { } bytes && size.DeadBytes >= bytes)
+            return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, bytes,
+                DeadLetterBound.Bytes);
+
+        return null;
     }
 
     public async ValueTask<SetAsideReport> ApplyRetentionAsync(CancellationToken cancellationToken = default)
@@ -556,20 +635,28 @@ public sealed class SqliteSubscription : ISubscription
         }
 
         long dropped = 0;
-        if (policy.MaxDeadCount is { } limit)
+        if (policy.MaxDeadCount is not null || policy.MaxDeadBytes is not null)
         {
-            (_, long dead, _) = await _store.SetAsideSizeAsync(Topic, cancellationToken).ConfigureAwait(false);
-            if (dead > limit)
+            if (policy.DeadOverflow == DeadLetterOverflow.DropOldest)
             {
-                if (policy.DeadOverflow == DeadLetterOverflow.DropOldest)
-                    dropped = await _store.DropOldestDeadAsync(Topic, dead - limit, cancellationToken)
-                        .ConfigureAwait(false);
-                else
-                    _stopped = new SubscriberStoppedException(Topic, Subscriber, dead, limit);
+                dropped = await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // Reaching a limit is what stops a subscriber when it settles one, and this pass can be what
+                // takes the set there — a deferral ageing out is a dead letter arriving. The two agreeing is
+                // the difference between a bound that holds and one that waits for a further dead letter to
+                // notice it was passed.
+                SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, cancellationToken)
+                    .ConfigureAwait(false);
+                _stopped = StoppedBy(size) ?? _stopped;
             }
         }
 
-        return new SetAsideReport(agedOut, dropped);
+        // Drops made while settling are counted here too. They are the same loss for the same reason, and a
+        // report that only mentioned the ones this pass made would put a number next to a silence.
+        return new SetAsideReport(agedOut, dropped + Interlocked.Exchange(ref _dropped, 0));
     }
 
     public async ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default)

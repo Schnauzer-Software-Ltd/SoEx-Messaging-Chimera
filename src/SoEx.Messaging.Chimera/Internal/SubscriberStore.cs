@@ -337,16 +337,19 @@ internal sealed class SubscriberStore : IAsyncDisposable
             // does not fit becomes a dead letter, and says so.
             if (filedAs == SetAsideKind.Deferred)
             {
-                (long deferred, _, long stored) = SetAsideSize(connection, transaction, topic);
-                if (bounds.MaxDeferredCount is { } maxDeferred && deferred >= maxDeferred)
+                SetAsideSizes size = SetAsideSize(connection, transaction, topic);
+                if (bounds.MaxDeferredCount is { } maxDeferred && size.Deferred >= maxDeferred)
                 {
                     filedAs = SetAsideKind.Dead;
                     why = $"deferred set full ({maxDeferred})";
                 }
-                else if (bounds.MaxSetAsideBytes is { } maxBytes && stored + bytes.Length > maxBytes)
+                else if (bounds.MaxDeferredBytes is { } maxBytes && size.DeferredBytes + bytes.Length > maxBytes)
                 {
+                    // Says what happened to it rather than what was full: this row is joining the store it
+                    // was measured against, and a reason reading "the store is full" next to a row that just
+                    // grew it is the sort of thing an operator has to read the source to understand.
                     filedAs = SetAsideKind.Dead;
-                    why = $"set-aside store full ({maxBytes} bytes)";
+                    why = $"deferring would exceed the deferred byte bound ({maxBytes} bytes); filed dead";
                 }
             }
 
@@ -659,16 +662,27 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// How many deliveries this subscriber holds for records between a position and a sequence: what it was
     /// handed and has not settled, and what it has settled but the position has not reached.
     /// </summary>
+    /// <remarks>
+    /// An entry left <see cref="EntryState.Available"/> is neither of those. A delivery that failed and was
+    /// handed back is in nobody's hands and is owed another attempt that only the log can make, so once the
+    /// record has gone the message is lost as surely as one that was never read at all — and counting it here
+    /// would subtract it from the loss and tell nobody. The exemption belongs to the states where something
+    /// still speaks for the message: a handler holding it, or a settle that has already happened.
+    /// </remarks>
     internal ValueTask<long> HeldBetweenAsync(string topic, EntrySource source, long above, long below,
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
             using var command = Sqlite.Command(connection, transaction,
-                "SELECT COUNT(*) FROM entry WHERE topic = $t AND source = $s AND id > $a AND id < $b;");
+                """
+                SELECT COUNT(*) FROM entry
+                WHERE topic = $t AND source = $s AND id > $a AND id < $b AND state <> $available;
+                """);
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$s", (int)source);
             command.Parameters.AddWithValue("$a", above);
             command.Parameters.AddWithValue("$b", below);
+            command.Parameters.AddWithValue("$available", (int)EntryState.Available);
             return (long)command.ExecuteScalar()!;
         }, ct);
 
@@ -728,11 +742,14 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteNonQuery();
         }, ct);
 
-    /// <summary>How much this subscriber currently has set aside, by kind and in total bytes.</summary>
-    internal async ValueTask<(long Deferred, long Dead, long Bytes)> SetAsideSizeAsync(string topic,
-        CancellationToken ct = default)
+    /// <summary>How much this subscriber currently has set aside: a count and a payload total for each kind.</summary>
+    /// <remarks>
+    /// Kept apart rather than totalled because the two sets are bounded separately, and they are bounded
+    /// separately because only one of them has somewhere to pass a message that does not fit.
+    /// </remarks>
+    internal async ValueTask<SetAsideSizes> SetAsideSizeAsync(string topic, CancellationToken ct = default)
     {
-        (long Deferred, long Dead, long Bytes) size = default;
+        SetAsideSizes size = default;
         await _writer.EnqueueAsync((connection, transaction) =>
         {
             size = SetAsideSize(connection, transaction, topic);
@@ -741,15 +758,16 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return size;
     }
 
-    private static (long Deferred, long Dead, long Bytes) SetAsideSize(SqliteConnection connection,
-        SqliteTransaction transaction, string topic)
+    private static SetAsideSizes SetAsideSize(SqliteConnection connection, SqliteTransaction transaction,
+        string topic)
     {
         using var command = Sqlite.Command(connection, transaction,
             """
             SELECT
               COALESCE(SUM(CASE WHEN kind = $deferred THEN 1 ELSE 0 END), 0),
               COALESCE(SUM(CASE WHEN kind = $dead THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(LENGTH(payload)), 0)
+              COALESCE(SUM(CASE WHEN kind = $deferred THEN LENGTH(payload) ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN kind = $dead THEN LENGTH(payload) ELSE 0 END), 0)
             FROM set_aside WHERE topic = $t;
             """);
         command.Parameters.AddWithValue("$t", topic);
@@ -757,8 +775,8 @@ internal sealed class SubscriberStore : IAsyncDisposable
         command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
         using SqliteDataReader reader = command.ExecuteReader();
         return reader.Read()
-            ? (reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2))
-            : (0, 0, 0);
+            ? new SetAsideSizes(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3))
+            : default;
     }
 
     /// <summary>
@@ -789,27 +807,47 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteNonQuery();
         }, ct);
 
-    /// <summary>Destroys the oldest dead letters. Real loss, and the only path here that causes any.</summary>
+    /// <summary>Destroys the oldest dead letters down to a limit. Real loss, and the only path here that causes any.</summary>
     /// <remarks>
+    /// <para>
+    /// It is given the limit and works out the excess itself, inside the one write that does the deleting. A
+    /// caller that reads the size and then asks for that many rows to be destroyed is deciding how many to
+    /// destroy against a set that other settles are trimming at the same time: each of them measures the same
+    /// backlog, each is told to remove it, and between them they empty a set that only had to lose its oldest
+    /// few. Same rule as the insert side, on the side that does the destroying.
+    /// </para>
+    /// <para>
     /// A dead letter someone has replayed and is handling now is not dropped, for the same reason a discard
     /// leaves one alone: the handler is about to be told what happened to a row that would no longer be there.
-    /// The bound is a maximum that can sit one or two above itself while those deliveries finish, and the next
-    /// pass trims what they leave behind.
+    /// It still counts towards the limit, so the set can sit one or two above itself while those deliveries
+    /// finish, and the next pass trims what they leave behind.
+    /// </para>
     /// </remarks>
-    internal ValueTask<long> DropOldestDeadAsync(string topic, long howMany, CancellationToken ct = default)
+    internal ValueTask<long> TrimDeadToAsync(string topic, long? count, long? bytes,
+        CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
+            // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
+            // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
+            // totalled like any other — it still occupies the set — but it is never the row deleted.
             using var command = Sqlite.Command(connection, transaction,
                 """
                 DELETE FROM set_aside WHERE aside_id IN (
-                  SELECT aside_id FROM set_aside
-                  WHERE topic = $t AND kind = $dead AND delivery <> $inflight
-                  ORDER BY aside_id LIMIT $n);
+                  SELECT aside_id FROM (
+                    SELECT aside_id, delivery,
+                           ROW_NUMBER() OVER (ORDER BY aside_id DESC) AS place,
+                           SUM(LENGTH(payload)) OVER (ORDER BY aside_id DESC
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+                    FROM set_aside WHERE topic = $t AND kind = $dead)
+                  WHERE delivery <> $inflight
+                    AND (($count IS NOT NULL AND place > $count)
+                      OR ($bytes IS NOT NULL AND running > $bytes)));
                 """);
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
             command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
-            command.Parameters.AddWithValue("$n", howMany);
+            command.Parameters.AddWithValue("$count", (object?)count ?? DBNull.Value);
+            command.Parameters.AddWithValue("$bytes", (object?)bytes ?? DBNull.Value);
             return command.ExecuteNonQuery();
         }, ct);
 
@@ -868,3 +906,6 @@ internal readonly record struct Attachment(string Topic, string LogUuid, StartAt
 
 /// <summary>A subscriber's whole view of one topic at a moment in time.</summary>
 internal sealed record StoreSnapshot(long Mark, Dictionary<long, EntryState> Entries, List<string> SetAsideOrigins);
+
+/// <summary>What one subscriber has set aside: a count and a payload total for each of the two sets.</summary>
+internal readonly record struct SetAsideSizes(long Deferred, long Dead, long DeferredBytes, long DeadBytes);

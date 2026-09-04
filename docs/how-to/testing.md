@@ -88,6 +88,10 @@ MessageStatus status = ChimeraInspector.StatusOf(options, "orders", "billing", m
 // Pending, NotYetDue, InFlight, AwaitingRetry, Completed, Deferred or DeadLettered, with the reason
 ```
 
+A deferred or dead-lettered message that has been replayed and is being handled right now reads as
+`InFlight`, not as parked. It agrees with the overview, which keeps such a subscriber unsettled: a test that
+waits for quiet and a test that asks about one message should never disagree about whether work is running.
+
 Ask by message id, not by the sequence on an envelope: sequences come from two different tables and only look
 orderable. One thing it cannot tell you is how many attempts a message that succeeded took. The row carrying
 that count is deleted when the position absorbs it, which is what keeps a subscriber's file from growing with

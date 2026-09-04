@@ -23,10 +23,18 @@ approaches the retention window.
 what it removed, and how many each lost. Log that at warning.
 
 **Afterwards.** The subscriber itself throws `MessagesLostException` on its next read, carrying the count and
-the range of sequences. It then moves its position over the gap and carries on, because a position stuck
+the range of sequences. Two things are counted in it: records this subscriber never read, and deliveries it
+failed. A failure is a promise that the message will come again, and only the log can keep that promise, so a
+record removed while a redelivery is owed against it is as lost as one nobody ever saw. It then moves its position over the gap and carries on, because a position stuck
 below records that will never exist again would never move again. It comes out of the read loop rather than
 out of a handler, so the loop has to be written to catch it and start reading again;
 [integrating](../how-to/integrating.md) shows the shape.
+
+The same is true on the scheduled side, but only that far: a scheduled delivery that failed is reported when
+its row goes, because the subscriber holds its own record of the attempt, while a scheduled message nobody
+ever read is not. Positions there are due times rather than sequences, and a due-time position cannot tell a
+row that was removed from one that was never published — so there is no gap to notice and nothing honest to
+say. Bound the scheduled table where the messages are created, and watch `RetentionReport.ScheduledRemoved`.
 
 Only a subscriber that was there is told. One created later takes its position from the oldest record still
 in the log, so records removed before it existed are not reported to it as loss, because they were never its

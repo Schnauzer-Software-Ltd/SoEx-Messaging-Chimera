@@ -40,8 +40,9 @@ while (!stopping.IsCancellationRequested)
     }
     catch (MessagesLostException lost)
     {
-        // Retention removed records this subscriber had not read. The position has already moved over the
-        // gap, so reading again carries on from the oldest record that still exists.
+        // Retention removed records this subscriber had not finished with — ones it never read, and ones it
+        // failed and was owed again. The position has already moved over the gap, so reading again carries
+        // on from the oldest record that still exists.
         Logger.LogWarning("Lost {Count} message(s) on {Topic}: {Range}",
             lost.Count, lost.Topic, $"{lost.FromSequence}..{lost.ToSequence}");
     }

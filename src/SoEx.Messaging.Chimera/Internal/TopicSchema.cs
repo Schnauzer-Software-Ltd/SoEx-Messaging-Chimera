@@ -137,7 +137,10 @@ internal static class TopicSchema
         if (uuid is null)
             return null;
 
-        string version = Get(connection, null, MetaSchemaVersion) ?? "0";
-        return (uuid, int.Parse(version));
+        // Tolerant in the same direction as the guard above: a version nobody can parse is treated as absent
+        // rather than thrown from, because the file this reads may be one something else wrote and a caller
+        // asking whether a log is ready should get an answer from the library's own vocabulary.
+        string? version = Get(connection, null, MetaSchemaVersion);
+        return (uuid, int.TryParse(version, out int parsed) ? parsed : 0);
     }
 }

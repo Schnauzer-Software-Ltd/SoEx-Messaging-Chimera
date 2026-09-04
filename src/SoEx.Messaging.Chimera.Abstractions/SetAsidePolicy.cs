@@ -37,16 +37,42 @@ public sealed record SetAsidePolicy
     /// <summary>Dead letters allowed before <see cref="DeadOverflow"/> decides what happens.</summary>
     public long? MaxDeadCount { get; init; } = 10_000;
 
-    /// <summary>Total stored payload across everything this subscriber has set aside, deferred and dead.</summary>
-    public long? MaxSetAsideBytes { get; init; } = 64L * 1024 * 1024;
+    /// <summary>
+    /// Stored payload allowed across this subscriber's deferred messages. Beyond it, deferring dead-letters
+    /// instead, exactly as it does beyond <see cref="MaxDeferredCount"/>.
+    /// </summary>
+    public long? MaxDeferredBytes { get; init; } = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// Stored payload allowed across this subscriber's dead letters. Beyond it, <see cref="DeadOverflow"/>
+    /// decides what happens, the same as beyond <see cref="MaxDeadCount"/>.
+    /// </summary>
+    /// <remarks>
+    /// There are two byte bounds rather than one because the two sets answer a bound differently and a single
+    /// number could only honour one of them. A deferral that does not fit is passed along to the dead set,
+    /// which is why the deferred bound can be enforced by refusing to grow that set. Dead is where passing
+    /// along stops, so the only answers there are to stop the subscriber or to destroy something — which is
+    /// exactly the choice <see cref="DeadOverflow"/> already exists to make. One number spanning both would
+    /// have to mean both things at once, and the one it meant in practice was the deferred one: the dead set
+    /// grew past it unchecked, one payload at a time, while the option said it was bounded.
+    /// <para>
+    /// Under <see cref="DeadLetterOverflow.DropOldest"/> a single dead letter larger than this whole bound
+    /// cannot be kept: it is destroyed on arrival and counted in
+    /// <see cref="SetAsideReport.DeadDropped"/>. Size the bound above the topic's payload limit.
+    /// </para>
+    /// </remarks>
+    public long? MaxDeadBytes { get; init; } = 64L * 1024 * 1024;
 
     public DeadLetterOverflow DeadOverflow { get; init; } = DeadLetterOverflow.StopDelivering;
 }
 
 /// <summary>What one pass over a subscriber's set-aside store did.</summary>
 /// <param name="DeferredAgedOut">Deferred messages that became dead letters because they sat too long.</param>
-/// <param name="DeadDropped">Dead letters destroyed to stay within the bound. Only ever non-zero under
-/// <see cref="DeadLetterOverflow.DropOldest"/>, and worth alarming on: it is real loss.</param>
+/// <param name="DeadDropped">Dead letters destroyed to stay within the bound, by this pass and by any settle
+/// since the last one. Only ever non-zero under <see cref="DeadLetterOverflow.DropOldest"/>, and worth
+/// alarming on: it is real loss, and a dead letter arriving is as likely to cause it as a maintenance pass.
+/// Counted rather than raised, so a subscriber that never runs a pass never learns of it — which is the
+/// trade the drop-oldest setting is.</param>
 public readonly record struct SetAsideReport(long DeferredAgedOut, long DeadDropped)
 {
     public bool DidAnything => DeferredAgedOut > 0 || DeadDropped > 0;

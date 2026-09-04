@@ -44,6 +44,21 @@ public sealed class SqliteTopicLog : ITopicLog
             throw new ArgumentOutOfRangeException(nameof(topicOptions),
                 topicOptions.MaxPayloadBytes, "The payload limit must be greater than zero.");
 
+        // Null is how a retention setting says "unbounded", so only supplied values are checked — and they
+        // are checked because the way they fail is silent and destructive. A negative age is a cutoff in the
+        // future, and a cutoff in the future removes every record in the log, including ones published a
+        // moment ago that nobody has read. A negative size or count is the same arithmetic.
+        RetentionPolicy retention = topicOptions.Retention;
+        if (retention.MaxAge is { } maxAge && maxAge <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(topicOptions), maxAge,
+                "A retention age must be greater than zero. Use null for no age bound.");
+        if (retention.MaxBytes is { } maxBytes && maxBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(topicOptions), maxBytes,
+                "A retention size must be greater than zero. Use null for no size bound.");
+        if (retention.MaxCount is { } maxCount && maxCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(topicOptions), maxCount,
+                "A retention count must be greater than zero. Use null for no count bound.");
+
         Directory.CreateDirectory(options.RootDirectory);
         string path = FileNames.TopicFile(options.RootDirectory, topic);
 
