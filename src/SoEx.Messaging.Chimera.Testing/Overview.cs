@@ -17,7 +17,12 @@ namespace SoEx.Messaging.Chimera.Testing;
 /// <param name="AwaitingRetry">
 /// Deliveries handed back after a failure, waiting to go out again. Also a subset of the two counts above.
 /// </param>
-/// <param name="AwaitingReplay">Set-aside messages someone has asked to be replayed, not yet delivered.</param>
+/// <param name="AwaitingReplay">
+/// Set-aside messages someone has asked to be replayed and that are not finished with: waiting to go out, or
+/// out with a handler now. Both are work in motion, which is what <see cref="SubscriberActivity.Settled"/>
+/// needs to know; a count of only the ones still waiting would call a subscriber quiet while a replay was
+/// being handled.
+/// </param>
 /// <param name="Deferred">Messages taken out of the flow until this subscriber asks for them.</param>
 /// <param name="DeadLettered">Messages this subscriber gave up on, with their payloads kept.</param>
 /// <param name="Stranded">

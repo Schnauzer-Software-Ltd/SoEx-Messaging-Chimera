@@ -411,25 +411,29 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Claims the right to settle a delivery, so that settling one twice is refused rather than acted on.
-    /// </summary>
-    /// <remarks>
-    /// The in-flight slot is the reason this has to be checked. Each settle releases one, so a message settled
-    /// twice releases two and the cap quietly grows by one for the life of the subscription — or the release
-    /// throws, from a call the handler could not connect to the one that caused it. Both are worse than being
-    /// told plainly, on the second call, that this delivery is already finished with.
-    /// </remarks>
-    /// <summary>
     /// Runs one settle: claims the right to settle this delivery, does the work, and frees the in-flight slot
-    /// once it is done.
+    /// once it is done. Claiming it is also what makes settling one twice refused rather than acted on.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// The in-flight slot is the reason the claim has to be checked. Each settle releases one, so a message
+    /// settled twice releases two and the cap quietly grows by one for the life of the subscription — or the
+    /// release throws, from a call the handler could not connect to the one that caused it. Both are worse
+    /// than being told plainly, on the second call, that this delivery is already finished with.
+    /// </para>
+    /// <para>
     /// The slot is freed on success only, and the delivery goes back to being outstanding if the work threw.
     /// A settle that failed has settled nothing — the entry in the file still says in flight — so the caller
     /// has to be able to try again, and the slot it is holding is not free. Freeing it anyway would let the
     /// cap the consumer configured drift up by one for every settle that failed, and forgetting the delivery
     /// would leave it in flight in the file with nothing able to settle it short of opening the subscription
     /// again.
+    /// </para>
+    /// <para>
+    /// Which is why what runs inside one settle is one durable write and nothing after it. Handing the claim
+    /// back is right for a settle that did nothing and a lie about one whose effect committed, and this cannot
+    /// tell the two apart: the settles below leave nothing that can throw once their write has gone in.
+    /// </para>
     /// </remarks>
     private async ValueTask<T> SettlingAsync<T>(EventEnvelope envelope, Func<ValueTask<T>> settle)
     {
@@ -474,14 +478,21 @@ public sealed class SqliteSubscription : ISubscription
 
             if (envelope.Tag.Source == EntrySource.SetAside)
             {
-                long settled = await _store.SettleSetAsideAsync(envelope.Tag.Id,
-                    exhausted ? SetAsideDelivery.Held : SetAsideDelivery.Ready, cancellationToken)
-                    .ConfigureAwait(false);
                 if (exhausted)
                 {
-                    await MakeDeadAsync(envelope.Tag.Id, reason, cancellationToken).ConfigureAwait(false);
+                    // The same refusal the three other routes into the dead set make, on the fourth. A
+                    // replayed row this subscriber could not keep as a dead letter is not filed and destroyed
+                    // in one breath here either: the delivery stays the caller's, to complete deliberately or
+                    // to fail again once the bound is somewhere it can live.
+                    EnsureKeepable(envelope.Payload.Length);
+                    SetAsideOutcome dead = await _store.RefileAsync(envelope.Tag.Id, Topic, SetAsideKind.Dead,
+                        reason, _subscriptionOptions.SetAside, cancellationToken).ConfigureAwait(false);
+                    Arm(dead);
                     return false;
                 }
+
+                long settled = await _store.SettleSetAsideAsync(envelope.Tag.Id, SetAsideDelivery.Ready,
+                    cancellationToken).ConfigureAwait(false);
 
                 // What the settle actually did, exactly as on the log path below. A set-aside row can go
                 // while a handler holds it — a crash between the claim and the settle, or retention on the
@@ -533,18 +544,20 @@ public sealed class SqliteSubscription : ISubscription
     {
         if (envelope.Tag.Source == EntrySource.SetAside)
         {
-            // Already in this subscriber's store; it only changes what it is filed as. The bounds below are
-            // not consulted, and that is the point: re-filing a row adds neither a row nor a byte, so a
-            // message replayed and deferred again at the bound was being measured against itself and
-            // dead-lettered for a set that was not growing. The one bound that still applies is the one this
-            // row cannot satisfy by staying where it is: a payload larger than the whole dead byte bound
-            // cannot be a dead letter here, wherever it is coming from.
+            // Already in this subscriber's store, so this only changes what it is filed as — in both
+            // directions. A dead letter someone replayed and then deferred is filed as deferred, which is what
+            // the call says it does and what an operator working a dead set down is asking for.
+            //
+            // The one bound checked out here is the one no set the row could join can satisfy: a payload
+            // larger than the whole dead byte bound cannot be a dead letter, wherever it is coming from. The
+            // rest are read inside the write, against the set the row is joining.
             if (kind == SetAsideKind.Dead)
                 EnsureKeepable(envelope.Payload.Length);
 
-            await _store.SettleSetAsideAsync(envelope.Tag.Id, SetAsideDelivery.Held, ct).ConfigureAwait(false);
-            if (kind == SetAsideKind.Dead)
-                await MakeDeadAsync(envelope.Tag.Id, reason ?? "dead-lettered", ct).ConfigureAwait(false);
+            SetAsideOutcome refiled = await _store.RefileAsync(envelope.Tag.Id, Topic, kind,
+                reason ?? (kind == SetAsideKind.Dead ? "dead-lettered" : null),
+                _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
+            Arm(refiled);
             return;
         }
 
@@ -560,8 +573,22 @@ public sealed class SqliteSubscription : ISubscription
         if (outcome.Refused)
             throw Unkeepable(envelope.Payload.Length);
 
+        Arm(outcome);
+    }
+
+    /// <summary>
+    /// Arms the stop from what the write that filed the row saw, if a full dead set is one this subscriber
+    /// stops at.
+    /// </summary>
+    /// <remarks>
+    /// In memory and after the fact, on purpose: it is the one part of holding the bound that cannot throw, so
+    /// it is the one part that can safely run once the settle's durable effect has committed. The stop itself
+    /// lives in the file — this only saves the next read a query.
+    /// </remarks>
+    private void Arm(SetAsideOutcome outcome)
+    {
         if (outcome.Kind == SetAsideKind.Dead)
-            await EnforceDeadBoundAsync(ct).ConfigureAwait(false);
+            _stopped = StoppedBy(outcome.Sizes) ?? _stopped;
     }
 
     /// <summary>
@@ -584,50 +611,6 @@ public sealed class SqliteSubscription : ISubscription
     private DeadLetterTooLargeException Unkeepable(int size)
         => new(Topic, Subscriber, size, _subscriptionOptions.SetAside.MaxDeadBytes ?? 0);
 
-    /// <summary>
-    /// Files a message already in this subscriber's store as dead, and holds the dead bound to it.
-    /// </summary>
-    /// <remarks>
-    /// A row moving from deferred to dead grows the dead set by one just as a fresh dead letter does, and it
-    /// is the same set with the same bound. Enforcing it only where a row is newly inserted left the count
-    /// free to pass the limit whenever a message was replayed and then given up on — which is the ordinary way
-    /// a deferred message ends. Ageing one out already enforced it, from the retention pass; this brings the
-    /// two together.
-    /// </remarks>
-    private async ValueTask MakeDeadAsync(long asideId, string reason, CancellationToken ct)
-    {
-        await _store.MakeDeadAsync(asideId, reason, ct).ConfigureAwait(false);
-        await EnforceDeadBoundAsync(ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Dead is where the passing-along stops, so this is the one place a bound has to be settled rather than
-    /// deferred to somewhere else. Stopping is the default because a stopped subscriber keeps its position,
-    /// does not block the publisher and does not touch any other subscriber.
-    /// </summary>
-    private async ValueTask EnforceDeadBoundAsync(CancellationToken ct)
-    {
-        SetAsidePolicy policy = _subscriptionOptions.SetAside;
-        if (policy.MaxDeadCount is null && policy.MaxDeadBytes is null)
-            return;
-
-        // A limit is a maximum, so dropping trims back to it and stopping happens on reaching it — a
-        // subscriber that stops has no way to take another one anyway.
-        if (policy.DeadOverflow == DeadLetterOverflow.DropOldest)
-        {
-            // The store is handed the limits rather than an excess worked out here: settles land
-            // concurrently, and an excess measured before the delete is an excess several of them would each
-            // destroy in full. What it destroyed is recorded where it destroyed it, for the next pass to
-            // report.
-            await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes, ct)
-                .ConfigureAwait(false);
-            return;
-        }
-
-        SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
-        _stopped = StoppedBy(size) ?? _stopped;
-    }
-
     /// <summary>Whether this subscriber is one a full dead set stops at all.</summary>
     private bool StopsAtBound
         => _subscriptionOptions.SetAside.DeadOverflow == DeadLetterOverflow.StopDelivering
@@ -639,18 +622,26 @@ public sealed class SqliteSubscription : ISubscription
     /// question and reaching either is enough, so they are asked in the one place rather than at each of the
     /// three moments a dead letter can arrive.
     /// </summary>
+    /// <remarks>
+    /// What it counts is the dead letters parked in the set, not every row filed as dead. Replaying them is
+    /// the remedy this exception names, and completing a replay is what takes one out of the set — but a
+    /// replay has to be delivered before it can be completed, and a stopped subscriber delivers nothing. On
+    /// the count of every dead row, the remedy therefore could not run: replay changes only the delivery
+    /// state, so the number never moved and the subscriber stayed stopped against the one thing that could
+    /// have cleared it. Counting the parked ones lets a replay out and re-arms the stop if it comes back.
+    /// </remarks>
     private SubscriberStoppedException? StoppedBy(SetAsideSizes size)
     {
         SetAsidePolicy policy = _subscriptionOptions.SetAside;
         if (policy.DeadOverflow != DeadLetterOverflow.StopDelivering)
             return null;
 
-        if (policy.MaxDeadCount is { } count && size.Dead >= count)
-            return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, count,
+        if (policy.MaxDeadCount is { } count && size.DeadHeld >= count)
+            return new SubscriberStoppedException(Topic, Subscriber, size.DeadHeld, size.DeadHeldBytes, count,
                 SizeBound.Count);
 
-        if (policy.MaxDeadBytes is { } bytes && size.DeadBytes >= bytes)
-            return new SubscriberStoppedException(Topic, Subscriber, size.Dead, size.DeadBytes, bytes,
+        if (policy.MaxDeadBytes is { } bytes && size.DeadHeldBytes >= bytes)
+            return new SubscriberStoppedException(Topic, Subscriber, size.DeadHeld, size.DeadHeldBytes, bytes,
                 SizeBound.Bytes);
 
         return null;

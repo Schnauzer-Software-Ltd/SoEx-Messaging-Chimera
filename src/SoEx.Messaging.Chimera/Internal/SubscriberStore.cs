@@ -337,11 +337,13 @@ internal sealed class SubscriberStore : IAsyncDisposable
         string origin = $"{source.ToString().ToLowerInvariant()}:{id}";
         SetAsideKind filedAs = kind;
         bool refused = false;
+        SetAsideSizes sizes = default;
 
         long asideId = await _writer.EnqueueAsync((connection, transaction) =>
         {
             filedAs = kind;
             refused = false;
+            sizes = default;
             string? why = reason;
 
             // Nothing is ever dropped to make room: a message that vanished because a bound was reached is
@@ -409,10 +411,120 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 AdvanceMark(connection, transaction, topic);
             }
 
+            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds);
             return written;
         }, ct).ConfigureAwait(false);
 
-        return new SetAsideOutcome(asideId, filedAs, refused);
+        return new SetAsideOutcome(asideId, filedAs, refused, sizes);
+    }
+
+    /// <summary>
+    /// Holds the dead bound to the set inside the write that just changed it, and answers with the sizes the
+    /// caller needs to decide whether the subscriber should stop.
+    /// </summary>
+    /// <remarks>
+    /// This runs here, in the transaction that filed the row, rather than in a second write op afterwards. A
+    /// settle made of two ops can commit the first and then fail the second — a cancelled token is checked at
+    /// the door of every op, so the ordinary way to hit it is to cancel a settle whose insert is already
+    /// queued — and the caller is then told the settle failed over an effect that is durable. It retries, and
+    /// the same message is filed dead twice. One op cannot half-happen, so there is nothing left to fail.
+    /// </remarks>
+    private static SetAsideSizes EnforceDead(SqliteConnection connection, SqliteTransaction transaction,
+        string topic, SetAsideKind filedAs, SetAsidePolicy bounds)
+    {
+        if (filedAs != SetAsideKind.Dead || (bounds.MaxDeadCount is null && bounds.MaxDeadBytes is null))
+            return default;
+
+        // A limit is a maximum, so dropping trims back to it and stopping happens on reaching it — a
+        // subscriber that stops has no way to take another one anyway.
+        if (bounds.DeadOverflow == DeadLetterOverflow.DropOldest)
+        {
+            TrimDeadTo(connection, transaction, topic, bounds.MaxDeadCount, bounds.MaxDeadBytes);
+            return default;
+        }
+
+        return SetAsideSize(connection, transaction, topic);
+    }
+
+    /// <summary>
+    /// Re-files a row already in this store as something else, and holds the bounds to what that leaves.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One write op, for the reason <see cref="EnforceDead"/> gives: the settles that reach here are the ones
+    /// that give a delivery back when they throw, so anything that can throw after the row has moved is a
+    /// failure reported over a durable effect.
+    /// </para>
+    /// <para>
+    /// The deferred bounds are consulted only when the row is joining the deferred set from outside it. A row
+    /// re-filed as what it already is adds neither a row nor a byte, and measuring it against a set it is
+    /// already inside is how a message replayed and deferred again at the bound was dead-lettered for a set
+    /// that was not growing. A row moving the other way — dead to deferred — is genuinely joining, so it is
+    /// measured, and a deferral that does not fit stays dead and says so, exactly as one arriving fresh does.
+    /// </para>
+    /// </remarks>
+    internal async ValueTask<SetAsideOutcome> RefileAsync(long asideId, string topic, SetAsideKind kind,
+        string? reason, SetAsidePolicy bounds, CancellationToken ct = default)
+    {
+        SetAsideKind filedAs = kind;
+        SetAsideSizes sizes = default;
+
+        await _writer.EnqueueAsync((connection, transaction) =>
+        {
+            filedAs = kind;
+            sizes = default;
+            string? why = reason;
+
+            SetAsideKind was;
+            long length;
+            using (var current = Sqlite.Command(connection, transaction,
+                "SELECT kind, LENGTH(payload) FROM set_aside WHERE aside_id = $i;"))
+            {
+                current.Parameters.AddWithValue("$i", asideId);
+                using SqliteDataReader reader = current.ExecuteReader();
+                if (!reader.Read())
+                    return 0;   // discarded, or destroyed by a bound, while the handler held it
+                was = (SetAsideKind)reader.GetInt32(0);
+                length = reader.GetInt64(1);
+            }
+
+            if (filedAs == SetAsideKind.Deferred && was != SetAsideKind.Deferred)
+            {
+                SetAsideSizes size = SetAsideSize(connection, transaction, topic);
+                if (bounds.MaxDeferredCount is { } maxDeferred && size.Deferred >= maxDeferred)
+                {
+                    filedAs = SetAsideKind.Dead;
+                    why = $"deferred set full ({maxDeferred})";
+                }
+                else if (bounds.MaxDeferredBytes is { } maxBytes && size.DeferredBytes + length > maxBytes)
+                {
+                    filedAs = SetAsideKind.Dead;
+                    why = $"deferring would exceed the deferred byte bound ({maxBytes} bytes); left dead";
+                }
+            }
+
+            using (var command = Sqlite.Command(connection, transaction,
+                """
+                UPDATE set_aside SET kind = $k, delivery = $held, reason = $r, aside_at = $now
+                WHERE aside_id = $i;
+                """))
+            {
+                command.Parameters.AddWithValue("$k", (int)filedAs);
+                command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
+                command.Parameters.AddWithValue("$r", (object?)why ?? DBNull.Value);
+
+                // Re-stamped, because the age bounds measure how long a row has sat as what it now is: a
+                // message deferred a moment ago has not been sitting there since it was first set aside.
+                command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+                command.Parameters.AddWithValue("$i", asideId);
+                command.ExecuteNonQuery();
+            }
+
+            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds);
+            return 1;
+        }, ct).ConfigureAwait(false);
+
+        return new SetAsideOutcome(asideId, filedAs, Refused: false, sizes);
     }
 
     /// <summary>Lists what is set aside. Reads go through the writer, which keeps one connection per file.</summary>
@@ -752,20 +864,6 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteNonQuery();
         }, ct);
 
-    /// <summary>Marks a set-aside row dead after its replay failed too often.</summary>
-    internal ValueTask<long> MakeDeadAsync(long asideId, string reason, CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
-        {
-            using var command = Sqlite.Command(connection, transaction,
-                "UPDATE set_aside SET kind = $k, delivery = $held, reason = $r, aside_at = $now WHERE aside_id = $i;");
-            command.Parameters.AddWithValue("$k", (int)SetAsideKind.Dead);
-            command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
-            command.Parameters.AddWithValue("$r", reason);
-            command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
-            command.Parameters.AddWithValue("$i", asideId);
-            return command.ExecuteNonQuery();
-        }, ct);
-
     /// <summary>How much this subscriber currently has set aside: a count and a payload total for each kind.</summary>
     /// <remarks>
     /// Kept apart rather than totalled because the two sets are bounded separately, and they are bounded
@@ -791,15 +889,19 @@ internal sealed class SubscriberStore : IAsyncDisposable
               COALESCE(SUM(CASE WHEN kind = $deferred THEN 1 ELSE 0 END), 0),
               COALESCE(SUM(CASE WHEN kind = $dead THEN 1 ELSE 0 END), 0),
               COALESCE(SUM(CASE WHEN kind = $deferred THEN LENGTH(payload) ELSE 0 END), 0),
-              COALESCE(SUM(CASE WHEN kind = $dead THEN LENGTH(payload) ELSE 0 END), 0)
+              COALESCE(SUM(CASE WHEN kind = $dead THEN LENGTH(payload) ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN kind = $dead AND delivery = $held THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN kind = $dead AND delivery = $held THEN LENGTH(payload) ELSE 0 END), 0)
             FROM set_aside WHERE topic = $t;
             """);
         command.Parameters.AddWithValue("$t", topic);
         command.Parameters.AddWithValue("$deferred", (int)SetAsideKind.Deferred);
         command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
+        command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
         using SqliteDataReader reader = command.ExecuteReader();
         return reader.Read()
-            ? new SetAsideSizes(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3))
+            ? new SetAsideSizes(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3),
+                reader.GetInt64(4), reader.GetInt64(5))
             : default;
     }
 
@@ -849,50 +951,61 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// </remarks>
     internal ValueTask<long> TrimDeadToAsync(string topic, long? count, long? bytes,
         CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
+        => _writer.EnqueueAsync((connection, transaction)
+            => TrimDeadTo(connection, transaction, topic, count, bytes), ct);
+
+    /// <inheritdoc cref="TrimDeadToAsync"/>
+    /// <remarks>
+    /// Given the connection rather than the writer, so that the settle which filed the row can trim inside the
+    /// write that filed it. What a bound destroys and what put the set over it belong in one transaction.
+    /// </remarks>
+    private static long TrimDeadTo(SqliteConnection connection, SqliteTransaction transaction, string topic,
+        long? count, long? bytes)
+    {
+        long dropped;
+        // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
+        // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
+        // totalled like any other — it still occupies the set — but it is never the row deleted.
+        using (var command = Sqlite.Command(connection, transaction,
+            """
+            DELETE FROM set_aside WHERE aside_id IN (
+              SELECT aside_id FROM (
+                SELECT aside_id, delivery,
+                       ROW_NUMBER() OVER (ORDER BY aside_id DESC) AS place,
+                       SUM(LENGTH(payload)) OVER (ORDER BY aside_id DESC
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+                FROM set_aside WHERE topic = $t AND kind = $dead)
+              WHERE delivery <> $inflight
+                AND (($count IS NOT NULL AND place > $count)
+                  OR ($bytes IS NOT NULL AND running > $bytes)));
+            """))
         {
-            long dropped;
-            // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
-            // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
-            // totalled like any other — it still occupies the set — but it is never the row deleted.
-            using var command = Sqlite.Command(connection, transaction,
-                """
-                DELETE FROM set_aside WHERE aside_id IN (
-                  SELECT aside_id FROM (
-                    SELECT aside_id, delivery,
-                           ROW_NUMBER() OVER (ORDER BY aside_id DESC) AS place,
-                           SUM(LENGTH(payload)) OVER (ORDER BY aside_id DESC
-                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
-                    FROM set_aside WHERE topic = $t AND kind = $dead)
-                  WHERE delivery <> $inflight
-                    AND (($count IS NOT NULL AND place > $count)
-                      OR ($bytes IS NOT NULL AND running > $bytes)));
-                """);
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
             command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
             command.Parameters.AddWithValue("$count", (object?)count ?? DBNull.Value);
             command.Parameters.AddWithValue("$bytes", (object?)bytes ?? DBNull.Value);
             dropped = command.ExecuteNonQuery();
+        }
 
-            // Recorded in the same write that destroyed them. A count held in memory is a count a close or a
-            // crash takes with it, and what it was counting is loss nobody can reconstruct afterwards: the
-            // rows are gone. Kept in the file, it belongs to the subscriber rather than to whichever object
-            // happened to be settling at the time, and the next pass reports it whoever runs it.
-            if (dropped > 0)
-            {
-                using var record = Sqlite.Command(connection, transaction,
-                    """
-                    INSERT INTO meta (key, value) VALUES ($k, $n)
-                    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + $n AS TEXT);
-                    """);
-                record.Parameters.AddWithValue("$k", DroppedKey(topic));
-                record.Parameters.AddWithValue("$n", dropped.ToString());
-                record.ExecuteNonQuery();
-            }
+        // Recorded in the same write that destroyed them. A count held in memory is a count a close or a
+        // crash takes with it, and what it was counting is loss nobody can reconstruct afterwards: the
+        // rows are gone. Kept in the file, it belongs to the subscriber rather than to whichever object
+        // happened to be settling at the time, and the next pass reports it whoever runs it.
+        if (dropped > 0)
+        {
+            using var record = Sqlite.Command(connection, transaction,
+                """
+                INSERT INTO meta (key, value) VALUES ($k, $n)
+                ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + $n AS TEXT);
+                """);
+            record.Parameters.AddWithValue("$k", DroppedKey(topic));
+            record.Parameters.AddWithValue("$n", dropped.ToString());
+            record.ExecuteNonQuery();
+        }
 
-            return dropped;
-        }, ct);
+        return dropped;
+    }
 
     /// <summary>How many dead letters have been destroyed for this topic since anyone last asked.</summary>
     /// <remarks>
@@ -971,7 +1084,21 @@ internal sealed record StoreSnapshot(long Mark, Dictionary<long, EntryState> Ent
 /// <summary>What became of a row this subscriber tried to set aside.</summary>
 /// <param name="Refused">Nothing was written: what it would have been filed as is something this subscriber
 /// cannot keep, so the caller is told instead of being answered with a row that is already gone.</param>
-internal readonly record struct SetAsideOutcome(long AsideId, SetAsideKind Kind, bool Refused);
+/// <param name="Sizes">
+/// What the dead set held once the write had finished with it, for a subscriber that stops at a bound rather
+/// than trimming to one. Read in the same transaction that filed the row, so the answer the caller acts on is
+/// the one that was true when it landed. Empty for the other overflow policy, which needs no answer.
+/// </param>
+internal readonly record struct SetAsideOutcome(long AsideId, SetAsideKind Kind, bool Refused,
+    SetAsideSizes Sizes);
 
 /// <summary>What one subscriber has set aside: a count and a payload total for each of the two sets.</summary>
-internal readonly record struct SetAsideSizes(long Deferred, long Dead, long DeferredBytes, long DeadBytes);
+/// <param name="DeadHeld">
+/// Dead letters nobody is working on — the ones parked in the set rather than on their way out of it. A
+/// subscriber that stops at a full dead set counts these, not every dead row: replay is the documented way to
+/// clear the stop, and a replayed row that still counted would leave the subscriber stopped against the only
+/// remedy it has.
+/// </param>
+/// <param name="DeadHeldBytes">Payload bytes those parked dead letters hold between them.</param>
+internal readonly record struct SetAsideSizes(long Deferred, long Dead, long DeferredBytes, long DeadBytes,
+    long DeadHeld, long DeadHeldBytes);
