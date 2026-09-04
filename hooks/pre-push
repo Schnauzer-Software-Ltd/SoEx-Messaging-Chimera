@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Product-repo push gate. A product change can break the tests, so this runs the same gate as the test
+# repo. See the test repo's scripts/prepush-verify.sh.
+exec /home/builder/soex-chimera-test/scripts/prepush-verify.sh "$@"

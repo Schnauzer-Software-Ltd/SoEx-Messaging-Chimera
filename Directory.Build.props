@@ -1,0 +1,26 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- Package metadata (applied to any project that is packed). -->
+  <PropertyGroup>
+    <Version>0.0.0-alpha-1</Version>
+    <Authors>Schnauzer Software Ltd</Authors>
+    <Company>Schnauzer Software Ltd</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 Schnauzer Software Ltd</Copyright>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>messaging;events;sqlite;pubsub;durable;in-process</PackageTags>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)artifacts</PackageOutputPath>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+</Project>

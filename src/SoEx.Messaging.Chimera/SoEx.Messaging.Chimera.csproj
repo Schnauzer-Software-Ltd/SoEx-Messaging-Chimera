@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>SoEx.Messaging.Chimera</RootNamespace>
+    <AssemblyName>SoEx.Messaging.Chimera</AssemblyName>
+    <Description>A durable event log that runs inside the process, storing each topic as a local SQLite file. Subscribers keep their own positions, so a topic fans out without copying, and nothing depends on a broker.</Description>
+  </PropertyGroup>
+
+  <!-- The only storage dependency, and it stays behind an internal seam. This project deliberately has
+       no SoEx dependency: the engine is usable on its own and the SoEx binding lives one project over. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+  </ItemGroup>
+
+  <!-- The mark-advancement invariant has to be tested against the store directly. Reaching it only through a
+       delivery loop would be a weaker test of the one rule that silently swallows messages when it is wrong. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="SoEx.Messaging.Chimera.Core.Tests" />
+    <InternalsVisibleTo Include="SoEx.Messaging.Chimera.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../SoEx.Messaging.Chimera.Abstractions/SoEx.Messaging.Chimera.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

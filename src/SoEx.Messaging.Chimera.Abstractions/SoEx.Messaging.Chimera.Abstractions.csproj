@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>SoEx.Messaging.Chimera</RootNamespace>
+    <AssemblyName>SoEx.Messaging.Chimera.Abstractions</AssemblyName>
+    <Description>Contracts for the SoEx.Chimera durable in-process event log: the log and subscription surfaces, the envelope, the entry states and the retention and delivery policies.</Description>
+  </PropertyGroup>
+
+  <!-- A delivery has to name the row it came from so it can be settled, but a handler has no business knowing
+       whether that row was in the log, the scheduled table or this subscriber's own store. The type stays
+       public so an envelope can be passed around; what it says is not. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="SoEx.Messaging.Chimera" />
+    <InternalsVisibleTo Include="SoEx.Messaging.Chimera.Core.Tests" />
+    <InternalsVisibleTo Include="SoEx.Messaging.Chimera.Testing" />
+  </ItemGroup>
+
+</Project>

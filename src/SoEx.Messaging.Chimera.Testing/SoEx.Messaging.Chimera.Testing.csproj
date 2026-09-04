@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>SoEx.Messaging.Chimera.Testing</RootNamespace>
+    <AssemblyName>SoEx.Messaging.Chimera.Testing</AssemblyName>
+    <Description>Reads what every subscriber under a Chimera root is doing, without disturbing any of them: how far behind each one is, what it is holding, and what became of one particular message. For asserting that an event-driven system has settled, and for finding out why it has not.</Description>
+  </PropertyGroup>
+
+  <!-- This reads the files' internals rather than its own copy of the schema. Two readers of one layout drift,
+       and the one that drifts silently is the one nobody runs in production. It ships in lockstep with the
+       engine for the same reason. -->
+  <ItemGroup>
+    <ProjectReference Include="../SoEx.Messaging.Chimera/SoEx.Messaging.Chimera.csproj" />
+  </ItemGroup>
+
+</Project>

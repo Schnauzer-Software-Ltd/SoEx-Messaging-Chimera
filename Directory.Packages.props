@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <!-- The embedded store, kept behind a narrow internal seam in SoEx.Messaging.Chimera. This is the only dependency
+       in the repository: the library is deliberately standalone, with no reference to SoEx or to any
+       hosting or container package, so it can be integrated by hand behind whatever seam a caller uses. -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+  </ItemGroup>
+</Project>
