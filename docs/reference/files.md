@@ -20,6 +20,25 @@ This is the rule the whole design rests on. Because each file has exactly one wr
 limit never binds, and no lease or visibility timeout is needed anywhere: a lock can only be held by one
 subscriber in one process, and if that process is gone the lock is gone with it.
 
+**Keeping to it is yours, not the library's.** Nothing here refuses a second writer, and that is deliberate.
+There are several ways to hold one writer to a file — a lock file in the root, a named system mutex, a lease
+in whatever your system already coordinates with, or simply a supervisor that runs one instance — and they
+differ in the things that matter: whether the lock survives a kill, what happens on a stale one, whether it
+works across containers or only within a host. Picking one for you would put its failure mode in your system
+without your having chosen it, and an enforcement that looks like a guarantee and is not one is worse than a
+rule you can see. So this is stated rather than enforced, and what the library does instead is behave sanely
+when it is broken.
+
+What breaking it costs, measured rather than asserted: two processes reading one topic through the *same*
+subscriber file handled 200 messages in about 210 deliveries, with none lost and the file readable
+afterwards. That is duplicate handling, which at-least-once already allows and which a handler here should
+already tolerate — not corruption and not loss. Which is precisely why it is easy to do by accident: there is
+no crash to tell you, only work done twice.
+
+Two spellings of one path are one file to everything here, so a relative root and an absolute one, or
+`/var/events` and `/var/./events`, cannot become two writers by accident. A symbolic link still can: the
+paths are resolved textually, not followed.
+
 It also means **you can open any of these files read-only, from any language, while the system is running**,
 without disturbing anything. You cannot corrupt them, advance anybody's position, or block a writer.
 

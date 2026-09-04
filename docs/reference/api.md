@@ -58,7 +58,8 @@ that there is only ever one is what removes the need for a lease or a visibility
 holds across processes as well as inside one: a publisher here and its subscribers over there is a supported
 shape, tested that way, because those are separate files with one writer each. Two processes on the *same*
 file is the thing to avoid, and what it costs when you do it is duplicate handling rather than damage —
-measured at around 210 deliveries for 200 messages, none lost. A
+measured at around 210 deliveries for 200 messages, none lost. Holding to the rule is yours to arrange, and
+[files](files.md#one-writer-any-number-of-readers) says why it is not arranged for you. A
 root written two ways is one root: paths are resolved before they are compared, so `/var/events` and
 `/var/./events` are the same files to every part of this. Symbolic links are not resolved.
 

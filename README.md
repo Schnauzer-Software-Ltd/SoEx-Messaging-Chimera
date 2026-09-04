@@ -55,7 +55,8 @@ system is running, without disturbing it.
 ## Limits, stated plainly
 
 - One writer per file, one machine. Processes may differ — a publisher here, its subscribers there — but two
-  writers on one file is a rule you are trusted to keep. Not a network broker and not a cluster.
+  writers on one file is a rule you keep, by whatever means suits your system: nothing here enforces it, and
+  the docs say why. Not a network broker and not a cluster.
 - The log is trimmed on retention, not on consumption. A subscriber that stops for longer than the
   retention window loses messages — it will tell you exactly how many, and it warns you before it
   happens, but it does not stop the publisher to save you.
