@@ -37,7 +37,15 @@ failed. A failure is a promise that the message will come again, and only the lo
 record removed while a redelivery is owed against it is as lost as one nobody ever saw. It then moves its position over the gap and carries on, because a position stuck
 below records that will never exist again would never move again. It comes out of the read loop rather than
 out of a handler, so the loop has to be written to catch it and start reading again;
-[integrating](../how-to/integrating.md) shows the shape.
+[integrating](../how-to/integrating.md) shows the shape. It is reported on the next poll whether or not the
+topic is still busy, including when a pass removed everything and left the log empty — the sequence counter
+is durable, so an empty log still knows how far it once got. A topic going quiet is exactly when an operator
+asks whether everything was drained, and it is no time to start answering yes by default.
+
+The retention size and the payload limit are checked against each other when a topic is opened. A `MaxBytes`
+below `MaxPayloadBytes` describes a topic that will accept a message no retention pass can then keep: it is
+written, and removed by the next pass as the record that put the log over its size, possibly before anyone
+read it. Since nothing can make such a message survive, the configuration is refused rather than the messages.
 
 The same is true on the scheduled side, but only that far: a scheduled delivery that failed is reported when
 its row goes, because the subscriber holds its own record of the attempt, while a scheduled message nobody
@@ -73,8 +81,15 @@ work nor lets the table grow without limit.
 Two consequences. Ordinary appends are unaffected while schedules are being refused: the log answers those
 settings by trimming, as it always did, so a full scheduled table does not stop anything being published.
 And the file's ceiling is the two bounds added together rather than either one — the log held at its bound by
-trimming, the scheduled table at its bound by refusing. What clears a refusal is due times arriving and the
-messages being consumed, or cancelling ones nobody wants any more.
+trimming, the scheduled table at its bound by refusing. What clears a refusal is due times arriving, or
+cancelling messages nobody wants any more.
+
+What the quota counts is the messages still waiting for a due time, not every row in the table. A delivered
+scheduled row stays where it is — fan-out means no one subscriber may remove it — so counting rows would
+count delivered history as pending work, and a topic doing steady scheduled traffic would be refused with
+nothing whatsoever outstanding. Service Bus counts what is waiting for the same reason, having removed the
+row at enqueue. The trade is that the tail of past-due rows is bounded by `MaxAge` rather than by this count,
+so the table can sit above the configured number while retention catches up with it.
 
 And a due time already in the past means due now, and is stored as now: a row that arrived behind a position
 already passed would sit below it and never be offered. Service Bus reads a scheduled enqueue time that has

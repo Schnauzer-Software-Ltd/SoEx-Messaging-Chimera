@@ -67,12 +67,19 @@ Disposing a subscription that is still holding deliveries hands them back rather
 out again on the next read, counted as further attempts, which is what the process stopping would have done
 to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach.
 
-`ScheduleAsync` refuses rather than stores when the topic's scheduled table is at the bound its retention
-policy sets, throwing `ScheduleRefusedException`. `DeadLetterAsync` and `FailAsync` refuse in one narrow case
-too: a subscriber set to drop the oldest, with a dead-letter byte bound smaller than the message, cannot keep
-the row it is being asked to file, so it throws `DeadLetterTooLargeException` instead of filing and
-destroying it in the same breath. A settle that threw has settled nothing, so the delivery is still yours —
-complete it to lose the message knowingly, or raise the bound.
+`ScheduleAsync` refuses rather than stores when the topic is already holding as many not-yet-due scheduled
+messages as its retention policy allows, throwing `ScheduleRefusedException`. Messages whose due time has
+passed do not hold the quota: they are on their way out, and what removes them is `MaxAge`. `DeadLetterAsync`
+and `FailAsync` refuse in one narrow case too: a subscriber set to drop the oldest, with a dead-letter byte
+bound smaller than the message, cannot keep the row it is being asked to file, so it throws
+`DeadLetterTooLargeException` instead of filing and destroying it in the same breath. That applies wherever
+the message is coming from, including a message that has run out of attempts and one already stored here and
+replayed. A settle that threw has settled nothing, so the delivery is still yours — complete it to lose the
+message knowingly, or raise the bound.
+
+Every settle is one durable write. Nothing runs after it that could fail, which is what makes "a settle that
+threw has settled nothing" a rule rather than a hope: a write already queued cannot be recalled, so cancelling
+a settle either takes effect before it is queued or does not take effect at all.
 
 `DeferredAsync` and `DeadLettersAsync` list what is set aside. `ReplayAsync(asideId)` makes one deliverable
 again from its own stored copy, so it works even after the log has dropped the original. `DiscardAsync`
@@ -129,7 +136,10 @@ payload at a time while the setting said it was bounded.
 When a dead-letter bound is reached the subscriber stops, by default, rather than destroying anything: it
 keeps its position, blocks nobody else, and starts again when the dead letters are dealt with. That is a
 property of the stored set and not of the object, so closing the subscription and opening it again does not
-buy another crop of deliveries — replaying or discarding the dead letters is what clears it. Under
+buy another crop of deliveries — replaying or discarding the dead letters is what clears it. What counts
+towards the bound is the dead letters parked in the set: replaying one takes it out of the count so that a
+stopped subscriber can still work through what stopped it, and a replay that fails its way back in puts it
+back. Deferring a replayed dead letter files it as deferred, which takes it out of the dead set too. Under
 `DropOldest` the oldest are destroyed instead, and a dead letter being handled right now is never one of
 them; it still counts towards the bound, so the set can sit briefly above it until that delivery settles.
 
@@ -137,4 +147,6 @@ Every one of these values is checked when the subscription is opened, as retenti
 opened. A negative or zero bound fails silently and destructively otherwise — a retention age below zero puts
 the cutoff in the future and removes the whole log — so `null` is how you say a bound is not wanted. Zero is
 allowed for `MaxDeferredAge` alone, where it means "age this out the next time a pass looks" and files the
-message dead rather than destroying it.
+message dead rather than destroying it. A retention `MaxBytes` below the topic's `MaxPayloadBytes` is refused
+for the same kind of reason: it describes a topic that accepts messages no retention pass can keep, and one
+of them would be written and then destroyed unread by the next pass.
