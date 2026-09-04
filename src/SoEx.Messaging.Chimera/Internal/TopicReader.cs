@@ -309,16 +309,39 @@ internal sealed class TopicReader : IDisposable
         return new ScheduledFloor(nowMs, (long)command.ExecuteScalar()!);
     }
 
-    /// <summary>Lowest sequence still in the log, for spotting what retention removed before it was read.</summary>
+    /// <summary>
+    /// Lowest sequence still in the log and highest, for spotting what retention removed before it was read
+    /// and for measuring how far behind a position is.
+    /// </summary>
+    /// <remarks>
+    /// A log retention has emptied has no lowest surviving sequence and no highest, and answering (0, 0) makes
+    /// every reading of those two numbers say the opposite of what happened: nothing above the position, so
+    /// nothing lost, nothing behind, and a subscriber reported as settled over messages that were destroyed
+    /// unread. The high-water mark answers instead. It is durable and exact — <c>seq</c> is AUTOINCREMENT
+    /// precisely so a sequence is never reissued, so SQLite keeps the highest ever assigned whether or not any
+    /// row survives — and it puts the bounds where an empty log genuinely leaves them: the next record will be
+    /// one above it, and everything up to it is gone. A log nobody has ever appended to reads as (1, 0), which
+    /// is the same empty window it always was.
+    /// </remarks>
     internal (long Min, long Max) Bounds()
     {
         if (_connection is null)
             return (0, 0);
 
         using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM log;");
+            """
+            SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0),
+                   COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0)
+            FROM log;
+            """);
         using SqliteDataReader reader = command.ExecuteReader();
-        return reader.Read() ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
+        if (!reader.Read())
+            return (0, 0);
+
+        long min = reader.GetInt64(0);
+        long max = reader.GetInt64(1);
+        long highWater = reader.GetInt64(2);
+        return max == 0 ? (highWater + 1, highWater) : (min, max);
     }
 
     internal DateTimeOffset? OldestAfter(long mark)

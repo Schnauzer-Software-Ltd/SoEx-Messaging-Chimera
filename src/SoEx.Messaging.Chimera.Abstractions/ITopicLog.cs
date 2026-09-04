@@ -32,11 +32,22 @@ public interface ITopicLog : IAsyncDisposable
 
     /// <summary>Removes a scheduled message. False if it was already removed.</summary>
     /// <remarks>
+    /// <para>
     /// True means the row was there and is now gone, not that the message was caught in time. A delivered
     /// message keeps its row — fan-out means no one subscriber may remove it, and only retention does — so
     /// cancelling one that has already been handled removes the row and returns true. There is nothing here
     /// that could tell the difference: whether it was delivered is each subscriber's own business, held in
     /// each subscriber's own file.
+    /// </para>
+    /// <para>
+    /// Cancelling a message a subscriber is in the middle of failing is reported to that subscriber as loss.
+    /// It has an entry saying the message reached it and is still owed another attempt — that is what a failed
+    /// delivery below the attempt limit leaves — and the row that attempt would have come from has gone, which
+    /// is <see cref="MessagesLostException"/> with <c>Scheduled</c> set. Nothing in the file distinguishes a
+    /// cancellation from a retention removal, and the loud reading is the safe one: a redelivery was promised
+    /// to a handler and is not going to happen. Cancel a message that may already be in delivery only if that
+    /// report is one the consumer can live with.
+    /// </para>
     /// </remarks>
     ValueTask<bool> CancelScheduledAsync(long scheduledId, CancellationToken cancellationToken = default);
 

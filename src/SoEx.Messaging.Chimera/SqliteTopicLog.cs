@@ -59,6 +59,19 @@ public sealed class SqliteTopicLog : ITopicLog
             throw new ArgumentOutOfRangeException(nameof(topicOptions), maxCount,
                 "A retention count must be greater than zero. Use null for no count bound.");
 
+        // A byte bound smaller than the largest message the topic will accept is a bound no such message can
+        // survive: it is accepted, written, and removed by the next retention pass as the record that put the
+        // log over its size — possibly before anyone read it. Refused here, where it is a configuration
+        // mistake with nothing at stake yet, rather than at the append, where the message is already in
+        // somebody's hands. It is the same rule the dead set follows when it refuses a dead letter it could
+        // not then keep, on the side of the file that keeps history.
+        if (retention.MaxBytes is { } bound && bound < topicOptions.MaxPayloadBytes)
+            throw new ArgumentOutOfRangeException(nameof(topicOptions), bound,
+                $"A retention size of {bound} bytes is below the topic's payload limit of " +
+                $"{topicOptions.MaxPayloadBytes} bytes, so a message at that limit would be removed by the " +
+                "next retention pass, unread. Raise MaxBytes to at least the payload limit, or lower " +
+                "MaxPayloadBytes to what retention can keep.");
+
         Directory.CreateDirectory(options.RootDirectory);
         string path = FileNames.TopicFile(options.RootDirectory, topic);
 
@@ -133,7 +146,7 @@ public sealed class SqliteTopicLog : ITopicLog
             // messages count against the entity quota and the send is refused. Measured inside the write for
             // the same reason every other bound here is: two schedules arriving together would otherwise both
             // find room in a table neither had joined yet.
-            if (Refusal(connection, transaction, bytes.Length) is { } stopped)
+            if (Refusal(connection, transaction, bytes.Length, Sqlite.ToUnixMs(now)) is { } stopped)
             {
                 refused = stopped;
                 return 0;
@@ -161,15 +174,26 @@ public sealed class SqliteTopicLog : ITopicLog
     /// answers by refusing the newest. Which means the file's ceiling is the two bounds added together, not
     /// either one of them — the log is held at its bound by trimming and the scheduled table by refusing.
     /// </summary>
+    /// <remarks>
+    /// What it counts is the messages still waiting for their due time, not every row in the table. A
+    /// scheduled row stays after it has been delivered — fan-out means the publisher cannot remove it, and
+    /// only retention does — so counting the table counts delivered history as pending work: five due-now
+    /// messages consumed and completed would refuse the sixth schedule until <c>MaxAge</c> came round, days
+    /// later, with nothing whatsoever pending. That is not the quota this is modelled on either; Service Bus
+    /// counts what is still waiting, because it takes a scheduled message out of the table at enqueue. The
+    /// tail of past-due rows is bounded by <c>MaxAge</c> rather than by this count, which is the trade: the
+    /// bound tracks work owed, and the table can sit above it while retention catches up.
+    /// </remarks>
     private ScheduleRefusedException? Refusal(SqliteConnection connection, SqliteTransaction transaction,
-        int size)
+        int size, long nowMs)
     {
         RetentionPolicy retention = _topicOptions.Retention;
         if (retention.MaxCount is null && retention.MaxBytes is null)
             return null;
 
         using var command = Sqlite.Command(connection, transaction,
-            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM scheduled;");
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM scheduled WHERE due_at > $now;");
+        command.Parameters.AddWithValue("$now", nowMs);
         using SqliteDataReader reader = command.ExecuteReader();
         if (!reader.Read())
             return null;
@@ -201,12 +225,8 @@ public sealed class SqliteTopicLog : ITopicLog
     public async ValueTask<IReadOnlyList<SubscriberPosition>> InspectSubscribersAsync(
         CancellationToken cancellationToken = default)
     {
-        long highest = await _writer.EnqueueAsync((connection, transaction) =>
-        {
-            using SqliteCommand command = Sqlite.Command(connection, transaction,
-                "SELECT COALESCE(MAX(seq), 0) FROM log;");
-            return (long)command.ExecuteScalar()!;
-        }, cancellationToken).ConfigureAwait(false);
+        long highest = await _writer.EnqueueAsync((connection, transaction)
+            => HighestSequence(connection, transaction), cancellationToken).ConfigureAwait(false);
 
         return SubscriberScan.Positions(_options, Topic, LogUuid, highest);
     }
@@ -258,8 +278,7 @@ public sealed class SqliteTopicLog : ITopicLog
             }
 
             logRemovedTo = logRemoved > 0 ? cutoff : 0;
-            using (var max = Sqlite.Command(connection, transaction, "SELECT COALESCE(MAX(seq), 0) FROM log;"))
-                highest = (long)max.ExecuteScalar()!;
+            highest = HighestSequence(connection, transaction);
 
             report = new RetentionReport(logRemoved, logRemovedTo, scheduledRemoved, []);
             return logRemoved + scheduledRemoved;
@@ -282,6 +301,27 @@ public sealed class SqliteTopicLog : ITopicLog
     {
         if (payload.Length > _topicOptions.MaxPayloadBytes)
             throw new PayloadTooLargeException(Topic, payload.Length, _topicOptions.MaxPayloadBytes);
+    }
+
+    /// <summary>
+    /// The highest sequence this log has ever issued, which is not the same as the highest it still holds.
+    /// </summary>
+    /// <remarks>
+    /// Taken from the AUTOINCREMENT counter rather than from the rows, so that a log retention has trimmed to
+    /// nothing does not read as a log with nothing in it: the difference is the whole of what a subscriber is
+    /// behind by, and reporting it as zero says everybody is up to date over records that were destroyed
+    /// unread. The counter is durable and never goes backwards, which is why <c>seq</c> is declared the way
+    /// it is.
+    /// </remarks>
+    private static long HighestSequence(SqliteConnection connection, SqliteTransaction transaction)
+    {
+        using SqliteCommand command = Sqlite.Command(connection, transaction,
+            """
+            SELECT MAX(
+              (SELECT COALESCE(MAX(seq), 0) FROM log),
+              COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0));
+            """);
+        return (long)command.ExecuteScalar()!;
     }
 
     private static long HighestSequenceWhere(SqliteConnection connection, SqliteTransaction transaction,

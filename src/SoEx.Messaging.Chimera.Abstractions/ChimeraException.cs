@@ -183,12 +183,12 @@ public sealed class ScheduleRefusedException : ChimeraException
 {
     public ScheduleRefusedException(string topic, long scheduled, long bytes, long limit, SizeBound bound)
         : base(bound == SizeBound.Bytes
-            ? $"Topic '{topic}' holds {bytes} bytes of scheduled messages, which is its bound of {limit} " +
-              "bytes. Scheduled messages are not trimmed by retention, so the schedule is refused rather " +
-              "than accepted into a table nothing will empty."
-            : $"Topic '{topic}' holds {scheduled} scheduled message(s), which is its bound of {limit}. " +
-              "Scheduled messages are not trimmed by retention, so the schedule is refused rather than " +
-              "accepted into a table nothing will empty.")
+            ? $"Topic '{topic}' is holding {bytes} bytes of scheduled messages that are not yet due, which " +
+              $"is its bound of {limit} bytes. Scheduled messages are not trimmed by retention, so the " +
+              "schedule is refused rather than accepted into a table nothing will empty."
+            : $"Topic '{topic}' is holding {scheduled} scheduled message(s) that are not yet due, which is " +
+              $"its bound of {limit}. Scheduled messages are not trimmed by retention, so the schedule is " +
+              "refused rather than accepted into a table nothing will empty.")
     {
         Topic = topic;
         Scheduled = scheduled;
@@ -199,10 +199,14 @@ public sealed class ScheduleRefusedException : ChimeraException
 
     public string Topic { get; }
 
-    /// <summary>Scheduled messages the topic holds.</summary>
+    /// <summary>
+    /// Scheduled messages the topic is holding for a due time that has not arrived. Rows already past due are
+    /// not counted: they are work on its way out rather than work waiting, and what removes them is the age
+    /// bound rather than this one.
+    /// </summary>
     public long Scheduled { get; }
 
-    /// <summary>Payload bytes they hold between them.</summary>
+    /// <summary>Payload bytes those messages hold between them.</summary>
     public long Bytes { get; }
 
     /// <summary>The limit that was reached, in the units of <see cref="Bound"/>.</summary>
