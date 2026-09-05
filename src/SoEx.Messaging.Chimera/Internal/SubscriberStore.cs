@@ -15,6 +15,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// </summary>
     private static readonly Dictionary<string, int> Reading = new(StringComparer.Ordinal);
 
+    /// <summary>The identity each path spelling this process has opened resolves to. See <see cref="Key"/>.</summary>
+    private static readonly Dictionary<string, string> Identities = new(StringComparer.Ordinal);
+
     private readonly SingleWriter _writer;
     private readonly TimeProvider _clock;
     private readonly string? _topic;
@@ -53,12 +56,16 @@ internal sealed class SubscriberStore : IAsyncDisposable
 
             if (topic is not null)
             {
+                // Worked out before the lock is taken: naming the file asks the filesystem a question the
+                // first time it sees a path, and every other store in this process opening any subscriber
+                // would be waiting behind it.
+                string key = Key(path, topic);
                 lock (Reading)
                 {
-                    Reading.TryGetValue(Key(path, topic), out int already);
+                    Reading.TryGetValue(key, out int already);
                     if (already == 0)
                         RecoverInFlight(connection, topic);
-                    Reading[Key(path, topic)] = already + 1;
+                    Reading[key] = already + 1;
                     counted = true;
                 }
             }
@@ -82,13 +89,28 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }
     }
 
-    private static string Key(string path, string topic) => path + "\u0000" + topic;
+    /// <summary>
+    /// How the file and topic a store is reading are named to the guard above. The path is folded to one
+    /// identity where the filesystem holding it ignores case, so two components configured with roots that
+    /// differ only in spelling find each other rather than each believing the other's deliveries are stale.
+    /// Asked once per path and remembered: the answer cannot change while the file is open, and a store
+    /// releasing its count has to name what it registered even if the file has since been deleted.
+    /// </summary>
+    private static string Key(string path, string topic)
+    {
+        lock (Identities)
+        {
+            if (!Identities.TryGetValue(path, out string? identity))
+                Identities[path] = identity = FileNames.Identity(path);
+            return identity + "\u0000" + topic;
+        }
+    }
 
     private static void Release(string path, string topic)
     {
+        string key = Key(path, topic);
         lock (Reading)
         {
-            string key = Key(path, topic);
             if (!Reading.TryGetValue(key, out int open))
                 return;
             if (open <= 1)
@@ -707,29 +729,45 @@ internal sealed class SubscriberStore : IAsyncDisposable
             // Records a handler is holding, or has already settled, are not lost to this subscriber however
             // they left the log: counting them would name messages someone has in their hands as ones that
             // never arrived. An entry left Available is neither — a delivery that failed and was handed back
-            // is owed another attempt only the log can make. Counted before the delete below takes the same
-            // entries with it.
-            long held;
-            using (var count = Sqlite.Command(connection, transaction,
+            // is owed another attempt only the log can make. Read before the delete below takes them, and
+            // read as ids rather than as a number so the gap this reports is the gap it counted.
+            var held = new HashSet<long>();
+            using (var rows = Sqlite.Command(connection, transaction,
                 """
-                SELECT COUNT(*) FROM entry
+                SELECT id FROM entry
                 WHERE topic = $t AND source = $s AND id > $a AND id < $b AND state <> $available;
                 """))
             {
-                count.Parameters.AddWithValue("$t", topic);
-                count.Parameters.AddWithValue("$s", (int)EntrySource.Log);
-                count.Parameters.AddWithValue("$a", mark);
-                count.Parameters.AddWithValue("$b", min);
-                count.Parameters.AddWithValue("$available", (int)EntryState.Available);
-                held = (long)count.ExecuteScalar()!;
+                rows.Parameters.AddWithValue("$t", topic);
+                rows.Parameters.AddWithValue("$s", (int)EntrySource.Log);
+                rows.Parameters.AddWithValue("$a", mark);
+                rows.Parameters.AddWithValue("$b", min);
+                rows.Parameters.AddWithValue("$available", (int)EntryState.Available);
+                using SqliteDataReader reader = rows.ExecuteReader();
+                while (reader.Read())
+                    held.Add(reader.GetInt64(0));
             }
 
+            // Everything in the gap except the deliveries that are still out. Those are left where they are
+            // deliberately: the mark is about to move past them, and an entry is then the only remaining
+            // record that this subscriber was handed the message at all. Deleting it — which is what used to
+            // happen — meant the settle that followed found nothing to hand back, so the failure was answered
+            // honestly and the message was counted by nobody: not here, because a handler held it when this
+            // ran, and not afterwards, because nothing was left to notice. What is left instead is swept by
+            // the pass over entries below the mark, which reports the ones still owed and is where the second
+            // ending for these lives. Bounded below by the mark as well, so an entry a previous gap left
+            // behind is that pass's to report and is not quietly taken from underneath it here.
             using (var entries = Sqlite.Command(connection, transaction,
-                "DELETE FROM entry WHERE topic = $t AND source = $s AND id <= $m;"))
+                """
+                DELETE FROM entry
+                WHERE topic = $t AND source = $s AND id > $a AND id <= $m AND state <> $inflight;
+                """))
             {
                 entries.Parameters.AddWithValue("$t", topic);
                 entries.Parameters.AddWithValue("$s", (int)EntrySource.Log);
+                entries.Parameters.AddWithValue("$a", mark);
                 entries.Parameters.AddWithValue("$m", min - 1);
+                entries.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
                 entries.ExecuteNonQuery();
             }
 
@@ -742,12 +780,70 @@ internal sealed class SubscriberStore : IAsyncDisposable
             }
 
             moved = AdvanceMark(connection, transaction, topic);
-            lost = Math.Max(0, min - mark - 1 - held);
+            lost = Math.Max(0, min - mark - 1 - held.Count);
+
+            // The bounds name records this report counted, and not the span it looked at. An operator given a
+            // range that takes in messages the subscriber is holding or has already dealt with goes looking
+            // for messages that are not missing.
             first = mark + 1;
+            while (first < min && held.Contains(first))
+                first++;
             last = min - 1;
+            while (last > mark && held.Contains(last))
+                last--;
             return lost;
         }, ct).ConfigureAwait(false);
         return (moved, lost, first, last);
+    }
+
+    /// <summary>
+    /// Clears the log entries the position has already passed, and says which of them were still owed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The mark only moves over an entry once there is nothing left to do about it, with one exception: the
+    /// settle above moves it over a gap retention left, and it leaves the deliveries that were out at the
+    /// time to be settled afterwards. Those entries come to rest underneath the mark, where no claim can
+    /// reach them — the claim guard is what makes that true — and nothing else will ever absorb them. This is
+    /// their ending, and which ending it is depends on how the delivery finished. Finished with is finished
+    /// with, however the record left the log. Handed back is a redelivery this subscriber was promised and
+    /// the log can no longer make, which is the definition of the loss it reports. A crash reaches the same
+    /// place: recovery hands its in-flight deliveries back, and the ones under the mark are owed.
+    /// </para>
+    /// <para>
+    /// The mark is read inside the delete and the rows are named by what the delete removed, so the report
+    /// belongs to the caller that removed them. A sibling, or a second enumerator, running this at the same
+    /// moment takes no rows and reports nothing rather than reporting the same loss over again. A delivery
+    /// claimed since the caller looked is left alone by the state clause for the same reason it is left alone
+    /// by the settle above: naming a message as lost while a handler holds it is the mistake in the report
+    /// that the guard exists to stop in the file.
+    /// </para>
+    /// </remarks>
+    internal async ValueTask<List<long>> ForgetStrandedAsync(string topic, CancellationToken ct = default)
+    {
+        List<long> owed = [];
+        await _writer.EnqueueAsync((connection, transaction) =>
+        {
+            owed.Clear();
+            using var command = Sqlite.Command(connection, transaction,
+                """
+                DELETE FROM entry
+                WHERE topic = $t AND source = $s AND state <> $inflight
+                  AND id <= (SELECT mark FROM cursor WHERE topic = $t)
+                RETURNING id, state;
+                """);
+            command.Parameters.AddWithValue("$t", topic);
+            command.Parameters.AddWithValue("$s", (int)EntrySource.Log);
+            command.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
+            using SqliteDataReader reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if ((EntryState)reader.GetInt32(1) == EntryState.Available)
+                    owed.Add(reader.GetInt64(0));
+            }
+            return owed.Count;
+        }, ct).ConfigureAwait(false);
+        return owed;
     }
 
     /// <summary>

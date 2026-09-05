@@ -35,6 +35,45 @@ internal static class FileNames
     /// </summary>
     private static string Full(string root, string file) => Path.GetFullPath(Path.Combine(root, file));
 
+    /// <summary>
+    /// The key one file is known by, for the guard that tells a subscription running now from one that has
+    /// gone. Two spellings of one path have to answer to the same key or that guard misses, and the second
+    /// component to open the file resets deliveries the first one's handlers are holding. <see cref="Full"/>
+    /// settles dot segments and relative roots; case is the spelling it cannot settle, because names are all
+    /// this class controls and the root directory belongs to the caller. Escaping a name and folding a path
+    /// are the same rule read from opposite ends: one name must never become two files, and one file must
+    /// never become two keys.
+    /// </summary>
+    internal static string Identity(string fullPath) => Identity(fullPath, IgnoresCase(fullPath));
+
+    /// <summary>The fold itself, separated from the question of whether to make it.</summary>
+    internal static string Identity(string fullPath, bool ignoresCase) =>
+        ignoresCase ? fullPath.ToLowerInvariant() : fullPath;
+
+    /// <summary>
+    /// Whether the filesystem holding this file ignores case — asked of the filesystem, by looking for the
+    /// same file under a spelling only a filesystem that ignores case would answer to.
+    /// </summary>
+    /// <remarks>
+    /// Assuming it from the operating system would be wrong in both directions, and folding a path the
+    /// filesystem does distinguish is the worse one: two subscriber files under one key, and the second
+    /// opened takes the first one's deliveries for its own. Windows and macOS default to filesystems that
+    /// ignore case and neither guarantees it, and a case-insensitive mount on Linux is ordinary enough.
+    /// Every spelling of one file gives the same answer, so the fold is stable however it was reached. The
+    /// file has to exist to be asked about, which every caller here has already seen to by opening it.
+    /// </remarks>
+    internal static bool IgnoresCase(string fullPath)
+    {
+        string swapped = string.Create(fullPath.Length, fullPath, static (span, path) =>
+        {
+            for (int i = 0; i < path.Length; i++)
+                span[i] = char.IsUpper(path[i]) ? char.ToLowerInvariant(path[i]) : char.ToUpperInvariant(path[i]);
+        });
+
+        // A path with no letters in it has no second spelling, and nothing to fold either way.
+        return !string.Equals(swapped, fullPath, StringComparison.Ordinal) && File.Exists(swapped);
+    }
+
     private static string Sanitise(string name, string what)
     {
         if (string.IsNullOrWhiteSpace(name))

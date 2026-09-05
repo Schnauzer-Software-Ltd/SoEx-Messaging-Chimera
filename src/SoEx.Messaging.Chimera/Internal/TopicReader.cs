@@ -251,6 +251,28 @@ internal sealed class TopicReader : IDisposable
     }
 
     /// <summary>
+    /// Whether one sequence still names a record in the log. Null when this reader has no file to answer
+    /// from, which is not the same answer as "it has gone" and must not be mistaken for it.
+    /// </summary>
+    /// <remarks>
+    /// Asked about the one record rather than inferred from the lowest sequence still present. Retention
+    /// takes the oldest records first, so the two agree today — but a settle answering a caller about the
+    /// message in its hands is the wrong place to depend on how another component chooses what to remove.
+    /// </remarks>
+    internal bool? ExistingLog(long seq)
+    {
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return null;
+
+            using SqliteCommand command = Sqlite.Command(connection, null, "SELECT 1 FROM log WHERE seq = $s;");
+            command.Parameters.AddWithValue("$s", seq);
+            return command.ExecuteScalar() is not null;
+        }
+    }
+
+    /// <summary>
     /// Which of these ids still name a row in the scheduled table. Null when this reader has no file to
     /// answer from, which is not the same answer as "none of them" and must not be mistaken for it.
     /// </summary>

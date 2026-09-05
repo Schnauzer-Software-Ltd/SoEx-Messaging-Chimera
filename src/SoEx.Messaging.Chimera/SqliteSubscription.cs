@@ -59,9 +59,7 @@ public sealed class SqliteSubscription : ISubscription
 
     private readonly StartAt _start;
     private bool _attached;
-    private bool _boundEvaluated;
     private long _seenMinimum;
-    private volatile SubscriberStoppedException? _stopped;
 
     private SqliteSubscription(string subscriber, string topic, ChimeraOptions options,
         SubscriptionOptions subscriptionOptions, SubscriberStore store, TopicReader reader, StartAt start,
@@ -363,28 +361,24 @@ public sealed class SqliteSubscription : ISubscription
     /// </summary>
     private async ValueTask<EventEnvelope?> NextAsync(CancellationToken ct)
     {
-        // The bound is on the stored set, so the stop belongs to the set and not to this object. A subscriber
-        // that stopped at a full dead set, was closed and opened again used to deliver until the next dead
-        // letter re-armed a flag the old process took with it — which meant a restart bought another crop of
-        // deliveries, and a set that was already at its limit crept past it once per process. Asking the set
-        // on the first read is what makes "stopped until somebody deals with them" outlive the instance.
-        if (_stopped is not null || (!_boundEvaluated && StopsAtBound))
+        // The bound is on the stored set, so the stop belongs to the set and not to this object, and it is
+        // read from the set on every poll. A subscriber that stopped at a full dead set, was closed and opened
+        // again used to deliver until the next dead letter re-armed a flag the old process took with it, so a
+        // restart bought another crop of deliveries. Asking once per instance instead fixed the restart and
+        // left the same hole open sideways: a second subscription on this subscriber and topic that happened
+        // to ask while the set had room kept that answer for as long as it lived, so a set filled by one of
+        // them stopped that one and a fresh one while the warm one delivered past it indefinitely. Reading it
+        // every time is also what lets the answer go the other way — replaying or discarding the dead letters
+        // is how someone clears this, and it would be unhelpful to make them restart the process as well.
+        //
+        // It costs one indexed read of this subscriber's own file per poll, and only for a subscription that
+        // asked to be stopped by a bound. A poll cancelled before the read has an answer simply has not asked
+        // yet, which is the ordinary state of the next poll anyway.
+        if (StopsAtBound)
         {
-            // Recheck rather than latch: replaying or discarding the dead letters is how someone clears this,
-            // and it would be unhelpful to make them restart the process as well.
             SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
-
-            // Spent only once it has an answer. Marking it before the read means an interrupted first poll —
-            // a consumer cancelling one is ordinary — counts as the evaluation that never happened, and this
-            // subscription then delivers past a full dead set for the rest of its life. Asking again is safe
-            // because asking is all it does.
-            _boundEvaluated = true;
-            if (StoppedBy(size) is { } still)
-            {
-                _stopped = still;
-                throw still;
-            }
-            _stopped = null;
+            if (StoppedBy(size) is { } stopped)
+                throw stopped;
         }
 
         if (!await TryAttachAsync(ct).ConfigureAwait(false))
@@ -407,6 +401,8 @@ public sealed class SqliteSubscription : ISubscription
 
         Dictionary<long, EntryState> states =
             await _store.EntryStatesAsync(Topic, EntrySource.Log, ct).ConfigureAwait(false);
+        await ForgetStrandedAsync(mark, states, ct).ConfigureAwait(false);
+
         return await TakeAsync(EntrySource.Log, _reader.After(mark, _subscriptionOptions.ReadBatchSize),
             0, states, ct).ConfigureAwait(false);
     }
@@ -471,6 +467,36 @@ public sealed class SqliteSubscription : ISubscription
 
             states = await _store.EntryStatesAsync(Topic, EntrySource.Scheduled, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Settles the log entries that came to rest under the position, reporting the ones still owed.
+    /// </summary>
+    /// <remarks>
+    /// The log twin of the pass over removed scheduled rows below, and it exists for the same reason: a
+    /// delivery that was out when retention overtook this subscriber is settled after the position has moved
+    /// past the record, and where that leaves it depends on how it was settled. Neither pass can be done at
+    /// the moment the record goes, because at that moment a handler still has the message and the answer is
+    /// not known yet.
+    /// <para>
+    /// The states this already read are what decides whether to run it at all. Entries under the mark are the
+    /// exception rather than the rule — a subscriber that is keeping up never has one — so the ordinary poll
+    /// pays a comparison over a dictionary it was going to read anyway rather than a write per read. The mark
+    /// is read again inside the write, so a stale reading here can only cost a pass that finds nothing.
+    /// </para>
+    /// </remarks>
+    private async ValueTask ForgetStrandedAsync(long mark, Dictionary<long, EntryState> states,
+        CancellationToken ct)
+    {
+        if (!states.Any(entry => entry.Key <= mark && entry.Value != EntryState.InFlight))
+            return;
+
+        List<long> owed = await _store.ForgetStrandedAsync(Topic, ct).ConfigureAwait(false);
+        foreach (long id in owed)
+            states.Remove(id);
+
+        if (owed.Count > 0)
+            throw new MessagesLostException(Topic, Subscriber, owed.Count, owed.Min(), owed.Max());
     }
 
     /// <summary>
@@ -708,7 +734,6 @@ public sealed class SqliteSubscription : ISubscription
                     EnsureKeepable(envelope.Payload.Length);
                     SetAsideOutcome dead = await _store.RefileAsync(envelope.Tag.Id, Topic, SetAsideKind.Dead,
                         reason, _subscriptionOptions.SetAside, cancellationToken).ConfigureAwait(false);
-                    Arm(dead);
                     return false;
                 }
 
@@ -734,8 +759,33 @@ public sealed class SqliteSubscription : ISubscription
             // caller cannot check for itself.
             long released = await _store.ReleaseAsync(Topic, envelope.Tag.Source, envelope.Tag.Id,
                 cancellationToken).ConfigureAwait(false);
-            return released > 0;
+            return released > 0 && StillInTheTopic(envelope.Tag);
         });
+
+    /// <summary>
+    /// Whether the record a handed-back delivery would come from is still in the topic file.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The release answers about this subscriber's own entry, and the promise a failure makes is about the
+    /// record. The two part company exactly where retention overtakes a delivery: the entry is there to hand
+    /// back long after the only thing that could act on it has gone, and a caller told "it will come again"
+    /// has no way to find out that nothing will ever offer it.
+    /// </para>
+    /// <para>
+    /// Asked after the release rather than before it. A record removed in between is one this subscriber is
+    /// still owed and is reported as lost, which is the honest ending for it; asking first would answer about
+    /// a file the entry had not yet been handed back against, and a stale "gone" there would be the same lie
+    /// pointing the other way. A reader with no file to answer from says nothing, and nothing is not "gone".
+    /// </para>
+    /// </remarks>
+    private bool StillInTheTopic(DeliveryTag tag)
+    {
+        bool? present = tag.Source == EntrySource.Scheduled
+            ? _reader.ExistingScheduled([tag.Id])?.Contains(tag.Id)
+            : _reader.ExistingLog(tag.Id);
+        return present ?? true;
+    }
 
     public ValueTask DeferAsync(EventEnvelope envelope, string? reason = null,
         CancellationToken cancellationToken = default)
@@ -778,7 +828,6 @@ public sealed class SqliteSubscription : ISubscription
             SetAsideOutcome refiled = await _store.RefileAsync(envelope.Tag.Id, Topic, kind,
                 reason ?? (kind == SetAsideKind.Dead ? "dead-lettered" : null),
                 _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
-            Arm(refiled);
             return;
         }
 
@@ -793,23 +842,6 @@ public sealed class SqliteSubscription : ISubscription
         // the delivery is still the caller's, exactly as after any settle that threw.
         if (outcome.Refused)
             throw Unkeepable(envelope.Payload.Length);
-
-        Arm(outcome);
-    }
-
-    /// <summary>
-    /// Arms the stop from what the write that filed the row saw, if a full dead set is one this subscriber
-    /// stops at.
-    /// </summary>
-    /// <remarks>
-    /// In memory and after the fact, on purpose: it is the one part of holding the bound that cannot throw, so
-    /// it is the one part that can safely run once the settle's durable effect has committed. The stop itself
-    /// lives in the file — this only saves the next read a query.
-    /// </remarks>
-    private void Arm(SetAsideOutcome outcome)
-    {
-        if (outcome.Kind == SetAsideKind.Dead)
-            _stopped = StoppedBy(outcome.Sizes) ?? _stopped;
     }
 
     /// <summary>
@@ -886,16 +918,12 @@ public sealed class SqliteSubscription : ISubscription
                 await _store.TrimDeadToAsync(Topic, policy.MaxDeadCount, policy.MaxDeadBytes,
                     cancellationToken).ConfigureAwait(false);
             }
-            else
-            {
-                // Reaching a limit is what stops a subscriber when it settles one, and this pass can be what
-                // takes the set there — a deferral ageing out is a dead letter arriving. The two agreeing is
-                // the difference between a bound that holds and one that waits for a further dead letter to
-                // notice it was passed.
-                SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, cancellationToken)
-                    .ConfigureAwait(false);
-                _stopped = StoppedBy(size) ?? _stopped;
-            }
+
+            // Nothing to arm on the other policy: this pass can be what takes the set to its limit — a
+            // deferral ageing out is a dead letter arriving — and the read that decides whether to stop
+            // happens on the next poll against the set this pass leaves behind. Arming it here as well used
+            // to be what made the bound hold, which meant a pass cancelled between the ageing and the arming
+            // left a set at its limit delivering.
         }
 
         // Everything since the last pass, not only what this one did. A dead letter arriving is as likely to

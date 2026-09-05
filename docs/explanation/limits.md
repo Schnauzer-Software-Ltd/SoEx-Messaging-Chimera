@@ -30,12 +30,20 @@ scheduled table as well as the log, since the age bound removes from both. Alarm
 retention window.
 
 **As it happens.** `ApplyRetentionAsync` reads the subscribers' files and names the ones that had not reached
-what it removed, and how many each lost. Log that at warning.
+what it removed, and how many each lost. Log that at warning. It counts from each subscriber's position, so a
+subscriber holding a delivery it goes on to complete is named here for a message that was never lost to it —
+this number is what the log can see from outside, and the subscriber's own report below is the one that knows
+how each delivery ended.
 
 **Afterwards.** The subscriber itself throws `MessagesLostException` on its next read, carrying the count and
 the range of sequences. Two things are counted in it: records this subscriber never read, and deliveries it
 failed. A failure is a promise that the message will come again, and only the log can keep that promise, so a
-record removed while a redelivery is owed against it is as lost as one nobody ever saw. It then moves its position over the gap and carries on, because a position stuck
+record removed while a redelivery is owed against it is as lost as one nobody ever saw. A delivery a handler
+still has in its hands is neither, and is not counted while that is true: what became of it is not known yet.
+It is counted when the handler is finished with it and the answer is a failure — on a later read, once the
+position has already moved — and it is `false` from `FailAsync` at the time, which is that call saying it
+cannot keep the promise it would otherwise be making. Between them, every record either reaches a handler that
+deals with it or turns up in exactly one of these reports. It then moves its position over the gap and carries on, because a position stuck
 below records that will never exist again would never move again. It comes out of the read loop rather than
 out of a handler, so the loop has to be written to catch it and start reading again;
 [integrating](../how-to/integrating.md) shows the shape. It is reported on the next poll whether or not the

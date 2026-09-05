@@ -107,7 +107,12 @@ public interface ISubscription : IAsyncDisposable
     /// Handling threw. Hands the message back for another attempt, or dead-letters it once
     /// <see cref="SubscriptionOptions.MaxAttempts"/> is reached. Redelivery is immediate.
     /// </summary>
-    /// <returns>True if the message will be delivered again; false if it is now a dead letter.</returns>
+    /// <returns>
+    /// True if the message will be delivered again. False if it will not: it is now a dead letter, or the
+    /// record it would have come from was removed by retention while you were holding it — the one case a
+    /// caller has no way of checking for itself. A message lost that way is counted and reported through
+    /// <see cref="MessagesLostException"/> on a later read, not silently dropped.
+    /// </returns>
     ValueTask<bool> FailAsync(EventEnvelope envelope, string reason, CancellationToken cancellationToken = default);
 
     /// <summary>

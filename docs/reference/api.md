@@ -50,6 +50,8 @@ frees one of the in-flight slots, so settling twice would quietly raise the limi
 throws has settled nothing and leaves the delivery yours to settle again, so a retry is the right response to
 one. `FailAsync` returns whether the message is coming back — false means it is now a dead letter, or that
 retention removed the record while you were holding it, which is the one case no caller can check for itself.
+A message that ends the second way is reported as lost on a later read, so it is named somewhere rather than
+only being implied by a return value you might not have looked at.
 
 One subscriber reading several topics is one `SqliteSubscription` per topic, all sharing that subscriber's
 file and its set-aside store. Open them freely: they do not disturb each other's deliveries. Do not open two
@@ -175,7 +177,9 @@ payload at a time while the setting said it was bounded.
 When a dead-letter bound is reached the subscriber stops, by default, rather than destroying anything: it
 keeps its position, blocks nobody else, and starts again when the dead letters are dealt with. That is a
 property of the stored set and not of the object, so closing the subscription and opening it again does not
-buy another crop of deliveries — replaying or discarding the dead letters is what clears it. What counts
+buy another crop of deliveries, and neither does a subscription that was already open when the set filled: the
+size is read from the file on every poll rather than remembered from the first one. Replaying or discarding
+the dead letters is what clears it. What counts
 towards the bound is the dead letters parked in the set: replaying one takes it out of the count so that a
 stopped subscriber can still work through what stopped it, and a replay that fails its way back in puts it
 back. Deferring a replayed dead letter files it as deferred, which takes it out of the dead set too. Under

@@ -101,5 +101,10 @@ public readonly record struct RetentionReport(
 /// <param name="Behind">Messages between its position and the end of the log.</param>
 public readonly record struct SubscriberPosition(string Subscriber, long Mark, long Behind);
 
-/// <param name="Lost">Messages removed that this subscriber had not read.</param>
+/// <param name="Lost">
+/// Messages removed above this subscriber's position. Measured from the position, which is all a log can see
+/// of a subscriber, so it counts a record whose delivery was out at the time and went on to be completed.
+/// The subscriber's own <see cref="MessagesLostException"/> knows how each delivery ended and can be lower;
+/// where the two disagree, it is the one to believe.
+/// </param>
 public readonly record struct SubscriberOvertaken(string Subscriber, long Mark, long Lost);
