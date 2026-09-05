@@ -14,7 +14,16 @@ public enum DeadLetterOverflow
     /// <summary>Stop delivering to this subscriber until somebody deals with the dead letters.</summary>
     StopDelivering = 0,
 
-    /// <summary>Destroy the oldest dead letters to make room. Bounded, silent unless the count is watched.</summary>
+    /// <summary>
+    /// Destroy the oldest dead letters to make room. Bounded, silent unless the count is watched.
+    /// </summary>
+    /// <remarks>
+    /// The only row this spares is one a handler has in its hands, because that handler is about to be told
+    /// what happened to it. Everything else is eligible, including a message you have replayed and not yet
+    /// been given: a replay marks a row for delivery, and a bound reached before that delivery happens still
+    /// takes the oldest. Count <c>SetAsideReport.DeadDropped</c> if that matters to you, or use
+    /// <see cref="StopDelivering"/>, which destroys nothing.
+    /// </remarks>
     DropOldest = 1,
 }
 

@@ -60,6 +60,31 @@ receives nothing sent before it was created, and a JetStream consumer replays th
 complaining about what has aged out of it. Which of those two a new subscriber gets is
 `SubscriptionOptions.Start`, and it applies once, when the position is first recorded.
 
+## The other way a message can be destroyed: a full dead-letter set
+
+By default a subscriber that fills its dead-letter set stops delivering until somebody deals with it, and
+nothing is destroyed. `DeadLetterOverflow.DropOldest` chooses the other answer, and it is the only setting in
+this library that destroys a message to make room. It is not the default for that reason.
+
+What it spares is exactly one thing: a message a handler has in its hands. That handler is about to be told
+what happened to it, and telling it about a row that no longer exists is the sort of untruth the rest of this
+design goes to some length to avoid. Everything else in the set is eligible, and that includes a message you
+have replayed and not yet been given.
+
+Worth stating plainly, because it looks like a hole. `ReplayAsync` answering true means the row was marked
+for delivery; it is a statement about the store as it stood, not a promise that the delivery happens. Nothing
+has read the row yet. A bound reached in the meantime takes the oldest, and if that is the row you replayed,
+that is the row that goes — the same relationship an append has with retention, which can remove a record
+before anybody reads it.
+
+We could spare replayed rows too, and chose not to. In-flight deliveries are capped by `MaxInFlight`, so
+exempting them costs a known and small amount of slack. There is no cap on how many rows can be made ready at
+once, so exempting those would let a caller who replayed a whole set switch the bound off. A bound that can be
+suspended is a worse thing to have than loss that is counted, and counted is what this is: every destroyed
+dead letter lands in `SetAsideReport.DeadDropped`, which is durable, survives the process, and is reported by
+whichever pass asks next. If you need the guarantee rather than the count, `StopDelivering` is the setting
+that gives it.
+
 ## Scheduled messages stay in the file after they are delivered
 
 A scheduled message is not moved into the log and is not removed when somebody consumes it. Subscribers read

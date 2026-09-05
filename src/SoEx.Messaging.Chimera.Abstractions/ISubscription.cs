@@ -119,6 +119,13 @@ public interface ISubscription : IAsyncDisposable
     ValueTask<IReadOnlyList<SetAsideEntry>> DeadLettersAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Makes a set-aside message deliverable again, from its own stored copy.</summary>
+    /// <returns>
+    /// True if the row was marked for delivery. That is a statement about the store as it stood, not a promise
+    /// that the delivery happens: nothing has read it yet, and under
+    /// <see cref="DeadLetterOverflow.DropOldest"/> a bound reached in the meantime can still take it, as
+    /// retention can take a record between an append and a read. False if there was no such row, or a handler
+    /// has it now.
+    /// </returns>
     ValueTask<bool> ReplayAsync(long asideId, CancellationToken cancellationToken = default);
 
     /// <summary>Destroys a set-aside message. The only deliberate loss in this library.</summary>

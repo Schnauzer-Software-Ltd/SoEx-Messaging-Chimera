@@ -959,6 +959,15 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// It still counts towards the limit, so the set can sit one or two above itself while those deliveries
     /// finish, and the next pass trims what they leave behind.
     /// </para>
+    /// <para>
+    /// A row that has been replayed but not yet handed out is not spared, and that is a decision rather than
+    /// an oversight. Nothing has been told anything about it that this could falsify — the answer replay gave
+    /// was about the store as it stood, the same kind of answer an append gives about a record retention may
+    /// later reach. And the exemption cannot be widened to cover it safely: deliveries in flight are capped by
+    /// <c>MaxInFlight</c>, whereas any number of rows can be made ready at once, so sparing them would let a
+    /// caller who replayed a whole set suspend the bound entirely. A bound that can be switched off is worse
+    /// than loss that is counted, which is what this option exists to provide.
+    /// </para>
     /// </remarks>
     internal ValueTask<long> TrimDeadToAsync(string topic, long? count, long? bytes,
         CancellationToken ct = default)

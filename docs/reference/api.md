@@ -95,11 +95,19 @@ destroys it, which is the only deliberate loss in this library. Both leave a mes
 right now alone and answer false: a row cannot be delivered to two handlers at once, and destroying one under
 a handler would make everything it is told afterwards untrue. Wait for the delivery to settle and ask again.
 
+`ReplayAsync` answering true means the row is marked for delivery, not that the delivery will happen. Nothing
+has read it yet, and under `DropOldest` a dead-letter bound reached before it is read can still take it —
+`ReplayAsync` is no more able to promise that than `AppendAsync` can promise retention will not reach a record
+before somebody reads it. Only a message actually in a handler's hands is safe from that bound. Under
+`StopDelivering`, which is the default, nothing is destroyed and the question does not arise.
+
 `LagAsync()` reports how far behind this subscriber is, as a count and as a duration.
 
 `ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Ageing one out
-changes what it is filed as and nothing else, so a message you have replayed is still on its way to you and
-the next read delivers it — as a dead letter, which is what replaying one has always meant. The pass leaves a
+changes what it is filed as and nothing else, so it does not itself cancel a replay: the row stays on its way
+to you and the next read delivers it, as a dead letter, which is what replaying one has always meant. Under
+`DropOldest` the same pass then enforces the bound, and that can destroy the row it has just aged out, or one
+you replayed earlier — counted, in the same report. The pass leaves a
 message a handler is holding alone entirely, because it has not been sitting anywhere; its age is measured
 again on the next pass, from wherever its settle leaves it. Its report also
 carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
