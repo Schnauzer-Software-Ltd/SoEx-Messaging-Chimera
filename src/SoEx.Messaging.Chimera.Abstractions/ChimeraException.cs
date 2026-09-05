@@ -139,8 +139,8 @@ public sealed class SubscriberStoppedException : ChimeraException
 
 /// <summary>
 /// A dead letter could not be filed, because it could not then be kept. Only ever raised by a subscriber set
-/// to drop the oldest with a byte bound smaller than the message: the row would be destroyed as it arrived,
-/// and a settle that says a message is filed when it has just been destroyed is worse than a refusal.
+/// to drop the oldest with a byte bound smaller than the message: keeping this row means destroying every
+/// other dead letter the subscriber holds and still standing over the bound, so it is refused instead.
 /// </summary>
 /// <remarks>
 /// The delivery is still outstanding, exactly as after any settle that threw. There are two ways on:
@@ -152,9 +152,10 @@ public sealed class DeadLetterTooLargeException : ChimeraException
 {
     public DeadLetterTooLargeException(string topic, string subscriber, int size, long limit)
         : base($"Subscriber '{subscriber}' cannot file a {size}-byte dead letter on topic '{topic}': its " +
-               $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so the row " +
-               "would be destroyed as it arrived. Complete the delivery to lose the message deliberately, or " +
-               "raise MaxDeadBytes above the topic's payload limit.")
+               $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so keeping " +
+               "this one would destroy every other dead letter it holds and still leave the set over the " +
+               "bound. Complete the delivery to lose the message deliberately, or raise MaxDeadBytes above " +
+               "the topic's payload limit.")
     {
         Topic = topic;
         Subscriber = subscriber;
@@ -177,7 +178,9 @@ public sealed class DeadLetterTooLargeException : ChimeraException
 /// <remarks>
 /// Service Bus does the same thing for the same reason — scheduled messages count against the entity quota
 /// and the send is refused. What clears it is the same as there: due times arriving and the messages being
-/// consumed, or cancelling ones that are no longer wanted.
+/// consumed, or cancelling ones that are no longer wanted. <see cref="Scheduled"/> and <see cref="Bytes"/>
+/// count what is still waiting for a due time, which is what the bound is on; rows already past due are held
+/// by <c>RetentionPolicy.MaxAge</c> instead, so a schedule made for now is never refused by this.
 /// </remarks>
 public sealed class ScheduleRefusedException : ChimeraException
 {

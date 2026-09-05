@@ -88,8 +88,27 @@ What the quota counts is the messages still waiting for a due time, not every ro
 scheduled row stays where it is — fan-out means no one subscriber may remove it — so counting rows would
 count delivered history as pending work, and a topic doing steady scheduled traffic would be refused with
 nothing whatsoever outstanding. Service Bus counts what is waiting for the same reason, having removed the
-row at enqueue. The trade is that the tail of past-due rows is bounded by `MaxAge` rather than by this count,
-so the table can sit above the configured number while retention catches up with it.
+row at enqueue.
+
+Which means the two settings bound *future-dated* work, and the rest of the table is bounded by time. Size
+them with both halves in mind:
+
+    rows in the file  ≈  MaxCount  +  (rate of due-or-past-due schedules × MaxAge)
+
+The second term is the one that surprises people. A schedule whose due time has already arrived is stored as
+due now, so it is never inside the counted set — not even at the instant it is written — and `MaxCount` does
+not see it at all. Nothing is wrong with that; those rows are past-due history, the same thing the trailing
+end of a stream of short-dated schedules becomes a moment after it is written. But it means a publisher that
+schedules for now, or a second ahead, is bounded by `MaxAge` alone. If that traffic is heavy, bound it by
+lowering `MaxAge` on the topic — or publish it with `AppendAsync`, which is what a message with no waiting to
+do actually is.
+
+We do not count the past-due tail against the quota, and there is no option to. The bound would have to mean
+"work still owed", and no publisher can know that: whether a scheduled message has been delivered is recorded
+in each subscriber's own file, and with fan-out there is no single answer to give. Counting the whole table
+instead is the thing described above, which refuses schedules over delivered history. So the quota says what
+it can say honestly — future-dated work is bounded by count and bytes, the due tail by age — rather than
+approximating the number nobody here can compute.
 
 And a due time already in the past means due now, and is stored as now: a row that arrived behind a position
 already passed would sit below it and never be offered. Service Bus reads a scheduled enqueue time that has

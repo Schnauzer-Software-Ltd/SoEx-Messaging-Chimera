@@ -180,9 +180,17 @@ public sealed class SqliteTopicLog : ITopicLog
     /// only retention does — so counting the table counts delivered history as pending work: five due-now
     /// messages consumed and completed would refuse the sixth schedule until <c>MaxAge</c> came round, days
     /// later, with nothing whatsoever pending. That is not the quota this is modelled on either; Service Bus
-    /// counts what is still waiting, because it takes a scheduled message out of the table at enqueue. The
-    /// tail of past-due rows is bounded by <c>MaxAge</c> rather than by this count, which is the trade: the
-    /// bound tracks work owed, and the table can sit above it while retention catches up.
+    /// counts what is still waiting, because it takes a scheduled message out of the table at enqueue.
+    /// <para>
+    /// Which makes this a bound on future-dated work, and <c>MaxAge</c> the bound on everything else — the
+    /// documented trade, and it reaches further than a tail. A due time already gone is stored as now, so
+    /// those rows are outside the counted set from the moment they are written and never hold the quota at
+    /// all: schedule for now and the count does not apply. That is deliberate. The number this would have to
+    /// count to do better is work still owed, and the publisher cannot know it — delivery lives in each
+    /// subscriber's file, and fan-out means there is no single answer — while counting the whole table is the
+    /// thing described above. The sizing arithmetic is on <c>RetentionPolicy</c>, where someone choosing the
+    /// numbers will read it.
+    /// </para>
     /// </remarks>
     private ScheduleRefusedException? Refusal(SqliteConnection connection, SqliteTransaction transaction,
         int size, long nowMs)

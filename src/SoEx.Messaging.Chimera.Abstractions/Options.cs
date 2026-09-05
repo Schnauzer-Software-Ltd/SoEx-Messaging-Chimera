@@ -30,6 +30,16 @@ public enum Durability
 /// it too. Ordinary appends are unaffected. The file's ceiling is therefore these bounds counted twice — once
 /// for the log, held there by trimming, and once for the scheduled table, held there by refusing.
 /// </para>
+/// <para>
+/// On the scheduled side those two bound the messages still waiting for a due time, and the rest of the table
+/// is bounded by <see cref="MaxAge"/> instead. So size it as <c>MaxCount</c> plus the rate of due-or-past-due
+/// schedules times <c>MaxAge</c>: a due time that has already arrived is stored as now, which puts the row
+/// outside the counted set from the moment it is written, and a publisher scheduling for now is bounded by age
+/// alone. There is no option that counts the past-due tail, because the bound would have to mean work still
+/// owed and no publisher can know that — delivery is recorded in each subscriber's own file, and fan-out means
+/// there is no one answer. Heavy due-now traffic belongs in <c>AppendAsync</c>, which is what a message with
+/// no waiting to do is.
+/// </para>
 /// </remarks>
 public sealed record RetentionPolicy
 {

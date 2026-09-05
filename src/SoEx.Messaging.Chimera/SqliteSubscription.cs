@@ -209,7 +209,8 @@ public sealed class SqliteSubscription : ISubscription
         if (replayed is not null)
         {
             return new EventEnvelope(replayed.MessageId, replayed.EnqueuedAt, _options.Clock.GetUtcNow(),
-                replayed.Attempts, replayed.Payload, new DeliveryTag(EntrySource.SetAside, replayed.AsideId));
+                replayed.Attempts, replayed.Payload,
+                new DeliveryTag(EntrySource.SetAside, replayed.AsideId, replayed.Attempts));
         }
 
         EventEnvelope? scheduled = await TakeScheduledAsync(ct).ConfigureAwait(false);
@@ -361,7 +362,7 @@ public sealed class SqliteSubscription : ISubscription
                 continue;
 
             return new EventEnvelope(candidate.MessageId, candidate.EnqueuedAt, candidate.EligibleAt,
-                (int)attempt, payload, new DeliveryTag(source, candidate.Id));
+                (int)attempt, payload, new DeliveryTag(source, candidate.Id, (int)attempt));
         }
         return null;
     }
@@ -434,6 +435,13 @@ public sealed class SqliteSubscription : ISubscription
     /// back is right for a settle that did nothing and a lie about one whose effect committed, and this cannot
     /// tell the two apart: the settles below leave nothing that can throw once their write has gone in.
     /// </para>
+    /// <para>
+    /// What is claimed is a delivery and not a message, which is why the tag carries the attempt. A tag naming
+    /// only the row would be reissued by every redelivery, so a failure and the retry behind it re-armed the
+    /// tag a stale caller was still holding: its second settle was accepted, it settled the retry out from
+    /// under the handler working on it, and that handler's own settle was refused for a mistake it had not
+    /// made.
+    /// </para>
     /// </remarks>
     private async ValueTask<T> SettlingAsync<T>(EventEnvelope envelope, Func<ValueTask<T>> settle)
     {
@@ -481,9 +489,9 @@ public sealed class SqliteSubscription : ISubscription
                 if (exhausted)
                 {
                     // The same refusal the three other routes into the dead set make, on the fourth. A
-                    // replayed row this subscriber could not keep as a dead letter is not filed and destroyed
-                    // in one breath here either: the delivery stays the caller's, to complete deliberately or
-                    // to fail again once the bound is somewhere it can live.
+                    // replayed row this subscriber could not keep as a dead letter is refused here too: the
+                    // delivery stays the caller's, to complete deliberately or to fail again once the bound is
+                    // somewhere it can live.
                     EnsureKeepable(envelope.Payload.Length);
                     SetAsideOutcome dead = await _store.RefileAsync(envelope.Tag.Id, Topic, SetAsideKind.Dead,
                         reason, _subscriptionOptions.SetAside, cancellationToken).ConfigureAwait(false);
@@ -593,10 +601,11 @@ public sealed class SqliteSubscription : ISubscription
 
     /// <summary>
     /// Refuses a dead letter this subscriber could not then keep. A byte bound smaller than the message, with
-    /// dropping the oldest to stay inside it, makes the row the oldest as it lands: filing it would destroy
-    /// it, and answering a settle with "filed" for a message that no longer exists is the sort of lie the
-    /// rest of this library goes to some length to avoid. The caller can complete the delivery instead and
-    /// lose the message knowingly, which is a decision rather than an accident.
+    /// dropping the oldest to stay inside it, leaves the trim nothing it can do: a settle never destroys the
+    /// row it is filing, so this one would be kept by destroying every other dead letter the subscriber holds
+    /// and the set would still stand over the bound. Emptying a set to no purpose is not a bound being held,
+    /// so it is refused. The caller can complete the delivery instead and lose the message knowingly, which is
+    /// a decision rather than an accident.
     /// </summary>
     private void EnsureKeepable(int size)
     {

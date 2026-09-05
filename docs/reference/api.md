@@ -67,15 +67,23 @@ Disposing a subscription that is still holding deliveries hands them back rather
 out again on the next read, counted as further attempts, which is what the process stopping would have done
 to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach.
 
+Settle each delivery once. A second settle of the same one throws `InvalidOperationException`, and it is the
+*delivery* that is finished with rather than the message: if a failed message has since been handed out again,
+settling the old delivery is still refused and the new one is still yours to settle. Service Bus draws the
+same line with its lock token.
+
 `ScheduleAsync` refuses rather than stores when the topic is already holding as many not-yet-due scheduled
 messages as its retention policy allows, throwing `ScheduleRefusedException`. Messages whose due time has
-passed do not hold the quota: they are on their way out, and what removes them is `MaxAge`. `DeadLetterAsync`
-and `FailAsync` refuse in one narrow case too: a subscriber set to drop the oldest, with a dead-letter byte
-bound smaller than the message, cannot keep the row it is being asked to file, so it throws
-`DeadLetterTooLargeException` instead of filing and destroying it in the same breath. That applies wherever
-the message is coming from, including a message that has run out of attempts and one already stored here and
-replayed. A settle that threw has settled nothing, so the delivery is still yours — complete it to lose the
-message knowingly, or raise the bound.
+passed do not hold the quota: they are on their way out, and what removes them is `MaxAge`. That includes a
+message scheduled for now — its due time is stored as now, so it never holds the quota at all — which makes
+the count a bound on future-dated work and `MaxAge` the bound on the rest; [limits](../explanation/limits.md)
+has the sizing arithmetic. `DeadLetterAsync` and `FailAsync` refuse in one narrow case too: a subscriber set
+to drop the oldest, with a dead-letter byte bound smaller than the message, cannot keep the row it is being
+asked to file — keeping it would mean destroying every other dead letter the subscriber holds and standing
+over the bound anyway — so it throws `DeadLetterTooLargeException`. That applies wherever the message is
+coming from, including a message that has run out of attempts and one already stored here and replayed. A
+settle that threw has settled nothing, so the delivery is still yours — complete it to lose the message
+knowingly, or raise the bound.
 
 Every settle is one durable write. Nothing runs after it that could fail, which is what makes "a settle that
 threw has settled nothing" a rule rather than a hope: a write already queued cannot be recalled, so cancelling
@@ -89,7 +97,11 @@ a handler would make everything it is told afterwards untrue. Wait for the deliv
 
 `LagAsync()` reports how far behind this subscriber is, as a count and as a duration.
 
-`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Its report also
+`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. It leaves alone
+anything already on its way out — a message a handler is holding, and one you have replayed and not yet been
+given — because neither has been sitting anywhere, and turning a replayed message into a dead letter would
+cancel the replay without saying so. Both are measured again on the next pass, from wherever their settle
+leaves them. Its report also
 carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
 the set under `DropOldest` causes real loss too, and it would be misleading to put a number next to one path
 and a silence next to the other. That count lives in the subscriber's file rather than in memory, so a
@@ -142,6 +154,9 @@ stopped subscriber can still work through what stopped it, and a replay that fai
 back. Deferring a replayed dead letter files it as deferred, which takes it out of the dead set too. Under
 `DropOldest` the oldest are destroyed instead, and a dead letter being handled right now is never one of
 them; it still counts towards the bound, so the set can sit briefly above it until that delivery settles.
+Neither is the message the settle is filing at that moment: whatever a bound destroys to make room for it, it
+is never the message you were told had been filed. A replayed message settled back into a full set counts as
+the newest arrival, not as the row it was when it first arrived.
 
 Every one of these values is checked when the subscription is opened, as retention's are when the log is
 opened. A negative or zero bound fails silently and destructively otherwise — a retention age below zero puts

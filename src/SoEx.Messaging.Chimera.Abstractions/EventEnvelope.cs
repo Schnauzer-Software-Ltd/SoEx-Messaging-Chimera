@@ -33,22 +33,33 @@ public readonly record struct EventEnvelope(
 }
 
 /// <summary>
-/// Identifies a delivery to the subscription that produced it. Opaque on purpose: it names a row in a
+/// Identifies one delivery to the subscription that produced it. Opaque on purpose: it names a row in a
 /// particular table, which is the subscription's business and nobody else's. Hold it, hand it back, and do not
 /// try to read it — a handler that branches on where a message came from is one that will behave differently
 /// after a move to a real broker.
 /// </summary>
+/// <remarks>
+/// A delivery, not a message. The attempt is part of it because a message that fails is handed out again, and
+/// a tag naming only the row would be the same tag for both deliveries: a stale settle of the first one would
+/// then be accepted and would settle the second out from under the handler working on it, whose own settle was
+/// refused for a mistake it had not made. Service Bus draws the same line with its lock token. The attempt is
+/// unique per delivery within a store's lifetime — claiming a row is what increments it — so the two are
+/// distinguishable wherever they are compared.
+/// </remarks>
 public readonly record struct DeliveryTag
 {
-    internal DeliveryTag(EntrySource source, long id)
+    internal DeliveryTag(EntrySource source, long id, int attempt)
     {
         Source = source;
         Id = id;
+        Attempt = attempt;
     }
 
     internal EntrySource Source { get; }
 
     internal long Id { get; }
+
+    internal int Attempt { get; }
 }
 
 /// <summary>Which table a delivery came from. Plumbing, deliberately not part of the public surface.</summary>

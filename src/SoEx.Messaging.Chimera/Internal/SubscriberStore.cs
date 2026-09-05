@@ -368,9 +368,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
             }
 
             // Filed dead and too big to be kept: this subscriber destroys the oldest to stay inside its byte
-            // bound, and a row larger than the whole bound is the oldest the moment it lands. Writing it and
-            // deleting it in the same breath would answer the caller with a settle that succeeded and a
-            // message that no longer exists.
+            // bound, and the trim below never destroys the row the write is filing — so keeping this one
+            // means destroying every other dead letter and standing over the bound anyway. Emptying the set
+            // to no purpose is not the bound being held, so nothing is written.
             if (filedAs == SetAsideKind.Dead
                 && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
                 && bounds.MaxDeadBytes is { } maxDead && bytes.Length > maxDead)
@@ -411,7 +411,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 AdvanceMark(connection, transaction, topic);
             }
 
-            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds);
+            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds, written);
             return written;
         }, ct).ConfigureAwait(false);
 
@@ -430,7 +430,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// the same message is filed dead twice. One op cannot half-happen, so there is nothing left to fail.
     /// </remarks>
     private static SetAsideSizes EnforceDead(SqliteConnection connection, SqliteTransaction transaction,
-        string topic, SetAsideKind filedAs, SetAsidePolicy bounds)
+        string topic, SetAsideKind filedAs, SetAsidePolicy bounds, long filed)
     {
         if (filedAs != SetAsideKind.Dead || (bounds.MaxDeadCount is null && bounds.MaxDeadBytes is null))
             return default;
@@ -439,7 +439,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         // subscriber that stops has no way to take another one anyway.
         if (bounds.DeadOverflow == DeadLetterOverflow.DropOldest)
         {
-            TrimDeadTo(connection, transaction, topic, bounds.MaxDeadCount, bounds.MaxDeadBytes);
+            TrimDeadTo(connection, transaction, topic, bounds.MaxDeadCount, bounds.MaxDeadBytes, filed);
             return default;
         }
 
@@ -520,7 +520,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 command.ExecuteNonQuery();
             }
 
-            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds);
+            sizes = EnforceDead(connection, transaction, topic, filedAs, bounds, asideId);
             return 1;
         }, ct).ConfigureAwait(false);
 
@@ -910,9 +910,13 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// message that quietly evaporated would be the silent loss this whole design exists to avoid.
     /// </summary>
     /// <remarks>
-    /// A row a handler is holding has not sat anywhere; it is being worked on now, and the settle that follows
-    /// would put a dead letter straight back to ready. Its age is measured again on the next pass, from
-    /// wherever that settle leaves it.
+    /// Only rows that are actually sitting there. A row a handler is holding has not sat anywhere; it is being
+    /// worked on now, and the settle that follows would put a dead letter straight back to ready. Nor has one
+    /// an operator has replayed: it is on its way out, the next read delivers it, and the settle after that
+    /// re-files it with a fresh stamp — so nothing is left able to sit for ever. Turning a replayed row into a
+    /// held dead letter cancelled the replay without saying so, which is the one thing an operator working a
+    /// set down has no way to see. Both are measured again on the next pass, from wherever their settle leaves
+    /// them.
     /// </remarks>
     internal ValueTask<long> AgeOutDeferredAsync(string topic, DateTimeOffset cutoff, string reason,
         CancellationToken ct = default)
@@ -920,13 +924,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
         {
             using var command = Sqlite.Command(connection, transaction,
                 """
-                UPDATE set_aside SET kind = $dead, reason = $r, delivery = $held
-                WHERE topic = $t AND kind = $deferred AND aside_at < $cutoff AND delivery <> $inflight;
+                UPDATE set_aside SET kind = $dead, reason = $r
+                WHERE topic = $t AND kind = $deferred AND aside_at < $cutoff AND delivery = $held;
                 """);
             command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
             command.Parameters.AddWithValue("$deferred", (int)SetAsideKind.Deferred);
             command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
-            command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
             command.Parameters.AddWithValue("$r", reason);
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$cutoff", Sqlite.ToUnixMs(cutoff));
@@ -952,7 +955,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
     internal ValueTask<long> TrimDeadToAsync(string topic, long? count, long? bytes,
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction)
-            => TrimDeadTo(connection, transaction, topic, count, bytes), ct);
+            => TrimDeadTo(connection, transaction, topic, count, bytes, filed: null), ct);
 
     /// <inheritdoc cref="TrimDeadToAsync"/>
     /// <remarks>
@@ -960,22 +963,41 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// write that filed it. What a bound destroys and what put the set over it belong in one transaction.
     /// </remarks>
     private static long TrimDeadTo(SqliteConnection connection, SqliteTransaction transaction, string topic,
-        long? count, long? bytes)
+        long? count, long? bytes, long? filed)
     {
         long dropped;
         // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
         // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
         // totalled like any other — it still occupies the set — but it is never the row deleted.
+        //
+        // The row this write just filed is the newest arrival whatever its aside_id says, which is the whole
+        // of $filed. A re-filed row keeps the id it was given when it was first set aside, so ordering by id
+        // alone made a replayed message settled dead the oldest row in the set by construction: the trim its
+        // own settle triggers destroyed it, and the settle answered "filed" about a message that had gone.
+        // Sorting it to the front is what fixes that — numbered first and totalled first, it is kept and what
+        // it pushes out is the oldest of the rest, exactly as a fresh insert has always behaved.
+        //
+        // Excluding it from the delete as well makes "a settle never destroys the row it is filing" true of
+        // this statement rather than true only while every route into the set turns away a row it could not
+        // keep. With the ordering in place the exclusion never fires today: sorted first, this row is chosen
+        // only if it alone breaks the bound, and a count bound below one is refused when the subscription is
+        // opened while a payload over the whole byte bound is refused before the write on all four routes in.
+        // It is here because that is a guarantee assembled out of four call sites and a validation rule, and
+        // this defect is what it looks like when one of them is a bound out of step with the one that fires.
+        // It is also what lets the refusal say what it now says: not "this row would be destroyed as it
+        // landed" but "keeping it would destroy every other dead letter and still leave the set over the
+        // bound", which is the honest reason to turn it away.
         using (var command = Sqlite.Command(connection, transaction,
             """
             DELETE FROM set_aside WHERE aside_id IN (
               SELECT aside_id FROM (
                 SELECT aside_id, delivery,
-                       ROW_NUMBER() OVER (ORDER BY aside_id DESC) AS place,
-                       SUM(LENGTH(payload)) OVER (ORDER BY aside_id DESC
+                       ROW_NUMBER() OVER (ORDER BY aside_id = $filed DESC, aside_id DESC) AS place,
+                       SUM(LENGTH(payload)) OVER (ORDER BY aside_id = $filed DESC, aside_id DESC
                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
                 FROM set_aside WHERE topic = $t AND kind = $dead)
               WHERE delivery <> $inflight
+                AND ($filed IS NULL OR aside_id <> $filed)
                 AND (($count IS NOT NULL AND place > $count)
                   OR ($bytes IS NOT NULL AND running > $bytes)));
             """))
@@ -985,6 +1007,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
             command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
             command.Parameters.AddWithValue("$count", (object?)count ?? DBNull.Value);
             command.Parameters.AddWithValue("$bytes", (object?)bytes ?? DBNull.Value);
+            command.Parameters.AddWithValue("$filed", (object?)filed ?? DBNull.Value);
             dropped = command.ExecuteNonQuery();
         }
 
