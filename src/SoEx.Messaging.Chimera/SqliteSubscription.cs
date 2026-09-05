@@ -11,6 +11,19 @@ public sealed class SqliteSubscription : ISubscription
     private readonly SubscriptionOptions _subscriptionOptions;
     private readonly SubscriberStore _store;
     private readonly TopicReader _reader;
+
+    /// <summary>
+    /// The in-flight cap, deliberately never disposed.
+    /// </summary>
+    /// <remarks>
+    /// A settle frees its slot after its durable write has committed, and closing drains the writer's queue
+    /// rather than discarding it, so a settle whose write was queued when the close began commits during it
+    /// and then releases against an object the close has been through. A disposed semaphore throws there, and
+    /// the caller is told a settle that is on disk failed. Disposing buys nothing to set against that: the
+    /// only thing <see cref="SemaphoreSlim.Dispose()"/> releases is the wait handle behind
+    /// <see cref="SemaphoreSlim.AvailableWaitHandle"/>, which is never asked for here, and it does not wake
+    /// anyone already waiting.
+    /// </remarks>
     private readonly SemaphoreSlim _inFlight;
     private readonly ConcurrentDictionary<DeliveryTag, byte> _outstanding = new();
     private readonly StartAt _start;
@@ -433,7 +446,10 @@ public sealed class SqliteSubscription : ISubscription
     /// <para>
     /// Which is why what runs inside one settle is one durable write and nothing after it. Handing the claim
     /// back is right for a settle that did nothing and a lie about one whose effect committed, and this cannot
-    /// tell the two apart: the settles below leave nothing that can throw once their write has gone in.
+    /// tell the two apart: the settles below leave nothing that can throw once their write has gone in. The
+    /// release beneath them is part of that and not an exception to it, which is why the semaphore it releases
+    /// is one nothing ever disposes — a close that ran while the write was in the queue would otherwise turn
+    /// the last step of a committed settle into the report that it had failed.
     /// </para>
     /// <para>
     /// What is claimed is a delivery and not a message, which is why the tag carries the attempt. A tag naming
@@ -728,7 +744,6 @@ public sealed class SqliteSubscription : ISubscription
         finally
         {
             _reader.Dispose();
-            _inFlight.Dispose();
             await _store.DisposeAsync().ConfigureAwait(false);
         }
     }

@@ -65,7 +65,10 @@ root written two ways is one root: paths are resolved before they are compared, 
 
 Disposing a subscription that is still holding deliveries hands them back rather than stranding them. They go
 out again on the next read, counted as further attempts, which is what the process stopping would have done
-to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach.
+to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach. Using one
+after it has closed is refused in its own terms rather than as a disposal error: a read says the store is
+closed, and a settle says the delivery has already been settled, which is the truth, because closing handed
+it back.
 
 Settle each delivery once. A second settle of the same one throws `InvalidOperationException`, and it is the
 *delivery* that is finished with rather than the message: if a failed message has since been handed out again,
@@ -87,7 +90,9 @@ knowingly, or raise the bound.
 
 Every settle is one durable write. Nothing runs after it that could fail, which is what makes "a settle that
 threw has settled nothing" a rule rather than a hope: a write already queued cannot be recalled, so cancelling
-a settle either takes effect before it is queued or does not take effect at all.
+a settle either takes effect before it is queued or does not take effect at all. Closing the subscription
+underneath a settle is held to the same rule. Closing drains the writes already queued rather than discarding
+them, so a settle that was in progress when the close began commits, and returns to say so.
 
 `DeferredAsync` and `DeadLettersAsync` list what is set aside. `ReplayAsync(asideId)` makes one deliverable
 again from its own stored copy, so it works even after the log has dropped the original. `DiscardAsync`
