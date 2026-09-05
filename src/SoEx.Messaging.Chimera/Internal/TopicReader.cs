@@ -404,6 +404,21 @@ internal sealed class TopicReader : IDisposable
     }
 
     /// <summary>
+    /// The statement <see cref="Bounds"/> runs. Each aggregate is in a scalar subquery of its own, which is
+    /// not a matter of taste: SQLite answers a minimum or a maximum from the index in a single descent, but
+    /// only for a query holding exactly one aggregate. Asking for both in the same SELECT loses that and
+    /// scans the whole log — on a delivery path that runs this per message, which turns the cost of a
+    /// delivery into the size of the file. As subqueries each qualifies again, and it stays one statement so
+    /// the three values are still read from a single snapshot.
+    /// </summary>
+    internal const string BoundsSql =
+        """
+        SELECT (SELECT COALESCE(MIN(seq), 0) FROM log),
+               (SELECT COALESCE(MAX(seq), 0) FROM log),
+               COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0);
+        """;
+
+    /// <summary>
     /// Lowest sequence still in the log and highest, for spotting what retention removed before it was read
     /// and for measuring how far behind a position is.
     /// </summary>
@@ -424,12 +439,7 @@ internal sealed class TopicReader : IDisposable
             if (Live() is not { } connection)
                 return (0, 0);
 
-            using SqliteCommand command = Sqlite.Command(connection, null,
-                """
-                SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0),
-                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0)
-                FROM log;
-                """);
+            using SqliteCommand command = Sqlite.Command(connection, null, BoundsSql);
             using SqliteDataReader reader = command.ExecuteReader();
             if (!reader.Read())
                 return (0, 0);
