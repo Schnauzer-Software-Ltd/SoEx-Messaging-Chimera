@@ -69,7 +69,14 @@ public sealed record SubscriptionOptions
 /// Age of the oldest message not yet dealt with, or null when there is nothing to read. Compare this with the
 /// retention window: a count of messages cannot be compared with a policy written in hours.
 /// </param>
-public readonly record struct SubscriptionLag(long Behind, TimeSpan? OldestUnread);
+/// <param name="DueScheduled">
+/// Scheduled messages that have come due and this subscriber has not finished with. Counted separately from
+/// <paramref name="Behind"/> because the two are held by different bounds — the log by size and count as well
+/// as age, the scheduled table by age alone — and adding them would hide which one is growing. It is here at
+/// all because <see cref="RetentionPolicy.MaxAge"/> removes from both tables, and a subscriber falling behind
+/// on the scheduled side is overtaken exactly as it is on the log side.
+/// </param>
+public readonly record struct SubscriptionLag(long Behind, TimeSpan? OldestUnread, long DueScheduled);
 
 /// <summary>
 /// One subscriber reading one topic — the same granularity as a Service Bus processor or a JetStream consumer,
@@ -131,7 +138,11 @@ public interface ISubscription : IAsyncDisposable
     /// <summary>Destroys a set-aside message. The only deliberate loss in this library.</summary>
     ValueTask<bool> DiscardAsync(long asideId, CancellationToken cancellationToken = default);
 
-    /// <summary>How far behind this subscriber is, for alarming before retention overtakes it.</summary>
+    /// <summary>
+    /// How far behind this subscriber is, for alarming before retention overtakes it. Both tables are
+    /// counted: the age bound reaches the scheduled one too, so a reading that covered only the log would be
+    /// silent about half of what it is meant to warn about.
+    /// </summary>
     ValueTask<SubscriptionLag> LagAsync(CancellationToken cancellationToken = default);
 
     /// <summary>

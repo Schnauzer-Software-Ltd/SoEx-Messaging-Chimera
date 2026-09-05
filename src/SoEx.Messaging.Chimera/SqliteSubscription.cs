@@ -26,6 +26,37 @@ public sealed class SqliteSubscription : ISubscription
     /// </remarks>
     private readonly SemaphoreSlim _inFlight;
     private readonly ConcurrentDictionary<DeliveryTag, byte> _outstanding = new();
+
+    /// <summary>
+    /// Cancelled when the close begins, so that a reader parked on the in-flight cap or on an idle poll is
+    /// answered instead of left waiting.
+    /// </summary>
+    /// <remarks>
+    /// Never disposed, for the reason <see cref="_inFlight"/> is not: a reader can be about to link against
+    /// it at the moment the close runs, and a disposed source throws there — turning the one thing that was
+    /// meant to answer a parked reader into a different way of failing it. Cancelling is what this is for and
+    /// cancelling needs no disposal; the registrations that matter belong to the linked sources the readers
+    /// own, and those they dispose themselves.
+    /// </remarks>
+    private readonly CancellationTokenSource _closed = new();
+
+    /// <summary>
+    /// Deliveries this instance has in transit: claimed but not yet recorded as outstanding, or being settled
+    /// right now. Guarded by <see cref="_gate"/> along with the seal and the quiet signal.
+    /// </summary>
+    /// <remarks>
+    /// It exists because <see cref="_outstanding"/> is not a complete list of what this subscription is
+    /// holding at every instant. A claim reaches the file before its tag reaches the dictionary, and a settle
+    /// takes its tag out before its write and puts it back if the write failed. A hand-back that reads the
+    /// dictionary in either window sees nothing to hand back and leaves the delivery in flight in the file
+    /// with nobody holding it — which recovery cannot repair for as long as a sibling on the same subscriber
+    /// and topic stays open, because recovery is skipped exactly then.
+    /// </remarks>
+    private readonly object _gate = new();
+    private int _inTransit;
+    private volatile bool _closing;
+    private TaskCompletionSource? _quiet;
+
     private readonly StartAt _start;
     private bool _attached;
     private bool _boundEvaluated;
@@ -46,6 +77,106 @@ public sealed class SqliteSubscription : ISubscription
         _reader = reader;
         _inFlight = new SemaphoreSlim(subscriptionOptions.MaxInFlight, subscriptionOptions.MaxInFlight);
     }
+
+    /// <summary>What taking a delivery out of <see cref="_outstanding"/> in order to settle it found.</summary>
+    private enum Held
+    {
+        /// <summary>Not this caller's to settle: already settled, handed back by the close, or never delivered.</summary>
+        No,
+
+        /// <summary>Taken, and counted as in transit until the settle has finished one way or the other.</summary>
+        Yes,
+
+        /// <summary>Still this instance's, but the close has sealed and will hand it back itself.</summary>
+        Closing,
+    }
+
+    /// <summary>
+    /// Takes a delivery out in order to settle it, and takes a place among the deliveries in transit with it.
+    /// </summary>
+    /// <remarks>
+    /// One step, under the lock the close's own sweep takes, because the two are otherwise a race with a
+    /// delivery in it. A settle that arrives after the seal has to put the tag back for the close to find,
+    /// and a sweep already part-way through the dictionary would not look at it again — which is the defect
+    /// this whole arrangement exists to close, reappearing inside its own fix.
+    /// </remarks>
+    private Held Take(DeliveryTag tag)
+    {
+        lock (_gate)
+        {
+            if (!_outstanding.TryRemove(tag, out _))
+                return Held.No;
+
+            if (_closing)
+            {
+                _outstanding[tag] = 0;
+                return Held.Closing;
+            }
+
+            _inTransit++;
+            return Held.Yes;
+        }
+    }
+
+    /// <summary>
+    /// Takes a place among the deliveries in transit, unless the close has sealed this subscription. A false
+    /// answer means the caller must not start: the close is about to read <see cref="_outstanding"/> and act
+    /// on what it finds there.
+    /// </summary>
+    private bool Begin()
+    {
+        lock (_gate)
+        {
+            if (_closing)
+                return false;
+            _inTransit++;
+            return true;
+        }
+    }
+
+    /// <summary>Files a claimed delivery as held and gives that place up, in the one step.</summary>
+    private void Recorded(DeliveryTag tag)
+    {
+        lock (_gate)
+        {
+            _outstanding[tag] = 0;
+            if (--_inTransit == 0)
+                _quiet?.TrySetResult();
+        }
+    }
+
+    /// <summary>Gives that place up, having left the delivery filed wherever it now belongs.</summary>
+    private void End()
+    {
+        lock (_gate)
+        {
+            if (--_inTransit == 0)
+                _quiet?.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Seals the subscription against new claims and new settles, and answers with the wait for the ones
+    /// already in transit.
+    /// </summary>
+    private Task SealAsync()
+    {
+        lock (_gate)
+        {
+            _closing = true;
+            if (_inTransit == 0)
+                return Task.CompletedTask;
+
+            _quiet ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            return _quiet.Task;
+        }
+    }
+
+    /// <summary>
+    /// What a closed subscription tells anybody who reaches it, in the same words the store uses, so that a
+    /// caller cannot tell from the answer which of the two it got there first.
+    /// </summary>
+    private static ChimeraException Closed() => new("The store is closed.");
 
     public string Subscriber { get; }
     public string Topic { get; }
@@ -155,11 +286,33 @@ public sealed class SqliteSubscription : ISubscription
     public async IAsyncEnumerable<EventEnvelope> ReadAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        // Linked to the close as well as to the caller's token. Every wait a reader can be parked in belongs
+        // to this loop, and none of them is woken by anything the close does to the file: a consumer that
+        // passes an uncancellable token — which this signature allows — would sit on the in-flight cap or on
+        // an idle poll for ever after its subscription was closed.
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _closed.Token);
+
         while (!cancellationToken.IsCancellationRequested)
         {
             // Taking the slot first is what makes the cap real: nothing is claimed that there is no room to
             // deliver, so a consumer that stops settling stops being read to.
-            await _inFlight.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _inFlight.WaitAsync(stop.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw Closed();
+            }
+
+            // Claimed and recorded have to happen inside one place the close can wait for. A claim reaches
+            // the file first and the tag reaches _outstanding afterwards, and a hand-back that swept between
+            // the two left the delivery in flight with nobody holding it.
+            if (!Begin())
+            {
+                _inFlight.Release();
+                throw Closed();
+            }
 
             EventEnvelope? next;
             try
@@ -169,17 +322,36 @@ public sealed class SqliteSubscription : ISubscription
             catch
             {
                 _inFlight.Release();
+                End();
                 throw;
             }
 
             if (next is null)
             {
                 _inFlight.Release();
-                await IdleAsync(cancellationToken).ConfigureAwait(false);
+                End();
+                try
+                {
+                    await IdleAsync(stop.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw Closed();
+                }
                 continue;
             }
 
-            _outstanding[next.Value.Tag] = 0;
+            Recorded(next.Value.Tag);
+
+            // Recorded, so the close is now certain to hand this delivery back — which means it is going out
+            // again, to this subscriber's next reader or to a sibling. Handing it to a handler here as well
+            // would put two of them on one message, so the loop ends instead and says why.
+            if (_closing)
+            {
+                _inFlight.Release();
+                throw Closed();
+            }
+
             yield return next.Value;
         }
     }
@@ -339,14 +511,19 @@ public sealed class SqliteSubscription : ISubscription
         if (gone.Count == 0)
             return;
 
-        List<long> owed = gone.Where(id => states[id] == EntryState.Available).ToList();
+        HashSet<long> owedIfForgotten = gone.Where(id => states[id] == EntryState.Available).ToHashSet();
 
         // Forgotten first, reported second: the report is the only one there will ever be, and an entry left
         // behind by a cancelled throw would be counted again by every poll after it.
-        await _store.ForgetScheduledAsync(Topic, gone, ct).ConfigureAwait(false);
-        foreach (long id in gone)
+        //
+        // And reported for what was forgotten rather than for what this asked to forget. The write turns away
+        // an entry that has been claimed since these states were read, and naming that message as lost while
+        // a handler holds it would be the same mistake in the report that the guard exists to stop in the file.
+        List<long> forgotten = await _store.ForgetScheduledAsync(Topic, gone, ct).ConfigureAwait(false);
+        foreach (long id in forgotten)
             states.Remove(id);
 
+        List<long> owed = forgotten.Where(owedIfForgotten.Contains).ToList();
         if (owed.Count > 0)
             throw new MessagesLostException(Topic, Subscriber, owed.Count, owed.Min(), owed.Max(), scheduled: true);
     }
@@ -461,10 +638,19 @@ public sealed class SqliteSubscription : ISubscription
     /// </remarks>
     private async ValueTask<T> SettlingAsync<T>(EventEnvelope envelope, Func<ValueTask<T>> settle)
     {
-        if (!_outstanding.TryRemove(envelope.Tag, out _))
-            throw new InvalidOperationException(
-                $"Message '{envelope.MessageId}' on topic '{Topic}' has already been settled, or was not " +
-                $"delivered by subscriber '{Subscriber}'. Each delivery is settled once.");
+        // A settle that starts after the close has sealed is turned away before it has done anything, and the
+        // delivery is left where the hand-back will find it. Letting it run instead is what stranded a
+        // failing settle's delivery: the tag is out of the dictionary for the length of the write, the catch
+        // below files it again, and a hand-back that has already been past never looks a second time.
+        switch (Take(envelope.Tag))
+        {
+            case Held.No:
+                throw new InvalidOperationException(
+                    $"Message '{envelope.MessageId}' on topic '{Topic}' has already been settled, or was not " +
+                    $"delivered by subscriber '{Subscriber}'. Each delivery is settled once.");
+            case Held.Closing:
+                throw Closed();
+        }
 
         T result;
         try
@@ -475,6 +661,13 @@ public sealed class SqliteSubscription : ISubscription
         {
             _outstanding[envelope.Tag] = 0;
             throw;
+        }
+        finally
+        {
+            // After the catch, so that a settle which failed has re-filed its delivery before the close is
+            // told this one is finished. The whole point of the wait is that what it waits for is settled
+            // one way or the other by the time it ends.
+            End();
         }
 
         _inFlight.Release();
@@ -675,11 +868,10 @@ public sealed class SqliteSubscription : ISubscription
     public async ValueTask<SetAsideReport> ApplyRetentionAsync(CancellationToken cancellationToken = default)
     {
         SetAsidePolicy policy = _subscriptionOptions.SetAside;
-        long agedOut = 0;
 
         if (policy.MaxDeferredAge is { } maxAge)
         {
-            agedOut = await _store.AgeOutDeferredAsync(Topic, _options.Clock.GetUtcNow() - maxAge,
+            await _store.AgeOutDeferredAsync(Topic, _options.Clock.GetUtcNow() - maxAge,
                 $"deferred longer than {maxAge}", cancellationToken).ConfigureAwait(false);
         }
 
@@ -702,11 +894,14 @@ public sealed class SqliteSubscription : ISubscription
             }
         }
 
-        // Everything destroyed since the last pass, not only what this one destroyed. A dead letter arriving
-        // is as likely to cause a drop as a maintenance pass is, and they are the same loss for the same
-        // reason: reporting one and not the other would put a number next to a silence.
-        return new SetAsideReport(agedOut,
-            await _store.TakeDroppedAsync(Topic, cancellationToken).ConfigureAwait(false));
+        // Everything since the last pass, not only what this one did. A dead letter arriving is as likely to
+        // cause a drop as a maintenance pass is, and they are the same loss for the same reason: reporting
+        // one and not the other would put a number next to a silence. The ageing count is read the same way
+        // and from the same place, so a pass that fails after ageing leaves its number for the next one
+        // instead of taking it away with it.
+        (long aged, long dropped) = await _store.TakeCountersAsync(Topic, cancellationToken)
+            .ConfigureAwait(false);
+        return new SetAsideReport(aged, dropped);
     }
 
     public async ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default)
@@ -724,21 +919,46 @@ public sealed class SqliteSubscription : ISubscription
     public async ValueTask<SubscriptionLag> LagAsync(CancellationToken cancellationToken = default)
     {
         if (!await TryAttachAsync(cancellationToken).ConfigureAwait(false))
-            return new SubscriptionLag(0, null);
+            return new SubscriptionLag(0, null, 0);
 
         long mark = await _store.ReadMarkAsync(Topic, cancellationToken).ConfigureAwait(false);
         (_, long max) = _reader.Bounds();
         DateTimeOffset? oldest = _reader.OldestAfter(mark);
 
+        // The scheduled side is counted as well, because the age bound removes from both tables and a call
+        // whose purpose is warning before retention overtakes a subscriber cannot be blind to half of what
+        // retention reaches. A backlog of due scheduled messages used to read as no lag at all.
+        DateTimeOffset now = _options.Clock.GetUtcNow();
+        ScheduledFloor floor = await _store.ReadScheduledFloorAsync(Topic, cancellationToken)
+            .ConfigureAwait(false);
+        Dictionary<long, EntryState> states =
+            await _store.EntryStatesAsync(Topic, EntrySource.Scheduled, cancellationToken).ConfigureAwait(false);
+
+        // Settled rows the floor has not reached yet are inside the due window but are not owed: the floor
+        // moves in the reader rather than at the moment of settling, so counting them says work is owed for
+        // a message already handled. Asked of the topic file rather than subtracted from a number counted
+        // here, so a row that has since been removed drops out of both sides instead of one.
+        List<long> absorbable = states.Where(entry => entry.Value == EntryState.Complete)
+            .Select(entry => entry.Key).ToList();
+        long due = Math.Max(0, _reader.DueCount(floor, now) - _reader.DueAmong(floor, now, absorbable));
+
         // A duration, not a count: retention is set in hours, and a number of messages cannot be compared with it.
         return new SubscriptionLag(Math.Max(0, max - mark),
-            oldest is null ? null : _options.Clock.GetUtcNow() - oldest.Value);
+            oldest is null ? null : now - oldest.Value, due);
     }
 
     public async ValueTask DisposeAsync()
     {
         try
         {
+            // Two phases, because a hand-back can only be right if what it reads is a complete list. Sealing
+            // stops new claims and new settles; the wait lets the ones already in transit finish filing
+            // themselves either way — a settle that commits during it keeps its true answer, one that fails
+            // puts its delivery back, and a claim that lands records its tag — and only then is _outstanding
+            // the whole of what this instance is holding.
+            Task quiet = SealAsync();
+            _closed.Cancel();
+            await quiet.ConfigureAwait(false);
             await ReleaseOutstandingAsync().ConfigureAwait(false);
         }
         finally
@@ -765,16 +985,30 @@ public sealed class SqliteSubscription : ISubscription
     /// The attempt count stays where it is, exactly as recovery leaves it, and a failure to write is not
     /// swallowed: a release that did not happen is the same stranding by a quieter route.
     /// </para>
+    /// <para>
+    /// It runs on a sealed and quiet subscription, which is what makes one pass enough. Reading this
+    /// dictionary while claims and settles are still moving through it is reading a snapshot rather than a
+    /// list: a claim reaches the file before its tag arrives here, and a settle takes its tag out for the
+    /// length of its write. Both were being missed, and a delivery this instance is holding that nobody hands
+    /// back is one no other instance may touch either — recovery is skipped while a sibling on the same
+    /// subscriber and topic is open, which is precisely the case that makes the strand indefinite.
+    /// </para>
     /// </remarks>
     private async ValueTask ReleaseOutstandingAsync()
     {
-        foreach (DeliveryTag tag in _outstanding.Keys)
+        // Taken whole, under the lock a settle takes to claim one, so that this and a handler settling at the
+        // same moment cannot both act on a delivery and cannot both miss one. Emptying the dictionary here is
+        // also what makes a settle arriving afterwards say "already settled", which is the true answer: this
+        // is about to hand the delivery back.
+        List<DeliveryTag> holding;
+        lock (_gate)
         {
-            // Taking the tag out first is what keeps this and a handler settling at the same moment from both
-            // acting on one delivery, for the same reason settling does it.
-            if (!_outstanding.TryRemove(tag, out _))
-                continue;
+            holding = [.. _outstanding.Keys];
+            _outstanding.Clear();
+        }
 
+        foreach (DeliveryTag tag in holding)
+        {
             if (tag.Source == EntrySource.SetAside)
                 await _store.SettleSetAsideAsync(tag.Id, SetAsideDelivery.Ready).ConfigureAwait(false);
             else

@@ -775,24 +775,37 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// file counts it for good. This is the other way an entry ends, and the only one that is not a position
     /// moving.
     /// </remarks>
-    internal ValueTask<long> ForgetScheduledAsync(string topic, IReadOnlyList<long> ids,
+    /// <returns>The ids whose entry this actually removed, which is not always the ids it was given.</returns>
+    internal async ValueTask<List<long>> ForgetScheduledAsync(string topic, IReadOnlyList<long> ids,
         CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
+    {
+        List<long> forgotten = [];
+        await _writer.EnqueueAsync((connection, transaction) =>
         {
+            forgotten.Clear();
+
+            // The in-flight guard belongs in the statement and not only in the caller's reading of the states
+            // it last saw. What to forget is decided from a set read a moment earlier, and a delivery claimed
+            // since — by a sibling on the same subscriber and topic — would otherwise have its entry deleted
+            // underneath it and be named as owed-and-lost while a handler was holding it. Same rule as
+            // everywhere else here: nothing acts on a row while a handler has it.
             using var delete = Sqlite.Command(connection, transaction,
-                "DELETE FROM entry WHERE topic = $t AND source = $s AND id = $i;");
+                "DELETE FROM entry WHERE topic = $t AND source = $s AND id = $i AND state <> $inflight;");
             delete.Parameters.AddWithValue("$t", topic);
             delete.Parameters.AddWithValue("$s", (int)EntrySource.Scheduled);
+            delete.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
             SqliteParameter id = delete.Parameters.AddWithValue("$i", 0L);
 
-            long removed = 0;
             foreach (long gone in ids)
             {
                 id.Value = gone;
-                removed += delete.ExecuteNonQuery();
+                if (delete.ExecuteNonQuery() > 0)
+                    forgotten.Add(gone);
             }
-            return removed;
-        }, ct);
+            return forgotten.Count;
+        }, ct).ConfigureAwait(false);
+        return forgotten;
+    }
 
     /// <summary>
     /// How many deliveries this subscriber holds for records between a position and a sequence: what it was
@@ -930,18 +943,31 @@ internal sealed class SubscriberStore : IAsyncDisposable
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
-            using var command = Sqlite.Command(connection, transaction,
+            long aged;
+            using (var command = Sqlite.Command(connection, transaction,
                 """
                 UPDATE set_aside SET kind = $dead, reason = $r
                 WHERE topic = $t AND kind = $deferred AND aside_at < $cutoff AND delivery <> $inflight;
-                """);
-            command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
-            command.Parameters.AddWithValue("$deferred", (int)SetAsideKind.Deferred);
-            command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
-            command.Parameters.AddWithValue("$r", reason);
-            command.Parameters.AddWithValue("$t", topic);
-            command.Parameters.AddWithValue("$cutoff", Sqlite.ToUnixMs(cutoff));
-            return command.ExecuteNonQuery();
+                """))
+            {
+                command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
+                command.Parameters.AddWithValue("$deferred", (int)SetAsideKind.Deferred);
+                command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
+                command.Parameters.AddWithValue("$r", reason);
+                command.Parameters.AddWithValue("$t", topic);
+                command.Parameters.AddWithValue("$cutoff", Sqlite.ToUnixMs(cutoff));
+                aged = command.ExecuteNonQuery();
+            }
+
+            // Recorded in the file, in the write that did it, for the reason the drop count is. A pass is
+            // three writes, and one that failed after this one — a cancelled token is checked at the door of
+            // every op, so a host handing its shutdown token to a maintenance pass is the ordinary way there
+            // — used to report nothing at all, and the next pass had nothing left to count: the deferrals
+            // were already dead by then and no arithmetic could recover the number.
+            if (aged > 0)
+                Bump(connection, transaction, AgedKey(topic), aged);
+
+            return aged;
         }, ct);
 
     /// <summary>Destroys the oldest dead letters down to a limit. Real loss, and the only path here that causes any.</summary>
@@ -1033,37 +1059,57 @@ internal sealed class SubscriberStore : IAsyncDisposable
         // rows are gone. Kept in the file, it belongs to the subscriber rather than to whichever object
         // happened to be settling at the time, and the next pass reports it whoever runs it.
         if (dropped > 0)
-        {
-            using var record = Sqlite.Command(connection, transaction,
-                """
-                INSERT INTO meta (key, value) VALUES ($k, $n)
-                ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + $n AS TEXT);
-                """);
-            record.Parameters.AddWithValue("$k", DroppedKey(topic));
-            record.Parameters.AddWithValue("$n", dropped.ToString());
-            record.ExecuteNonQuery();
-        }
+            Bump(connection, transaction, DroppedKey(topic), dropped);
 
         return dropped;
     }
 
-    /// <summary>How many dead letters have been destroyed for this topic since anyone last asked.</summary>
+    /// <summary>
+    /// What has happened to this subscriber's set-aside store since anyone last asked: deferrals aged into
+    /// dead letters, and dead letters destroyed by a bound.
+    /// </summary>
     /// <remarks>
-    /// Read and reset in one write, so two passes cannot both report the same drops and a pass that reports
-    /// them cannot leave them behind to be reported again.
+    /// Read and reset in one write, so two passes cannot both report the same numbers and a pass that reports
+    /// them cannot leave them behind to be reported again. The two are taken together because both are now
+    /// counted the same way — by whatever did the work, in the write that did it — and a pass that took one
+    /// from the file and the other from a local variable lost the local one every time it failed part-way.
     /// </remarks>
-    internal ValueTask<long> TakeDroppedAsync(string topic, CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
+    internal async ValueTask<(long AgedOut, long Dropped)> TakeCountersAsync(string topic,
+        CancellationToken ct = default)
+    {
+        long aged = 0, dropped = 0;
+        await _writer.EnqueueAsync((connection, transaction) =>
         {
-            using var command = Sqlite.Command(connection, transaction,
-                "DELETE FROM meta WHERE key = $k RETURNING value;");
-            command.Parameters.AddWithValue("$k", DroppedKey(topic));
-            return command.ExecuteScalar() is string value && long.TryParse(value, out long dropped)
-                ? dropped
-                : 0;
-        }, ct);
+            aged = Take(connection, transaction, AgedKey(topic));
+            dropped = Take(connection, transaction, DroppedKey(topic));
+            return aged + dropped;
+        }, ct).ConfigureAwait(false);
+        return (aged, dropped);
+    }
+
+    private static long Take(SqliteConnection connection, SqliteTransaction transaction, string key)
+    {
+        using var command = Sqlite.Command(connection, transaction,
+            "DELETE FROM meta WHERE key = $k RETURNING value;");
+        command.Parameters.AddWithValue("$k", key);
+        return command.ExecuteScalar() is string value && long.TryParse(value, out long count) ? count : 0;
+    }
+
+    private static void Bump(SqliteConnection connection, SqliteTransaction transaction, string key, long by)
+    {
+        using var command = Sqlite.Command(connection, transaction,
+            """
+            INSERT INTO meta (key, value) VALUES ($k, $n)
+            ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + $n AS TEXT);
+            """);
+        command.Parameters.AddWithValue("$k", key);
+        command.Parameters.AddWithValue("$n", by.ToString());
+        command.ExecuteNonQuery();
+    }
 
     private static string DroppedKey(string topic) => $"dead_dropped:{topic}";
+
+    private static string AgedKey(string topic) => $"deferred_aged:{topic}";
 
     /// <summary>Everything this subscriber knows about a topic, for checking the invariant in one go.</summary>
     internal async ValueTask<StoreSnapshot> SnapshotAsync(string topic, CancellationToken ct = default)

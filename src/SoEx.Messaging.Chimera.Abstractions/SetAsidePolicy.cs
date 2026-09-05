@@ -80,7 +80,11 @@ public sealed record SetAsidePolicy
 }
 
 /// <summary>What one pass over a subscriber's set-aside store did.</summary>
-/// <param name="DeferredAgedOut">Deferred messages that became dead letters because they sat too long.</param>
+/// <param name="DeferredAgedOut">Deferred messages that became dead letters because they sat too long, by
+/// this pass and by any earlier pass whose report never reached anybody. Kept in the subscriber's file beside
+/// the rows it changed, exactly as the drop count is: a pass is several writes, and one that fails after the
+/// ageing has committed would otherwise take the number away with it — the messages are dead by then and no
+/// later pass can work out how many became so.</param>
 /// <param name="DeadDropped">Dead letters destroyed to stay within the bound, by this pass and by any settle
 /// since the last one. Only ever non-zero under <see cref="DeadLetterOverflow.DropOldest"/>, and worth
 /// alarming on: it is real loss, and a dead letter arriving is as likely to cause it as a maintenance pass.
