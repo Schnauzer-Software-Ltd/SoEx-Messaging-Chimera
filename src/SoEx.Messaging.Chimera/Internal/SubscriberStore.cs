@@ -18,7 +18,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
     private readonly SingleWriter _writer;
     private readonly TimeProvider _clock;
     private readonly string? _topic;
-    private bool _closed;
+    private int _closed;
 
     private SubscriberStore(string subscriber, string path, string? topic, SingleWriter writer,
         TimeProvider clock)
@@ -1101,13 +1101,22 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return new StoreSnapshot(mark, entries, origins);
     }
 
+    /// <summary>
+    /// Closes the file and gives back the count this store holds against it.
+    /// </summary>
+    /// <remarks>
+    /// Given back once, whoever gets there first. Two calls that both read a plain flag before either set it
+    /// would each give the same reader back, and the count for this file and topic would reach nothing while a
+    /// sibling subscription was still holding deliveries — which is the one condition that lets the next open
+    /// run crash recovery, handing that sibling's in-flight work to somebody else. Closing twice is a thing
+    /// callers are entitled to do, so it is made safe here rather than asked for.
+    /// </remarks>
     public async ValueTask DisposeAsync()
     {
         await _writer.DisposeAsync().ConfigureAwait(false);
 
-        if (_closed || _topic is null)
+        if (_topic is null || Interlocked.Exchange(ref _closed, 1) != 0)
             return;
-        _closed = true;
         Release(Path, _topic);
     }
 }
