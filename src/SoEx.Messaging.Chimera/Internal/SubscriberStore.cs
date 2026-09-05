@@ -910,13 +910,21 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// message that quietly evaporated would be the silent loss this whole design exists to avoid.
     /// </summary>
     /// <remarks>
-    /// Only rows that are actually sitting there. A row a handler is holding has not sat anywhere; it is being
-    /// worked on now, and the settle that follows would put a dead letter straight back to ready. Nor has one
-    /// an operator has replayed: it is on its way out, the next read delivers it, and the settle after that
-    /// re-files it with a fresh stamp — so nothing is left able to sit for ever. Turning a replayed row into a
-    /// held dead letter cancelled the replay without saying so, which is the one thing an operator working a
-    /// set down has no way to see. Both are measured again on the next pass, from wherever their settle leaves
-    /// them.
+    /// <para>
+    /// A row a handler is holding is left alone. It has not sat anywhere; it is being worked on now, and the
+    /// settle that follows would put a dead letter straight back to ready. Its age is measured again on the
+    /// next pass, from wherever that settle leaves it.
+    /// </para>
+    /// <para>
+    /// Everything else keeps whatever delivery state it had. The pass used to park each row it changed, which
+    /// silently cancelled a replay: a deferral an operator had asked to see again was turned into a held dead
+    /// letter and the request evaporated without a word. Only the kind changes now, so a row on its way out is
+    /// still on its way out and the next read delivers it — as a dead letter, which is what replaying one has
+    /// always meant. Leaving the row alone instead would have been the other way to stop cancelling the
+    /// replay, and it is the worse one: a delivery interrupted by a restart comes back as ready, so every
+    /// deferral a redeploy caught mid-flight would have been exempt from the age bound for as long as nobody
+    /// read the subscriber — which, for a subscriber stopped at a full dead set, is indefinitely.
+    /// </para>
     /// </remarks>
     internal ValueTask<long> AgeOutDeferredAsync(string topic, DateTimeOffset cutoff, string reason,
         CancellationToken ct = default)
@@ -925,11 +933,11 @@ internal sealed class SubscriberStore : IAsyncDisposable
             using var command = Sqlite.Command(connection, transaction,
                 """
                 UPDATE set_aside SET kind = $dead, reason = $r
-                WHERE topic = $t AND kind = $deferred AND aside_at < $cutoff AND delivery = $held;
+                WHERE topic = $t AND kind = $deferred AND aside_at < $cutoff AND delivery <> $inflight;
                 """);
             command.Parameters.AddWithValue("$dead", (int)SetAsideKind.Dead);
             command.Parameters.AddWithValue("$deferred", (int)SetAsideKind.Deferred);
-            command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
+            command.Parameters.AddWithValue("$inflight", (int)SetAsideDelivery.InFlight);
             command.Parameters.AddWithValue("$r", reason);
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$cutoff", Sqlite.ToUnixMs(cutoff));

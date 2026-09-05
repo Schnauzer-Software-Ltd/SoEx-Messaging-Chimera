@@ -97,11 +97,11 @@ a handler would make everything it is told afterwards untrue. Wait for the deliv
 
 `LagAsync()` reports how far behind this subscriber is, as a count and as a duration.
 
-`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. It leaves alone
-anything already on its way out — a message a handler is holding, and one you have replayed and not yet been
-given — because neither has been sitting anywhere, and turning a replayed message into a dead letter would
-cancel the replay without saying so. Both are measured again on the next pass, from wherever their settle
-leaves them. Its report also
+`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Ageing one out
+changes what it is filed as and nothing else, so a message you have replayed is still on its way to you and
+the next read delivers it — as a dead letter, which is what replaying one has always meant. The pass leaves a
+message a handler is holding alone entirely, because it has not been sitting anywhere; its age is measured
+again on the next pass, from wherever its settle leaves it. Its report also
 carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
 the set under `DropOldest` causes real loss too, and it would be misleading to put a number next to one path
 and a silence next to the other. That count lives in the subscriber's file rather than in memory, so a
