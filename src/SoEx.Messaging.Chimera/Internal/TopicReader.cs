@@ -24,15 +24,33 @@ internal readonly record struct ScheduledFloor(long DueAtMs, long Id)
 /// database content — though not SQLite creating the -wal and -shm sidecars, so the process still needs write
 /// permission on the directory.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Every statement, and the close, run under one lock. A <see cref="SqliteConnection"/> is not thread-safe,
+/// and this is the one object in a subscription that more than one caller reaches: the read loop is on it
+/// continuously, <c>LagAsync</c> is documented to be called beside that loop, a second enumerator would be on
+/// it too, and the close destroys it. Everything else a subscription touches goes through the single writer,
+/// which serialises by construction; this had nothing. Unsynchronised, the losing party got a
+/// <c>SQLITE_MISUSE</c>, an <c>ObjectDisposedException</c> on a statement handle, or a connection left broken
+/// enough that closing it took the process down from inside <c>DisposeAsync</c>.
+/// </para>
+/// <para>
+/// The lock is held across one statement and never across an await, so the only thing it makes anybody wait
+/// for is a query already in progress. That is the point: the close waits for the loop's current read rather
+/// than pulling the connection out from under it.
+/// </para>
+/// </remarks>
 internal sealed class TopicReader : IDisposable
 {
     /// <summary>Due, and past a subscriber's floor. One definition, used by everything that asks.</summary>
     private const string DueAboveFloor =
         "due_at <= $now AND (due_at > $fd OR (due_at = $fd AND id > $fi))";
 
+    private readonly object _gate = new();
     private readonly string _path;
     private readonly ChimeraOptions _options;
     private SqliteConnection? _connection;
+    private bool _closed;
 
     internal TopicReader(string path, ChimeraOptions options)
     {
@@ -45,40 +63,64 @@ internal sealed class TopicReader : IDisposable
     /// reads as an empty topic rather than an error — creating it here would make a subscriber a writer of the
     /// log, which is the one thing the design does not allow.
     /// </summary>
-    internal bool IsOpen => _connection is not null;
+    internal bool IsOpen
+    {
+        get { lock (_gate) return _connection is not null; }
+    }
 
     internal string? LogUuid { get; private set; }
 
+    /// <summary>
+    /// The connection to read from, or null when there is no file yet. Called under the lock by everything
+    /// below.
+    /// </summary>
+    /// <remarks>
+    /// A reader that has been closed says so rather than answering as though the topic were empty. The two
+    /// are not the same thing and reading them as the same is how a loop carries on polling a subscription
+    /// somebody closed: no rows, no error, and nothing to tell it apart from a topic nobody has published to.
+    /// </remarks>
+    private SqliteConnection? Live()
+    {
+        if (_closed)
+            throw new ChimeraException("The store is closed.");
+        return _connection;
+    }
+
     internal bool TryOpen()
     {
-        if (_connection is not null)
-            return true;
-        if (!File.Exists(_path))
-            return false;
-
-        SqliteConnection connection = Sqlite.OpenReader(_path, _options);
-        try
+        lock (_gate)
         {
-            if (TopicSchema.TryReadIdentity(connection) is not { } identity)
-            {
-                // The file is there but the publisher has not committed the schema yet. Come back.
-                connection.Dispose();
+            if (_closed)
+                throw new ChimeraException("The store is closed.");
+            if (_connection is not null)
+                return true;
+            if (!File.Exists(_path))
                 return false;
+
+            SqliteConnection connection = Sqlite.OpenReader(_path, _options);
+            try
+            {
+                if (TopicSchema.TryReadIdentity(connection) is not { } identity)
+                {
+                    // The file is there but the publisher has not committed the schema yet. Come back.
+                    connection.Dispose();
+                    return false;
+                }
+
+                if (identity.SchemaVersion > TopicSchema.Version)
+                    throw new ChimeraException(
+                        $"The topic file was written by a newer version of this library " +
+                        $"(schema {identity.SchemaVersion}).");
+
+                LogUuid = identity.Uuid;
+                _connection = connection;
+                return true;
             }
-
-            if (identity.SchemaVersion > TopicSchema.Version)
-                throw new ChimeraException(
-                    $"The topic file was written by a newer version of this library " +
-                    $"(schema {identity.SchemaVersion}).");
-
-            LogUuid = identity.Uuid;
-            _connection = connection;
-            return true;
-        }
-        catch
-        {
-            connection.Dispose();
-            throw;
+            catch
+            {
+                connection.Dispose();
+                throw;
+            }
         }
     }
 
@@ -88,21 +130,24 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal List<Candidate> After(long mark, int limit)
     {
-        var records = new List<Candidate>();
-        if (_connection is null)
-            return records;
-
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT seq, msg_id, enqueued_at FROM log WHERE seq > $m ORDER BY seq LIMIT $n;");
-        command.Parameters.AddWithValue("$m", mark);
-        command.Parameters.AddWithValue("$n", limit);
-        using SqliteDataReader reader = command.ExecuteReader();
-        while (reader.Read())
+        lock (_gate)
         {
-            DateTimeOffset enqueued = Sqlite.FromUnixMs(reader.GetInt64(2));
-            records.Add(new Candidate(reader.GetInt64(0), reader.GetString(1), enqueued, enqueued));
+            var records = new List<Candidate>();
+            if (Live() is not { } connection)
+                return records;
+
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                "SELECT seq, msg_id, enqueued_at FROM log WHERE seq > $m ORDER BY seq LIMIT $n;");
+            command.Parameters.AddWithValue("$m", mark);
+            command.Parameters.AddWithValue("$n", limit);
+            using SqliteDataReader reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                DateTimeOffset enqueued = Sqlite.FromUnixMs(reader.GetInt64(2));
+                records.Add(new Candidate(reader.GetInt64(0), reader.GetString(1), enqueued, enqueued));
+            }
+            return records;
         }
-        return records;
     }
 
     /// <summary>
@@ -118,22 +163,25 @@ internal sealed class TopicReader : IDisposable
     /// </remarks>
     internal List<Candidate> Due(ScheduledFloor floor, DateTimeOffset now, int limit)
     {
-        var records = new List<Candidate>();
-        if (_connection is null)
-            return records;
-
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            $"SELECT id, msg_id, enqueued_at, due_at FROM scheduled WHERE {DueAboveFloor} " +
-            "ORDER BY due_at, id LIMIT $n;");
-        Bind(command, floor, now);
-        command.Parameters.AddWithValue("$n", limit);
-        using SqliteDataReader reader = command.ExecuteReader();
-        while (reader.Read())
+        lock (_gate)
         {
-            records.Add(new Candidate(reader.GetInt64(0), reader.GetString(1),
-                Sqlite.FromUnixMs(reader.GetInt64(2)), Sqlite.FromUnixMs(reader.GetInt64(3))));
+            var records = new List<Candidate>();
+            if (Live() is not { } connection)
+                return records;
+
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                $"SELECT id, msg_id, enqueued_at, due_at FROM scheduled WHERE {DueAboveFloor} " +
+                "ORDER BY due_at, id LIMIT $n;");
+            Bind(command, floor, now);
+            command.Parameters.AddWithValue("$n", limit);
+            using SqliteDataReader reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                records.Add(new Candidate(reader.GetInt64(0), reader.GetString(1),
+                    Sqlite.FromUnixMs(reader.GetInt64(2)), Sqlite.FromUnixMs(reader.GetInt64(3))));
+            }
+            return records;
         }
-        return records;
     }
 
     /// <summary>
@@ -143,16 +191,19 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal byte[]? PayloadOf(EntrySource source, long id)
     {
-        if (_connection is null)
-            return null;
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return null;
 
-        string sql = source == EntrySource.Scheduled
-            ? "SELECT payload FROM scheduled WHERE id = $i;"
-            : "SELECT payload FROM log WHERE seq = $i;";
+            string sql = source == EntrySource.Scheduled
+                ? "SELECT payload FROM scheduled WHERE id = $i;"
+                : "SELECT payload FROM log WHERE seq = $i;";
 
-        using SqliteCommand command = Sqlite.Command(_connection, null, sql);
-        command.Parameters.AddWithValue("$i", id);
-        return command.ExecuteScalar() as byte[];
+            using SqliteCommand command = Sqlite.Command(connection, null, sql);
+            command.Parameters.AddWithValue("$i", id);
+            return command.ExecuteScalar() as byte[];
+        }
     }
 
     /// <summary>
@@ -161,13 +212,16 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal long DueCount(ScheduledFloor floor, DateTimeOffset now)
     {
-        if (_connection is null)
-            return 0;
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return 0;
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            $"SELECT COUNT(*) FROM scheduled WHERE {DueAboveFloor};");
-        Bind(command, floor, now);
-        return (long)command.ExecuteScalar()!;
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                $"SELECT COUNT(*) FROM scheduled WHERE {DueAboveFloor};");
+            Bind(command, floor, now);
+            return (long)command.ExecuteScalar()!;
+        }
     }
 
     /// <summary>
@@ -178,19 +232,22 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal long DueAmong(ScheduledFloor floor, DateTimeOffset now, IReadOnlyList<long> ids)
     {
-        if (_connection is null)
-            return 0;
-
-        long total = 0;
-        foreach ((string list, int start, int count) in Chunks(ids))
+        lock (_gate)
         {
-            using SqliteCommand command = Sqlite.Command(_connection, null,
-                $"SELECT COUNT(*) FROM scheduled WHERE {DueAboveFloor} AND id IN ({list});");
-            Bind(command, floor, now);
-            BindIds(command, ids, start, count);
-            total += (long)command.ExecuteScalar()!;
+            if (Live() is not { } connection)
+                return 0;
+
+            long total = 0;
+            foreach ((string list, int start, int count) in Chunks(ids))
+            {
+                using SqliteCommand command = Sqlite.Command(connection, null,
+                    $"SELECT COUNT(*) FROM scheduled WHERE {DueAboveFloor} AND id IN ({list});");
+                Bind(command, floor, now);
+                BindIds(command, ids, start, count);
+                total += (long)command.ExecuteScalar()!;
+            }
+            return total;
         }
-        return total;
     }
 
     /// <summary>
@@ -199,20 +256,23 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal HashSet<long>? ExistingScheduled(IReadOnlyList<long> ids)
     {
-        if (_connection is null)
-            return null;
-
-        var present = new HashSet<long>();
-        foreach ((string list, int start, int count) in Chunks(ids))
+        lock (_gate)
         {
-            using SqliteCommand command = Sqlite.Command(_connection, null,
-                $"SELECT id FROM scheduled WHERE id IN ({list});");
-            BindIds(command, ids, start, count);
-            using SqliteDataReader reader = command.ExecuteReader();
-            while (reader.Read())
-                present.Add(reader.GetInt64(0));
+            if (Live() is not { } connection)
+                return null;
+
+            var present = new HashSet<long>();
+            foreach ((string list, int start, int count) in Chunks(ids))
+            {
+                using SqliteCommand command = Sqlite.Command(connection, null,
+                    $"SELECT id FROM scheduled WHERE id IN ({list});");
+                BindIds(command, ids, start, count);
+                using SqliteDataReader reader = command.ExecuteReader();
+                while (reader.Read())
+                    present.Add(reader.GetInt64(0));
+            }
+            return present;
         }
-        return present;
     }
 
     /// <summary>
@@ -243,31 +303,37 @@ internal sealed class TopicReader : IDisposable
     /// </remarks>
     internal (EntrySource Source, long Id)? Locate(string messageId)
     {
-        if (_connection is null)
-            return null;
-
-        using (var log = Sqlite.Command(_connection, null, "SELECT seq FROM log WHERE msg_id = $m;"))
+        lock (_gate)
         {
-            log.Parameters.AddWithValue("$m", messageId);
-            if (log.ExecuteScalar() is long seq)
-                return (EntrySource.Log, seq);
-        }
+            if (Live() is not { } connection)
+                return null;
 
-        using var scheduled = Sqlite.Command(_connection, null, "SELECT id FROM scheduled WHERE msg_id = $m;");
-        scheduled.Parameters.AddWithValue("$m", messageId);
-        return scheduled.ExecuteScalar() is long id ? (EntrySource.Scheduled, id) : null;
+            using (var log = Sqlite.Command(connection, null, "SELECT seq FROM log WHERE msg_id = $m;"))
+            {
+                log.Parameters.AddWithValue("$m", messageId);
+                if (log.ExecuteScalar() is long seq)
+                    return (EntrySource.Log, seq);
+            }
+
+            using var scheduled = Sqlite.Command(connection, null, "SELECT id FROM scheduled WHERE msg_id = $m;");
+            scheduled.Parameters.AddWithValue("$m", messageId);
+            return scheduled.ExecuteScalar() is long id ? (EntrySource.Scheduled, id) : null;
+        }
     }
 
     /// <summary>The due time of one scheduled row, for placing it against a floor.</summary>
     internal DateTimeOffset? DueAt(long id)
     {
-        if (_connection is null)
-            return null;
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return null;
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT due_at FROM scheduled WHERE id = $i;");
-        command.Parameters.AddWithValue("$i", id);
-        return command.ExecuteScalar() is long due ? Sqlite.FromUnixMs(due) : null;
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                "SELECT due_at FROM scheduled WHERE id = $i;");
+            command.Parameters.AddWithValue("$i", id);
+            return command.ExecuteScalar() is long due ? Sqlite.FromUnixMs(due) : null;
+        }
     }
 
     private static void Bind(SqliteCommand command, ScheduledFloor floor, DateTimeOffset now)
@@ -283,13 +349,16 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal DateTimeOffset? NextDue(DateTimeOffset after)
     {
-        if (_connection is null)
-            return null;
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return null;
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT MIN(due_at) FROM scheduled WHERE due_at > $now;");
-        command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(after));
-        return command.ExecuteScalar() is long due ? Sqlite.FromUnixMs(due) : null;
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                "SELECT MIN(due_at) FROM scheduled WHERE due_at > $now;");
+            command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(after));
+            return command.ExecuteScalar() is long due ? Sqlite.FromUnixMs(due) : null;
+        }
     }
 
     /// <summary>
@@ -299,14 +368,17 @@ internal sealed class TopicReader : IDisposable
     /// </summary>
     internal ScheduledFloor DueSoFar(DateTimeOffset now)
     {
-        long nowMs = Sqlite.ToUnixMs(now);
-        if (_connection is null)
-            return new ScheduledFloor(nowMs, 0);
+        lock (_gate)
+        {
+            long nowMs = Sqlite.ToUnixMs(now);
+            if (Live() is not { } connection)
+                return new ScheduledFloor(nowMs, 0);
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT COALESCE(MAX(id), 0) FROM scheduled WHERE due_at <= $now;");
-        command.Parameters.AddWithValue("$now", nowMs);
-        return new ScheduledFloor(nowMs, (long)command.ExecuteScalar()!);
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                "SELECT COALESCE(MAX(id), 0) FROM scheduled WHERE due_at <= $now;");
+            command.Parameters.AddWithValue("$now", nowMs);
+            return new ScheduledFloor(nowMs, (long)command.ExecuteScalar()!);
+        }
     }
 
     /// <summary>
@@ -325,35 +397,59 @@ internal sealed class TopicReader : IDisposable
     /// </remarks>
     internal (long Min, long Max) Bounds()
     {
-        if (_connection is null)
-            return (0, 0);
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return (0, 0);
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            """
-            SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0),
-                   COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0)
-            FROM log;
-            """);
-        using SqliteDataReader reader = command.ExecuteReader();
-        if (!reader.Read())
-            return (0, 0);
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                """
+                SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0),
+                       COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'log'), 0)
+                FROM log;
+                """);
+            using SqliteDataReader reader = command.ExecuteReader();
+            if (!reader.Read())
+                return (0, 0);
 
-        long min = reader.GetInt64(0);
-        long max = reader.GetInt64(1);
-        long highWater = reader.GetInt64(2);
-        return max == 0 ? (highWater + 1, highWater) : (min, max);
+            long min = reader.GetInt64(0);
+            long max = reader.GetInt64(1);
+            long highWater = reader.GetInt64(2);
+            return max == 0 ? (highWater + 1, highWater) : (min, max);
+        }
     }
 
     internal DateTimeOffset? OldestAfter(long mark)
     {
-        if (_connection is null)
-            return null;
+        lock (_gate)
+        {
+            if (Live() is not { } connection)
+                return null;
 
-        using SqliteCommand command = Sqlite.Command(_connection, null,
-            "SELECT MIN(enqueued_at) FROM log WHERE seq > $m;");
-        command.Parameters.AddWithValue("$m", mark);
-        return command.ExecuteScalar() is long ms ? Sqlite.FromUnixMs(ms) : null;
+            using SqliteCommand command = Sqlite.Command(connection, null,
+                "SELECT MIN(enqueued_at) FROM log WHERE seq > $m;");
+            command.Parameters.AddWithValue("$m", mark);
+            return command.ExecuteScalar() is long ms ? Sqlite.FromUnixMs(ms) : null;
+        }
     }
 
-    public void Dispose() => _connection?.Dispose();
+    /// <summary>
+    /// Closes the connection, waiting for whatever statement is on it rather than freeing it underneath one.
+    /// </summary>
+    /// <remarks>
+    /// Closing twice is safe and does nothing the second time, and the field is cleared rather than left
+    /// pointing at a disposed object: a reader that has been closed answers every later call by saying so,
+    /// which is what <see cref="Live"/> is for.
+    /// </remarks>
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_closed)
+                return;
+            _closed = true;
+            _connection?.Dispose();
+            _connection = null;
+        }
+    }
 }
