@@ -71,4 +71,5 @@ And ask a subscriber how far behind it is, in the units your retention window is
 ```csharp
 SubscriptionLag lag = await worker.LagAsync();
 // lag.OldestUnread is a duration. Compare it with the retention window and alarm well before they meet.
+// lag.DueScheduled counts scheduled messages that have come due and nobody has dealt with yet.
 ```

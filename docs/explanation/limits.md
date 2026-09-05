@@ -25,8 +25,9 @@ no third answer to find.
 So the answer here is to make the loss bounded, attributable, and loud.
 
 **Before it happens.** Ask a subscriber how far behind it is. `LagAsync` reports a duration as well as a
-count, because a number of messages cannot be compared with a policy written in hours. Alarm when the lag
-approaches the retention window.
+count, because a number of messages cannot be compared with a policy written in hours. It counts the
+scheduled table as well as the log, since the age bound removes from both. Alarm when the lag approaches the
+retention window.
 
 **As it happens.** `ApplyRetentionAsync` reads the subscribers' files and names the ones that had not reached
 what it removed, and how many each lost. Log that at warning.

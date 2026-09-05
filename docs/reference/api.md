@@ -65,10 +65,20 @@ root written two ways is one root: paths are resolved before they are compared, 
 
 Disposing a subscription that is still holding deliveries hands them back rather than stranding them. They go
 out again on the next read, counted as further attempts, which is what the process stopping would have done
-to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach. Using one
-after it has closed is refused in its own terms rather than as a disposal error: a read says the store is
-closed, and a settle says the delivery has already been settled, which is the truth, because closing handed
-it back.
+to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach. That covers
+everything the subscription had at the moment you closed it, including a delivery it was in the middle of
+claiming and one whose settle was in the middle of failing: the close seals the subscription against new
+work, waits for what is already moving to come to rest, and only then hands back what it finds.
+
+You can close a subscription whose read loop is still running, and you do not have to cancel the loop first.
+The loop ends with the same closed-store answer as any other call, and it will not be handed a delivery on
+the way out: a message claimed as the close began is handed back, not given to a handler who could no longer
+settle it. A read waiting for an in-flight slot, or pausing between polls, is woken and told the same thing
+rather than left waiting — which matters because `ReadAsync` accepts a token you never cancel.
+
+Using a subscription after it has closed is refused in its own terms rather than as a disposal error: a read
+says the store is closed, and a settle says the delivery has already been settled, which is the truth,
+because closing handed it back.
 
 Settle each delivery once. A second settle of the same one throws `InvalidOperationException`, and it is the
 *delivery* that is finished with rather than the message: if a failed message has since been handed out again,
@@ -106,7 +116,11 @@ has read it yet, and under `DropOldest` a dead-letter bound reached before it is
 before somebody reads it. Only a message actually in a handler's hands is safe from that bound. Under
 `StopDelivering`, which is the default, nothing is destroyed and the question does not arise.
 
-`LagAsync()` reports how far behind this subscriber is, as a count and as a duration.
+`LagAsync()` reports how far behind this subscriber is: a count of log records it has not reached, the age of
+the oldest of them, and a count of scheduled messages that have come due and it has not finished with. The
+scheduled count is separate because the two tables are held by different bounds, and it is there at all
+because `MaxAge` removes from both — a subscriber can be overtaken on either side. It is safe to call while
+the subscription is reading, which is what it is for.
 
 `ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Ageing one out
 changes what it is filed as and nothing else, so it does not itself cancel a replay: the row stays on its way
