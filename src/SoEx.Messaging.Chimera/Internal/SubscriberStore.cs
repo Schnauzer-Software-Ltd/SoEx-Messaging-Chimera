@@ -208,26 +208,6 @@ internal sealed class SubscriberStore : IAsyncDisposable
     internal ValueTask<long> ReadMarkAsync(string topic, CancellationToken ct = default)
         => _writer.EnqueueAsync((c, t) => MarkOf(c, t, topic), ct);
 
-    /// <summary>Takes a delivery. Returns the attempt number this delivery is.</summary>
-    internal ValueTask<long> ClaimAsync(string topic, EntrySource source, long id, CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
-        {
-            using var command = Sqlite.Command(connection, transaction,
-                """
-                INSERT INTO entry (topic, source, id, state, attempts, updated)
-                VALUES ($t, $s, $i, $inflight, 1, $now)
-                ON CONFLICT(topic, source, id) DO UPDATE
-                  SET state = $inflight, attempts = entry.attempts + 1, updated = $now
-                RETURNING attempts;
-                """);
-            command.Parameters.AddWithValue("$t", topic);
-            command.Parameters.AddWithValue("$s", (int)source);
-            command.Parameters.AddWithValue("$i", id);
-            command.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
-            command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
-            return (long)command.ExecuteScalar()!;
-        }, ct);
-
     /// <summary>Finishes a delivery and lets the mark absorb whatever it now can.</summary>
     internal ValueTask<long> CompleteAsync(string topic, EntrySource source, long id, CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
@@ -612,17 +592,36 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Takes a delivery only if nothing already holds it. An entry above the mark is either in flight now or
-    /// finished but not yet absorbed, and neither should be delivered again.
+    /// Takes a delivery only if nothing already holds it and the position has not passed it. An entry above
+    /// the mark is either in flight now or finished but not yet absorbed, and neither should be delivered
+    /// again.
     /// </summary>
-    /// <returns>The attempt number, or 0 if this message is already spoken for.</returns>
-    internal ValueTask<long> TryClaimAsync(string topic, EntrySource source, long id, CancellationToken ct = default)
+    /// <remarks>
+    /// The position is checked inside this statement and not by the caller, because the caller's reading of it
+    /// is stale by the time the claim runs. Choosing a candidate and claiming it are separate write ops, and a
+    /// second reader of the same subscriber — a sibling instance, or a second enumerator — can complete the
+    /// same record in between, whereupon the mark absorbs it and <em>deletes its entry</em>. An unguarded
+    /// upsert then reads that absence as "never delivered" and inserts a fresh claim below the mark: the
+    /// message goes to a second handler on a path where nothing failed, and the row it leaves behind sits
+    /// where no position will ever absorb it — counted by every poll and every inspection for the life of the
+    /// file, and answered over by <c>ReleaseAsync</c> as if a redelivery were coming that no read will offer.
+    /// Selecting from the cursor row makes the claim and the check one statement: a log claim is valid only
+    /// above the mark, a scheduled one only above the floor, which needs the row's due time because the floor
+    /// orders by due time and then id — the same comparison <c>TopicReader.Due</c> makes.
+    /// </remarks>
+    /// <returns>The attempt number, or 0 if this message is already spoken for or already absorbed.</returns>
+    internal ValueTask<long> TryClaimAsync(string topic, EntrySource source, long id, long dueAtMs,
+        CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
+            string above = source == EntrySource.Scheduled
+                ? "(due_floor < $d OR (due_floor = $d AND id_floor < $i))"
+                : "mark < $i";
             using var command = Sqlite.Command(connection, transaction,
-                """
+                $"""
                 INSERT INTO entry (topic, source, id, state, attempts, updated)
-                VALUES ($t, $s, $i, $inflight, 1, $now)
+                SELECT $t, $s, $i, $inflight, 1, $now FROM cursor
+                WHERE topic = $t AND {above}
                 ON CONFLICT(topic, source, id) DO UPDATE
                   SET state = $inflight, attempts = entry.attempts + 1, updated = $now
                   WHERE entry.state = $available
@@ -631,6 +630,8 @@ internal sealed class SubscriberStore : IAsyncDisposable
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$s", (int)source);
             command.Parameters.AddWithValue("$i", id);
+            if (source == EntrySource.Scheduled)
+                command.Parameters.AddWithValue("$d", dueAtMs);
             command.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
             command.Parameters.AddWithValue("$available", (int)EntryState.Available);
             command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
@@ -660,33 +661,94 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Moves the position forward over messages that no longer exist, dropping any entries it passes.
+    /// Measures the loss below a surviving minimum, moves the position over it, and drops the entries it
+    /// passes — in the one write, so the gap that is measured is the gap that is closed.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Only for the case where retention removed records this subscriber had not read. The mark advances over
-    /// contiguous entries, so leaving it below a gap that can never be filled would freeze it there for good and
-    /// the exception set would grow without limit. Acknowledging the loss is the only way back to a consistent
-    /// position, which is why it is reported at the same time rather than done quietly.
+    /// contiguous entries, so leaving it below a gap that can never be filled would freeze it there for good
+    /// and the exception set would grow without limit. Acknowledging the loss is the only way back to a
+    /// consistent position, which is why it is reported at the same time rather than done quietly.
+    /// </para>
+    /// <para>
+    /// Measuring and moving used to be separate ops, and two readers of the same subscriber — a sibling
+    /// instance, or a second enumerator — interleaved them: both read the un-moved mark, both measured the
+    /// same gap, and both reported it, doubling the one number the loss contract says an operator can act on.
+    /// In one op, whichever call finds the mark already moved measures a gap of nothing and reports nothing:
+    /// the report belongs to the call that moved the position. The opening no-op write is part of that — it
+    /// takes the file's write lock before the mark is read, so a sibling's move lands before this
+    /// measurement rather than between it and the write behind it.
+    /// </para>
     /// </remarks>
-    internal ValueTask<long> ForceMarkAsync(string topic, long mark, CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
+    /// <returns>The moved mark, how many records were lost, and the bounds of the gap they were lost in.</returns>
+    internal async ValueTask<(long Mark, long Lost, long First, long Last)> SettleLossAsync(string topic,
+        long min, CancellationToken ct = default)
+    {
+        long moved = 0, lost = 0, first = 0, last = 0;
+        await _writer.EnqueueAsync((connection, transaction) =>
         {
+            moved = 0; lost = 0; first = 0; last = 0;
+
+            using (var touch = Sqlite.Command(connection, transaction,
+                "UPDATE cursor SET mark = mark WHERE topic = $t;"))
+            {
+                touch.Parameters.AddWithValue("$t", topic);
+                touch.ExecuteNonQuery();
+            }
+
+            long mark = MarkOf(connection, transaction, topic);
+            if (min <= mark + 1)
+            {
+                moved = mark;
+                return 0;
+            }
+
+            // Records a handler is holding, or has already settled, are not lost to this subscriber however
+            // they left the log: counting them would name messages someone has in their hands as ones that
+            // never arrived. An entry left Available is neither — a delivery that failed and was handed back
+            // is owed another attempt only the log can make. Counted before the delete below takes the same
+            // entries with it.
+            long held;
+            using (var count = Sqlite.Command(connection, transaction,
+                """
+                SELECT COUNT(*) FROM entry
+                WHERE topic = $t AND source = $s AND id > $a AND id < $b AND state <> $available;
+                """))
+            {
+                count.Parameters.AddWithValue("$t", topic);
+                count.Parameters.AddWithValue("$s", (int)EntrySource.Log);
+                count.Parameters.AddWithValue("$a", mark);
+                count.Parameters.AddWithValue("$b", min);
+                count.Parameters.AddWithValue("$available", (int)EntryState.Available);
+                held = (long)count.ExecuteScalar()!;
+            }
+
             using (var entries = Sqlite.Command(connection, transaction,
                 "DELETE FROM entry WHERE topic = $t AND source = $s AND id <= $m;"))
             {
                 entries.Parameters.AddWithValue("$t", topic);
                 entries.Parameters.AddWithValue("$s", (int)EntrySource.Log);
-                entries.Parameters.AddWithValue("$m", mark);
+                entries.Parameters.AddWithValue("$m", min - 1);
                 entries.ExecuteNonQuery();
             }
 
-            using var command = Sqlite.Command(connection, transaction,
-                "UPDATE cursor SET mark = $m WHERE topic = $t AND mark < $m;");
-            command.Parameters.AddWithValue("$m", mark);
-            command.Parameters.AddWithValue("$t", topic);
-            command.ExecuteNonQuery();
-            return AdvanceMark(connection, transaction, topic);
-        }, ct);
+            using (var move = Sqlite.Command(connection, transaction,
+                "UPDATE cursor SET mark = $m WHERE topic = $t AND mark < $m;"))
+            {
+                move.Parameters.AddWithValue("$m", min - 1);
+                move.Parameters.AddWithValue("$t", topic);
+                move.ExecuteNonQuery();
+            }
+
+            moved = AdvanceMark(connection, transaction, topic);
+            lost = Math.Max(0, min - mark - 1 - held);
+            first = mark + 1;
+            last = min - 1;
+            return lost;
+        }, ct).ConfigureAwait(false);
+        return (moved, lost, first, last);
+    }
 
     /// <summary>
     /// What this subscriber knows about the records above a position: what it is holding, and what it has
@@ -806,34 +868,6 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct).ConfigureAwait(false);
         return forgotten;
     }
-
-    /// <summary>
-    /// How many deliveries this subscriber holds for records between a position and a sequence: what it was
-    /// handed and has not settled, and what it has settled but the position has not reached.
-    /// </summary>
-    /// <remarks>
-    /// An entry left <see cref="EntryState.Available"/> is neither of those. A delivery that failed and was
-    /// handed back is in nobody's hands and is owed another attempt that only the log can make, so once the
-    /// record has gone the message is lost as surely as one that was never read at all — and counting it here
-    /// would subtract it from the loss and tell nobody. The exemption belongs to the states where something
-    /// still speaks for the message: a handler holding it, or a settle that has already happened.
-    /// </remarks>
-    internal ValueTask<long> HeldBetweenAsync(string topic, EntrySource source, long above, long below,
-        CancellationToken ct = default)
-        => _writer.EnqueueAsync((connection, transaction) =>
-        {
-            using var command = Sqlite.Command(connection, transaction,
-                """
-                SELECT COUNT(*) FROM entry
-                WHERE topic = $t AND source = $s AND id > $a AND id < $b AND state <> $available;
-                """);
-            command.Parameters.AddWithValue("$t", topic);
-            command.Parameters.AddWithValue("$s", (int)source);
-            command.Parameters.AddWithValue("$a", above);
-            command.Parameters.AddWithValue("$b", below);
-            command.Parameters.AddWithValue("$available", (int)EntryState.Available);
-            return (long)command.ExecuteScalar()!;
-        }, ct);
 
     /// <summary>Takes a set-aside row that replay made ready.</summary>
     internal async ValueTask<SetAsideEntry?> ClaimReadySetAsideAsync(string topic, CancellationToken ct = default)

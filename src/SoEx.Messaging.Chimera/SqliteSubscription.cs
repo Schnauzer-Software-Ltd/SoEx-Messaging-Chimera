@@ -547,7 +547,13 @@ public sealed class SqliteSubscription : ISubscription
             if (payload is null)
                 continue;
 
-            long attempt = await _store.TryClaimAsync(Topic, source, candidate.Id, ct).ConfigureAwait(false);
+            // The claim re-checks the position inside its own write — the mark for a log row, the floor for
+            // a scheduled one, which is why the due time goes along. The states and candidates this loop is
+            // working from were read in earlier ops, and a second reader of the same subscriber can settle
+            // and absorb a row in between; a claim that trusted this method's reading would re-insert an
+            // entry for it below the position, and deliver the message twice on a path where nothing failed.
+            long attempt = await _store.TryClaimAsync(Topic, source, candidate.Id,
+                Sqlite.ToUnixMs(candidate.EligibleAt), ct).ConfigureAwait(false);
             if (attempt == 0)
                 continue;
 
@@ -568,16 +574,14 @@ public sealed class SqliteSubscription : ISubscription
         if (min <= mark + 1 || min <= _seenMinimum)
             return mark;
 
-        // Records a handler is holding, or has already settled, are not lost to this subscriber however they
-        // left the log: counting them would name messages someone has in their hands as ones that never
-        // arrived. A delivery that failed and was handed back is not one of those — see HeldBetweenAsync.
-        long held = await _store.HeldBetweenAsync(Topic, EntrySource.Log, mark, min, ct).ConfigureAwait(false);
-        long lost = min - mark - 1 - held;
-
-        // The position has to move over the gap before anything is said about it. The mark only advances over
-        // contiguous entries, so leaving it below records that will never exist again would pin it there for
-        // good, and every later completion would pile up as an entry that can never be absorbed.
-        long moved = await _store.ForceMarkAsync(Topic, min - 1, ct).ConfigureAwait(false);
+        // Measuring the gap and moving the position over it are one write, and the gap in the report is the
+        // one that write measured — not the one this method read a moment ago. Two readers of the same
+        // subscriber can reach here together, and when they did the measurement and the move were separate
+        // ops: both measured against the un-moved mark and the same loss was reported twice. The write that
+        // finds the mark already moved measures nothing and reports nothing, so between however many readers
+        // there are, the loss is reported by exactly the one that moved the position over it.
+        (long moved, long lost, long first, long last) =
+            await _store.SettleLossAsync(Topic, min, ct).ConfigureAwait(false);
 
         // And only now is this minimum a seen one. A detection that runs once has to be one that finished:
         // a consumer cancelling a read is ordinary, and cancelling it above would leave the flag set with the
@@ -588,7 +592,7 @@ public sealed class SqliteSubscription : ISubscription
         if (lost <= 0)
             return moved;
 
-        throw new MessagesLostException(Topic, Subscriber, lost, mark + 1, min - 1);
+        throw new MessagesLostException(Topic, Subscriber, lost, first, last);
     }
 
     private async ValueTask IdleAsync(CancellationToken ct)
