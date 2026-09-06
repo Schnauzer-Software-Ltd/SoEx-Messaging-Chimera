@@ -451,6 +451,25 @@ internal sealed class TopicReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// When the oldest record above a position was published, or null when there is nothing above it.
+    /// </summary>
+    /// <remarks>
+    /// Read as the first record above the mark rather than as the minimum over everything above it, which is
+    /// the same answer for one reason: a record's stamp is taken on the writer thread in the order sequences
+    /// are handed out, so stamps never fall as sequences rise. Asked as a minimum it is a single aggregate
+    /// over a column with no index, so SQLite has to look at every record above the mark to be sure — the
+    /// index takes it to the right starting point and then it reads to the end of the log. Asked as the first
+    /// row it stops there. On a hundred thousand records that is the difference between twenty-one
+    /// milliseconds and eight microseconds, and the query plan is identical for both, so nothing but a
+    /// measurement or this comment will tell them apart.
+    /// <para>
+    /// The ordering is not a new assumption. Age-based retention already picks a cutoff by time and then
+    /// deletes by sequence, which removes every record below the cutoff whatever its stamp says, so a log
+    /// whose stamps fell out of order would lose unexpired records there long before this reading of it
+    /// mattered. Stating the dependency in one more place is worth more than hiding it.
+    /// </para>
+    /// </remarks>
     internal DateTimeOffset? OldestAfter(long mark)
     {
         lock (_gate)
@@ -459,8 +478,11 @@ internal sealed class TopicReader : IDisposable
                 return null;
 
             using SqliteCommand command = Sqlite.Command(connection, null,
-                "SELECT MIN(enqueued_at) FROM log WHERE seq > $m;");
+                "SELECT enqueued_at FROM log WHERE seq > $m ORDER BY seq LIMIT 1;");
             command.Parameters.AddWithValue("$m", mark);
+
+            // No row rather than a null row when nothing is above the mark, which reaches this the same way:
+            // neither is a long, and both mean there is nothing to be behind on.
             return command.ExecuteScalar() is long ms ? Sqlite.FromUnixMs(ms) : null;
         }
     }
