@@ -675,9 +675,14 @@ public sealed class SqliteSubscription : ISubscription
         switch (Take(envelope.Tag))
         {
             case Held.No:
+                // All three causes are named, because the caller can only act on one of them. A settle
+                // arriving after the close was told it had already settled the message, which is a lie about
+                // its own delivery: the hand-back took the claim, nothing was written, and the message is
+                // there for the next subscription to be handed. Held.No has known these apart all along.
                 throw new InvalidOperationException(
-                    $"Message '{envelope.MessageId}' on topic '{Topic}' has already been settled, or was not " +
-                    $"delivered by subscriber '{Subscriber}'. Each delivery is settled once.");
+                    $"Message '{envelope.MessageId}' on topic '{Topic}' is not this caller's to settle: it " +
+                    $"has already been settled, or closing the subscription handed the delivery back, or " +
+                    $"subscriber '{Subscriber}' never delivered it. Each delivery is settled once.");
             case Held.Closing:
                 throw Closed();
         }
@@ -727,13 +732,15 @@ public sealed class SqliteSubscription : ISubscription
             {
                 if (exhausted)
                 {
-                    // The same refusal the three other routes into the dead set make, on the fourth. A
-                    // replayed row this subscriber could not keep as a dead letter is refused here too: the
-                    // delivery stays the caller's, to complete deliberately or to fail again once the bound is
-                    // somewhere it can live.
-                    EnsureKeepable(envelope.Payload.Length);
+                    // The same refusal the other routes into the dead set make, on this one — decided in the
+                    // write, which can tell a deferral arriving in the dead set from a dead letter being
+                    // re-filed as what it already is. Refused, nothing was written and the delivery is still
+                    // the caller's, to complete deliberately or to fail again once the bound is somewhere it
+                    // can live.
                     SetAsideOutcome dead = await _store.RefileAsync(envelope.Tag.Id, Topic, SetAsideKind.Dead,
                         reason, _subscriptionOptions.SetAside, cancellationToken).ConfigureAwait(false);
+                    if (dead.Refused)
+                        throw Unkeepable(envelope.Payload.Length);
                     return false;
                 }
 
@@ -819,15 +826,15 @@ public sealed class SqliteSubscription : ISubscription
             // directions. A dead letter someone replayed and then deferred is filed as deferred, which is what
             // the call says it does and what an operator working a dead set down is asking for.
             //
-            // The one bound checked out here is the one no set the row could join can satisfy: a payload
-            // larger than the whole dead byte bound cannot be a dead letter, wherever it is coming from. The
-            // rest are read inside the write, against the set the row is joining.
-            if (kind == SetAsideKind.Dead)
-                EnsureKeepable(envelope.Payload.Length);
-
+            // Every bound is read inside the write, against the set the row is joining, and that includes the
+            // keepability refusal: whether this row is joining the dead set or is in it already is the thing
+            // the decision turns on, and it is the write that knows.
             SetAsideOutcome refiled = await _store.RefileAsync(envelope.Tag.Id, Topic, kind,
                 reason ?? (kind == SetAsideKind.Dead ? "dead-lettered" : null),
                 _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
+
+            if (refiled.Refused)
+                throw Unkeepable(envelope.Payload.Length);
             return;
         }
 
@@ -845,23 +852,13 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Refuses a dead letter this subscriber could not then keep. A byte bound smaller than the message, with
-    /// dropping the oldest to stay inside it, leaves the trim nothing it can do: a settle never destroys the
-    /// row it is filing, so this one would be kept by destroying every other dead letter the subscriber holds
-    /// and the set would still stand over the bound. Emptying a set to no purpose is not a bound being held,
-    /// so it is refused. The caller can complete the delivery instead and lose the message knowingly, which is
-    /// a decision rather than an accident.
+    /// Refuses a dead letter this subscriber could not then keep: with a byte bound smaller than the message
+    /// and dropping the oldest to stay inside it, the trim destroys this row on its next pass whatever else
+    /// the set holds, so filing it would be storing a message in order to lose it. The refusal itself is made
+    /// in the write that would have filed the row — the set the row is measured against is the set it is
+    /// joining — and thrown out here, where the caller that caused it is. The caller can complete the
+    /// delivery instead and lose the message knowingly, which is a decision rather than an accident.
     /// </summary>
-    private void EnsureKeepable(int size)
-    {
-        SetAsidePolicy policy = _subscriptionOptions.SetAside;
-        if (policy.DeadOverflow == DeadLetterOverflow.DropOldest
-            && policy.MaxDeadBytes is { } maxDead && size > maxDead)
-        {
-            throw Unkeepable(size);
-        }
-    }
-
     private DeadLetterTooLargeException Unkeepable(int size)
         => new(Topic, Subscriber, size, _subscriptionOptions.SetAside.MaxDeadBytes ?? 0);
 

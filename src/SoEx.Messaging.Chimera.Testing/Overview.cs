@@ -79,6 +79,12 @@ public sealed record ChimeraOverview(IReadOnlyList<SubscriberActivity> Subscribe
     public bool Settled => Subscribers.All(s => s.Settled);
 
     /// <summary>Dead letters across every subscriber. Assert on this separately from <see cref="Settled"/>.</summary>
+    /// <remarks>
+    /// What is being held now, which under <see cref="DeadLetterOverflow.DropOldest"/> is not the same as what
+    /// was ever given up on: a dead letter the bound destroyed has left the set and this count with it. Zero
+    /// here means nothing is parked, not that nothing was lost — <c>SetAsideReport.DeadDropped</c> is what
+    /// says that.
+    /// </remarks>
     public long DeadLettered => Subscribers.Sum(s => s.DeadLettered);
 
     /// <summary>What one subscriber is doing about one topic, or null if it does not read that topic.</summary>
@@ -89,9 +95,21 @@ public sealed record ChimeraOverview(IReadOnlyList<SubscriberActivity> Subscribe
 }
 
 /// <summary>Where one message has got to, as far as one subscriber is concerned.</summary>
+/// <remarks>
+/// Two of these answer from what the files still hold rather than from what happened, because the two ways a
+/// message can be destroyed destroy its evidence with it. Neither <see cref="Completed"/> nor
+/// <see cref="Unknown"/> is a promise on its own, and each says so in its own words. A test that has to rule
+/// out loss reads what <see cref="ISubscription.ApplyRetentionAsync"/> reports — every drop and every ageing
+/// is counted there, durably — or does not run <see cref="DeadLetterOverflow.DropOldest"/>, which is not the
+/// default.
+/// </remarks>
 public enum MessageState
 {
-    /// <summary>This topic holds no message with that id. It was never published, or retention has removed it.</summary>
+    /// <summary>
+    /// This topic holds no record with that id. It was never published, or retention has removed the
+    /// record — including the record of one this subscriber completed long ago: the answer starts from the
+    /// topic file, and a record that is gone ends it whatever the subscriber file holds.
+    /// </summary>
     Unknown = 0,
 
     /// <summary>Published and due, and this subscriber has not been handed it yet.</summary>
@@ -106,7 +124,11 @@ public enum MessageState
     /// <summary>Handed back after a failure. It goes out again on the next read.</summary>
     AwaitingRetry = 4,
 
-    /// <summary>Settled successfully.</summary>
+    /// <summary>
+    /// Settled successfully, or destroyed by a dead-letter bound. Dropping a row removes the same records
+    /// completing it removes, so afterwards there is nothing left to tell the two apart; the drop is counted
+    /// in <c>SetAsideReport.DeadDropped</c> instead, which is where a test asks about it.
+    /// </summary>
     Completed = 5,
 
     /// <summary>Taken out of the flow until this subscriber asks for it.</summary>

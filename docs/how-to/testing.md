@@ -68,7 +68,8 @@ if (overview.Settled && overview.DeadLettered == 0)
 `Settled` means nothing will move on its own. Dead-lettered and deferred messages do not count against it,
 deliberately: both were parked on purpose, so a system holding them is at rest. It is not necessarily
 healthy, which is a different question — assert `DeadLettered == 0` separately, and a topology that gives up
-on everything fails with a count and a reason instead of waiting for a timeout.
+on everything fails with a count and a reason instead of waiting for a timeout. That count is what is held
+now, not what was ever given up on; the section below says what follows from that.
 
 It is a snapshot taken while everything carries on running, not a barrier. A handler that has settled its
 message and is about to publish what comes next looks quiet for that instant, so wait for quiet twice in a
@@ -96,6 +97,35 @@ Ask by message id, not by the sequence on an envelope: sequences come from two d
 orderable. One thing it cannot tell you is how many attempts a message that succeeded took. The row carrying
 that count is deleted when the position absorbs it, which is what keeps a subscriber's file from growing with
 the log. If a test needs that, watch the deliveries — every envelope carries its own attempt number.
+
+## What these cannot tell you: that nothing was lost
+
+Both of these read the files as they are now, and destroying a message destroys what would say it had been
+there. So neither `Completed` nor `DeadLettered == 0` is a statement about loss, and it is worth knowing which
+way round each of them fails.
+
+`Completed` means settled successfully **or destroyed by the dead-letter bound**. Dropping a dead letter
+removes the same records completing it removes, so afterwards there is nothing left to tell the two apart.
+`Unknown` means the topic no longer holds a record with that id, which covers a message that was never
+published, one log retention removed unread, and one this subscriber completed long ago: the answer starts
+from the topic file, and a record that is gone ends it. So `Completed` is not a state every success stays in
+either. `Overview.DeadLettered` counts what is being held now, so a dead letter the bound destroyed has left
+that count with the set.
+
+None of that is silent. Every drop and every deferral aged out is counted in the subscriber's file as it
+happens, and `ApplyRetentionAsync` returns the pair:
+
+```csharp
+SetAsideReport report = await subscription.ApplyRetentionAsync(ct);
+// report.DeadDropped     — dead letters destroyed to stay inside the bound, by this pass and by any settle
+// report.DeferredAgedOut — deferrals that became dead letters because they sat too long
+```
+
+That report is where a test asserts nothing was lost. It is read once and cleared, to whichever pass asks
+first, so a harness that wants it has to be the thing running the passes rather than sharing them with a
+maintenance loop. The simpler route, if the test does not care about the bound, is not to set
+`DeadLetterOverflow.DropOldest`: it is opt-in, and the default stops delivering instead of destroying
+anything.
 
 ## Controlling time
 

@@ -58,8 +58,16 @@ public static class ChimeraInspector
 
     /// <summary>What became of one message, as far as one subscriber is concerned.</summary>
     /// <remarks>
+    /// <para>
     /// Ask by message id, never by the sequence on an envelope: sequences come from two number spaces in the
     /// topic file and only look orderable. The translation from one to the other happens here.
+    /// </para>
+    /// <para>
+    /// This reads the files as they are now, so what a destroyed message reads as is what its absence reads
+    /// as. <see cref="MessageState.Completed"/> and <see cref="MessageState.Unknown"/> both cover a loss for
+    /// that reason, and the remarks on <see cref="MessageState"/> say which. Asserting an expected state here
+    /// is the right assertion; asserting that nothing was lost is not one this can make.
+    /// </para>
     /// </remarks>
     public static MessageStatus StatusOf(ChimeraOptions options, string topic, string subscriber,
         string messageId)
@@ -110,8 +118,13 @@ public static class ChimeraInspector
             return Status(messageId, topic, subscriber, state, entry.Attempts, null, entry.Updated);
         }
 
-        // No record of it in the exception set. Either the position has passed it, which for a row still in
-        // the topic can only mean this subscriber finished with it, or it has not been handed out yet.
+        // No record of it in the exception set. Either the position has passed it or it has not been handed
+        // out yet. A passed position usually means this subscriber finished with it, and cannot mean only
+        // that: the dead-letter bound destroying a filed row deletes the set-aside row, and the entry that
+        // row came from was terminal and absorbed long before. What is left is a position past the record
+        // and nothing else, which is exactly what a completion leaves. Nothing here can separate them, so
+        // this answers Completed for both and the enum says as much. The drop is counted where it can be,
+        // in the subscriber's own file, and reported by ApplyRetentionAsync.
         (long mark, ScheduledFloor floor) = Position(connection, topic);
         return Status(messageId, topic, subscriber,
             Undelivered(reader, row, floor, mark, options.Clock.GetUtcNow()), 0, null, null);

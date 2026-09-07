@@ -370,9 +370,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
             }
 
             // Filed dead and too big to be kept: this subscriber destroys the oldest to stay inside its byte
-            // bound, and the trim below never destroys the row the write is filing — so keeping this one
-            // means destroying every other dead letter and standing over the bound anyway. Emptying the set
-            // to no purpose is not the bound being held, so nothing is written.
+            // bound, and this row is over that bound on its own, so the trim takes it whatever room the set
+            // has. Writing it would be storing the message in order to lose it, so nothing is written and the
+            // caller is told. What it would cost the rest of the set is nothing either way — an unkeepable
+            // row is charged to nothing — so the refusal is about this message and not about the others.
             if (filedAs == SetAsideKind.Dead
                 && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
                 && bounds.MaxDeadBytes is { } maxDead && bytes.Length > maxDead)
@@ -464,17 +465,28 @@ internal sealed class SubscriberStore : IAsyncDisposable
     /// that was not growing. A row moving the other way — dead to deferred — is genuinely joining, so it is
     /// measured, and a deferral that does not fit stays dead and says so, exactly as one arriving fresh does.
     /// </para>
+    /// <para>
+    /// The keepability refusal is made here as well, and on the same terms as everywhere else: a row is
+    /// refused when it is joining the dead set and is larger than the whole byte bound. Knowing what the row
+    /// already is, is the reason the decision belongs in this write rather than at the call site. A caller
+    /// cannot tell a deferral being downgraded — which is arriving in the dead set, and meets the refusal a
+    /// fresh arrival meets — from a dead letter being re-filed as what it already is, which joins nothing:
+    /// refusing that one gives a reason untrue of it, since the row is already held and keeping it costs the
+    /// set nothing, and it leaves a replayed dead letter no way back into the store it came out of.
+    /// </para>
     /// </remarks>
     internal async ValueTask<SetAsideOutcome> RefileAsync(long asideId, string topic, SetAsideKind kind,
         string? reason, SetAsidePolicy bounds, CancellationToken ct = default)
     {
         SetAsideKind filedAs = kind;
         SetAsideSizes sizes = default;
+        bool refused = false;
 
         await _writer.EnqueueAsync((connection, transaction) =>
         {
             filedAs = kind;
             sizes = default;
+            refused = false;
             string? why = reason;
 
             SetAsideKind was;
@@ -505,6 +517,17 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 }
             }
 
+            // Joining the dead set and too big for this subscriber to hold: nothing is written, for the
+            // reason the fresh arrival is turned away. A row already filed dead is not joining it, and is
+            // re-filed as what it already is without complaint — the set it is in is the set it stays in.
+            if (filedAs == SetAsideKind.Dead && was != SetAsideKind.Dead
+                && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
+                && bounds.MaxDeadBytes is { } maxDead && length > maxDead)
+            {
+                refused = true;
+                return 0;
+            }
+
             using (var command = Sqlite.Command(connection, transaction,
                 """
                 UPDATE set_aside SET kind = $k, delivery = $held, reason = $r, aside_at = $now
@@ -526,7 +549,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return 1;
         }, ct).ConfigureAwait(false);
 
-        return new SetAsideOutcome(asideId, filedAs, Refused: false, sizes);
+        return new SetAsideOutcome(asideId, filedAs, refused, sizes);
     }
 
     /// <summary>Lists what is set aside. Reads go through the writer, which keeps one connection per file.</summary>
@@ -1152,26 +1175,38 @@ internal sealed class SubscriberStore : IAsyncDisposable
         //
         // Excluding it from the delete as well makes "a settle never destroys the row it is filing" true of
         // this statement rather than true only while every route into the set turns away a row it could not
-        // keep. With the ordering in place the exclusion never fires today: sorted first, this row is chosen
-        // only if it alone breaks the bound, and a count bound below one is refused when the subscription is
-        // opened while a payload over the whole byte bound is refused before the write on all four routes in.
-        // It is here because that is a guarantee assembled out of four call sites and a validation rule, and
-        // this defect is what it looks like when one of them is a bound out of step with the one that fires.
-        // It is also what lets the refusal say what it now says: not "this row would be destroyed as it
-        // landed" but "keeping it would destroy every other dead letter and still leave the set over the
-        // bound", which is the honest reason to turn it away.
+        // keep. It is here because that would otherwise be a guarantee assembled out of call sites and a
+        // validation rule, and the defect it was written for is what that looks like when one of them is a
+        // bound out of step with the one that fires.
+        //
+        // A row whose own payload is larger than the whole byte bound is charged to nothing and destroyed
+        // wherever it sits. Totalling it like any other row made one unkeepable row push the running sum
+        // past the bound for every row older than it, so a set that was comfortably inside the bound was
+        // emptied by a single arrival it could never have kept — the age-out pass files exactly such a row,
+        // and the maintenance trim that followed took the rest of the set with it. Both bounds now count
+        // only what this subscriber can keep, so the collateral is gone and what is destroyed is the row
+        // that cannot be held, counted as the loss it is. The delete says so directly rather than relying on
+        // the sum, because a row too big for the bound is over it alone and stays over it however the set
+        // around it shrinks; the in-flight and $filed exclusions still come first, since a handler about to
+        // be told what happened to a row, and the row a write is filing, are spared whatever their size.
         using (var command = Sqlite.Command(connection, transaction,
             """
             DELETE FROM set_aside WHERE aside_id IN (
               SELECT aside_id FROM (
-                SELECT aside_id, delivery,
-                       ROW_NUMBER() OVER (ORDER BY aside_id = $filed DESC, aside_id DESC) AS place,
-                       SUM(LENGTH(payload)) OVER (ORDER BY aside_id = $filed DESC, aside_id DESC
-                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
-                FROM set_aside WHERE topic = $t AND kind = $dead)
+                SELECT aside_id, delivery, unkeepable,
+                       SUM(CASE WHEN unkeepable THEN 0 ELSE 1 END)
+                         OVER (ORDER BY aside_id = $filed DESC, aside_id DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS place,
+                       SUM(CASE WHEN unkeepable THEN 0 ELSE size END)
+                         OVER (ORDER BY aside_id = $filed DESC, aside_id DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+                FROM (SELECT aside_id, delivery, LENGTH(payload) AS size,
+                             ($bytes IS NOT NULL AND LENGTH(payload) > $bytes) AS unkeepable
+                      FROM set_aside WHERE topic = $t AND kind = $dead))
               WHERE delivery <> $inflight
                 AND ($filed IS NULL OR aside_id <> $filed)
-                AND (($count IS NOT NULL AND place > $count)
+                AND (unkeepable
+                  OR ($count IS NOT NULL AND place > $count)
                   OR ($bytes IS NOT NULL AND running > $bytes)));
             """))
         {

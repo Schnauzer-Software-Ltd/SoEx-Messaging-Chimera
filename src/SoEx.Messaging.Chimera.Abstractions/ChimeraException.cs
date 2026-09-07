@@ -139,23 +139,32 @@ public sealed class SubscriberStoppedException : ChimeraException
 
 /// <summary>
 /// A dead letter could not be filed, because it could not then be kept. Only ever raised by a subscriber set
-/// to drop the oldest with a byte bound smaller than the message: keeping this row means destroying every
-/// other dead letter the subscriber holds and still standing over the bound, so it is refused instead.
+/// to drop the oldest with a byte bound smaller than the message: this row is over that bound on its own, so
+/// the trim destroys it whatever else the set holds and filing it would be storing a message in order to lose
+/// it. It is refused instead.
 /// </summary>
 /// <remarks>
+/// <para>
 /// The delivery is still outstanding, exactly as after any settle that threw. There are two ways on:
 /// complete it, which loses the message knowingly, or raise <see cref="SetAsidePolicy.MaxDeadBytes"/> above
 /// the topic's payload limit and settle it again. Trying the same settle again will be refused again — the
 /// bound cannot hold this message however many times it is asked.
+/// </para>
+/// <para>
+/// Raised where the row would be joining the dead set. A message already filed dead — replayed, and then
+/// failed out of its attempts or dead-lettered again — is re-filed as what it already is without complaint:
+/// it is held, and holding it costs the set nothing it is not already paying. Refusing it there would offer
+/// a reason untrue of it and leave a replayed dead letter no way back into the store it came out of.
+/// </para>
 /// </remarks>
 public sealed class DeadLetterTooLargeException : ChimeraException
 {
     public DeadLetterTooLargeException(string topic, string subscriber, int size, long limit)
         : base($"Subscriber '{subscriber}' cannot file a {size}-byte dead letter on topic '{topic}': its " +
-               $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so keeping " +
-               "this one would destroy every other dead letter it holds and still leave the set over the " +
-               "bound. Complete the delivery to lose the message deliberately, or raise MaxDeadBytes above " +
-               "the topic's payload limit.")
+               $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so this one " +
+               "is over the bound on its own and would be destroyed by the next trim however much room the " +
+               "set has. Filing it would be storing the message in order to lose it. Complete the delivery " +
+               "to lose it deliberately, or raise MaxDeadBytes above the topic's payload limit.")
     {
         Topic = topic;
         Subscriber = subscriber;

@@ -75,6 +75,13 @@ By default a subscriber that fills its dead-letter set stops delivering until so
 nothing is destroyed. `DeadLetterOverflow.DropOldest` chooses the other answer, and it is the only setting in
 this library that destroys a message to make room. It is not the default for that reason.
 
+What it destroys, it chooses newest-first: the set keeps its newest dead letters and drops what they have
+pushed out. A message larger than the whole byte bound is charged to nothing on the way through that sum — it
+is over the bound on its own, so it is the row that goes, and the dead letters older than it are not
+collateral. That case is refused at the settle wherever a caller is there to refuse to. It still arrives by
+two routes with no caller: a deferral that ages out into the dead set, and a bound lowered under rows already
+filed, since `SetAsidePolicy` goes with the subscription you open and not with the rows in the file.
+
 What it spares is exactly one thing: a message a handler has in its hands. That handler is about to be told
 what happened to it, and telling it about a row that no longer exists is the sort of untruth the rest of this
 design goes to some length to avoid. Everything else in the set is eligible, and that includes a message you

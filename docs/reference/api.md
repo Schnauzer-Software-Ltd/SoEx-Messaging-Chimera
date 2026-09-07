@@ -79,8 +79,9 @@ settle it. A read waiting for an in-flight slot, or pausing between polls, is wo
 rather than left waiting — which matters because `ReadAsync` accepts a token you never cancel.
 
 Using a subscription after it has closed is refused in its own terms rather than as a disposal error: a read
-says the store is closed, and a settle says the delivery has already been settled, which is the truth,
-because closing handed it back.
+says the store is closed, and a settle says the delivery is not this caller's to settle, naming the hand-back
+among the three things that can mean. Not that the message has already been settled: nothing was written, and
+it is there for the next subscription to be handed.
 
 Settle each delivery once. A second settle of the same one throws `InvalidOperationException`, and it is the
 *delivery* that is finished with rather than the message: if a failed message has since been handed out again,
@@ -94,11 +95,19 @@ message scheduled for now — its due time is stored as now, so it never holds t
 the count a bound on future-dated work and `MaxAge` the bound on the rest; [limits](../explanation/limits.md)
 has the sizing arithmetic. `DeadLetterAsync` and `FailAsync` refuse in one narrow case too: a subscriber set
 to drop the oldest, with a dead-letter byte bound smaller than the message, cannot keep the row it is being
-asked to file — keeping it would mean destroying every other dead letter the subscriber holds and standing
-over the bound anyway — so it throws `DeadLetterTooLargeException`. That applies wherever the message is
-coming from, including a message that has run out of attempts and one already stored here and replayed. A
-settle that threw has settled nothing, so the delivery is still yours — complete it to lose the message
-knowingly, or raise the bound.
+asked to file — the message is over that bound on its own, so the trim destroys it whatever room the set has,
+and filing it would be storing the message in order to lose it — so it throws `DeadLetterTooLargeException`.
+That applies wherever the message is coming from, including one that has run out of attempts and one stored
+here as a deferral and replayed. A settle that threw has settled nothing, so the delivery is still yours —
+complete it to lose the message knowingly, or raise the bound.
+
+A message already filed as a dead letter is the exception, and it is re-filed rather than refused: it is
+being held, so holding it costs the set nothing it was not already paying. That is how a bound lowered
+across a reopen behaves too — the policy goes with the open, not with the row — and the rows it has left
+oversized are removed by the first retention pass that sees them, however many that is, counted in
+`DeadDropped`, without taking the dead letters that still fit with them. The one that goes alone is the row a
+settle has just filed: the trim spares what it is writing, so an oversized one survives its own pass and dies
+on the next.
 
 Every settle is one durable write. Nothing runs after it that could fail, which is what makes "a settle that
 threw has settled nothing" a rule rather than a hope: a write already queued cannot be recalled, so cancelling
