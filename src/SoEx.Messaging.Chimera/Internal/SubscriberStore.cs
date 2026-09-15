@@ -19,12 +19,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
     private static readonly Dictionary<string, string> Identities = new(StringComparer.Ordinal);
 
     private readonly SingleWriter _writer;
-    private readonly TimeProvider _clock;
+    private readonly MonotonicClock _clock;
     private readonly string? _topic;
     private int _closed;
 
     private SubscriberStore(string subscriber, string path, string? topic, SingleWriter writer,
-        TimeProvider clock)
+        MonotonicClock clock)
     {
         Subscriber = subscriber;
         Path = path;
@@ -77,8 +77,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 transaction.Commit();
             }
 
+            // Seeded from this file's own stamps, for the reason the topic file is: a deferral aged out from
+            // a stamp older than the event it describes can reach destruction under a dead bound.
+            var stamps = new MonotonicClock(options.Clock, NewestStamp(connection));
+
             return new SubscriberStore(subscriber, path, topic,
-                new SingleWriter(connection, options.MaxAppendBatch), options.Clock);
+                new SingleWriter(connection, options.MaxAppendBatch), stamps);
         }
         catch
         {
@@ -104,6 +108,24 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 Identities[path] = identity = FileNames.Identity(path);
             return identity + "\u0000" + topic;
         }
+    }
+
+    /// <summary>
+    /// The newest moment this file has already been stamped with. Only the two stamps this store writes are
+    /// consulted: a set-aside row also carries the moment the topic published it, which belongs to another
+    /// file's clock.
+    /// </summary>
+    private static long NewestStamp(SqliteConnection connection)
+    {
+        using SqliteCommand command = Sqlite.Command(connection, null,
+            """
+            SELECT MAX(newest) FROM (
+              SELECT COALESCE(MAX(updated), 0) AS newest FROM entry
+              UNION ALL
+              SELECT COALESCE(MAX(aside_at), 0) FROM set_aside
+            );
+            """);
+        return command.ExecuteScalar() is long value ? value : 0;
     }
 
     private static void Release(string path, string topic)
@@ -254,7 +276,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         command.Parameters.AddWithValue("$s", (int)source);
         command.Parameters.AddWithValue("$i", id);
         command.Parameters.AddWithValue("$complete", (int)EntryState.Complete);
-        command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+        command.Parameters.AddWithValue("$now", _clock.NowMs());
         command.ExecuteNonQuery();
     }
 
@@ -400,7 +422,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 // The clock is read here, where the row is written, and not where the call was made. An age
                 // stamped before the write queued is an age the row never had: a writer with a backlog longer
                 // than the deferred age would file a message that ages out the moment it lands.
-                insert.Parameters.AddWithValue("$a", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+                insert.Parameters.AddWithValue("$a", _clock.NowMs());
                 insert.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
                 insert.Parameters.AddWithValue("$n", attempts);
                 insert.Parameters.AddWithValue("$r", (object?)why ?? DBNull.Value);
@@ -540,7 +562,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
 
                 // Re-stamped, because the age bounds measure how long a row has sat as what it now is: a
                 // message deferred a moment ago has not been sitting there since it was first set aside.
-                command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+                command.Parameters.AddWithValue("$now", _clock.NowMs());
                 command.Parameters.AddWithValue("$i", asideId);
                 command.ExecuteNonQuery();
             }
@@ -679,7 +701,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 command.Parameters.AddWithValue("$d", dueAtMs);
             command.Parameters.AddWithValue("$inflight", (int)EntryState.InFlight);
             command.Parameters.AddWithValue("$available", (int)EntryState.Available);
-            command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+            command.Parameters.AddWithValue("$now", _clock.NowMs());
             return command.ExecuteScalar() as long? ?? 0L;
         }, ct);
 
@@ -698,7 +720,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
             using var command = Sqlite.Command(connection, transaction,
                 "UPDATE entry SET state = $available, updated = $now WHERE topic = $t AND source = $s AND id = $i;");
             command.Parameters.AddWithValue("$available", (int)EntryState.Available);
-            command.Parameters.AddWithValue("$now", Sqlite.ToUnixMs(_clock.GetUtcNow()));
+            command.Parameters.AddWithValue("$now", _clock.NowMs());
             command.Parameters.AddWithValue("$t", topic);
             command.Parameters.AddWithValue("$s", (int)source);
             command.Parameters.AddWithValue("$i", id);

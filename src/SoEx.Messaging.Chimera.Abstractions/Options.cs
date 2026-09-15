@@ -101,6 +101,19 @@ public sealed record ChimeraOptions
     /// reader wakes only when you advance it, and advancing fires the timers already registered and no others,
     /// so advance while nothing is part-way through a read.
     /// </para>
+    /// <para>
+    /// A file's writer never sees this clock go backwards. The stamps it writes are held at the newest moment
+    /// that file has already recorded, seeded from the file itself when it is opened, so a correction that
+    /// moves the wall clock back — NTP, a resumed virtual machine, somebody setting the date — cannot write a
+    /// record that appears older than one already there. Three things depend on that: the position a
+    /// subscriber holds in the scheduled table, the cutoff age retention deletes by, and the seek for the
+    /// oldest record after a time. The cost is that a message published as due now, just after a step back,
+    /// falls due when the wall clock catches up again rather than immediately.
+    /// </para>
+    /// <para>
+    /// Two processes writing one topic directory with two clocks are still two clocks, and nothing a single
+    /// file knows can order them. One machine is the stated boundary for that reason.
+    /// </para>
     /// </remarks>
     public TimeProvider Clock { get; init; } = TimeProvider.System;
 }

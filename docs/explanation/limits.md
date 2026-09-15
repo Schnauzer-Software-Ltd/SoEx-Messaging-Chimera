@@ -182,6 +182,20 @@ looking again, for no longer than the poll interval. It is taken from `ChimeraOp
 everything else here that reads the time, which is worth knowing if you hand it a clock you drive yourself.
 Nothing wakes up in order to deliver a particular message, and there is no timer per message anywhere.
 
+## A clock that goes backwards costs latency, not messages
+
+Each file holds its stamps at the newest moment it has already recorded, seeded from the file when it is
+opened, so an NTP correction or a resumed virtual machine cannot write a record that looks older than one
+already there. Without that, a due-now scheduled message written just after a step back lands underneath the
+position a subscriber has already passed and is never offered again, and age retention picks a cutoff by time
+that it then deletes by sequence, taking unexpired records with it.
+
+What it costs: after a step back, a message published as due now becomes due when the wall clock catches up,
+late by the size of the step. Nothing is dropped and nothing is hidden.
+
+What it does not cover: two processes writing one topic directory have two clocks, and no single file can put
+them in order. That is the same boundary as everywhere else here — one machine.
+
 ## Deleting is not erasing
 
 Retention removes records from the database. On an SSD the old content survives underneath until wear

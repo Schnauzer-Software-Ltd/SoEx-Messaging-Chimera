@@ -11,9 +11,10 @@ public sealed class SqliteTopicLog : ITopicLog
     private readonly ChimeraOptions _options;
     private readonly TopicOptions _topicOptions;
     private readonly SingleWriter _writer;
+    private readonly MonotonicClock _stamps;
 
     private SqliteTopicLog(string topic, string path, string logUuid, ChimeraOptions options,
-        TopicOptions topicOptions, SingleWriter writer)
+        TopicOptions topicOptions, SingleWriter writer, MonotonicClock stamps)
     {
         Topic = topic;
         Path = path;
@@ -21,6 +22,7 @@ public sealed class SqliteTopicLog : ITopicLog
         _options = options;
         _topicOptions = topicOptions;
         _writer = writer;
+        _stamps = stamps;
     }
 
     public string Topic { get; }
@@ -79,8 +81,11 @@ public sealed class SqliteTopicLog : ITopicLog
         try
         {
             string uuid = TopicSchema.Initialise(connection, topic);
+            // Seeded from the file rather than started at zero: the high-water is a field, and a process that
+            // restarts after a backwards step would otherwise begin by trusting the stepped clock again.
+            var stamps = new MonotonicClock(options.Clock, NewestStamp(connection));
             return new SqliteTopicLog(topic, path, uuid, options, topicOptions,
-                new SingleWriter(connection, options.MaxAppendBatch));
+                new SingleWriter(connection, options.MaxAppendBatch), stamps);
         }
         catch
         {
@@ -100,7 +105,7 @@ public sealed class SqliteTopicLog : ITopicLog
             // Stamped on the writer thread, for the same reason the scheduled path reads the clock there: a
             // stamp taken at the call and a sequence taken at the commit can disagree about which of two
             // records came first, and retention removes by sequence after choosing a cutoff by time.
-            long enqueuedAt = Sqlite.ToUnixMs(_options.Clock.GetUtcNow());
+            long enqueuedAt = _stamps.NowMs();
 
             using SqliteCommand command = Sqlite.Command(connection, transaction,
                 "INSERT INTO log (msg_id, enqueued_at, size, payload) VALUES ($m, $e, $s, $p) RETURNING seq;");
@@ -130,7 +135,7 @@ public sealed class SqliteTopicLog : ITopicLog
             // in commit order closes that. A row's due time is then at or after the moment it became visible,
             // so it is at or above any position set before that moment, and a position set after it has the
             // row in its window and stops at it rather than passing over it.
-            DateTimeOffset now = _options.Clock.GetUtcNow();
+            DateTimeOffset now = _stamps.Now();
             long enqueuedAt = Sqlite.ToUnixMs(now);
 
             // A due time already gone means due now, and is stored as now. Service Bus reads a scheduled
@@ -242,13 +247,18 @@ public sealed class SqliteTopicLog : ITopicLog
     public async ValueTask<RetentionReport> ApplyRetentionAsync(CancellationToken cancellationToken = default)
     {
         RetentionPolicy policy = _topicOptions.Retention;
-        long now = Sqlite.ToUnixMs(_options.Clock.GetUtcNow());
         long logRemovedTo = 0;
         long highest = 0;
         RetentionReport report = default;
 
         await _writer.EnqueueAsync((connection, transaction) =>
         {
+            // Read here, on the writer thread and through the same high-water the stamps were written
+            // through. An age cutoff chooses a sequence by comparing times, and then the delete removes by
+            // sequence: if the two disagree about which record came first, the delete takes records the
+            // policy says to keep.
+            long now = _stamps.NowMs();
+
             long cutoff = 0;   // highest log sequence to remove; 0 removes nothing
 
             if (policy.MaxAge is { } maxAge)
@@ -339,6 +349,23 @@ public sealed class SqliteTopicLog : ITopicLog
             $"SELECT COALESCE(MAX(seq), 0) FROM log WHERE {predicate};");
         command.Parameters.AddWithValue("$v", value);
         return (long)command.ExecuteScalar()!;
+    }
+
+    /// <summary>
+    /// The newest moment this file has already been stamped with. Due times are deliberately not consulted:
+    /// a row due next week is a statement about the future, not evidence that the clock ever read it.
+    /// </summary>
+    private static long NewestStamp(SqliteConnection connection)
+    {
+        using SqliteCommand command = Sqlite.Command(connection, null,
+            """
+            SELECT MAX(newest) FROM (
+              SELECT COALESCE(MAX(enqueued_at), 0) AS newest FROM log
+              UNION ALL
+              SELECT COALESCE(MAX(enqueued_at), 0) FROM scheduled
+            );
+            """);
+        return command.ExecuteScalar() is long value ? value : 0;
     }
 
     private static long Scalar(SqliteConnection connection, SqliteTransaction transaction, string sql, long value)
