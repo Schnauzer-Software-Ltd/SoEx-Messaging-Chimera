@@ -1,0 +1,15 @@
+<Project>
+
+  <!-- The three assemblies read each other's internals, so a consumer that resolves them to different
+       versions breaks when something is called, not when the graph is restored. A project reference packs
+       as a minimum-version dependency, which permits exactly that; these are written as exact ranges so
+       the feed refuses the combination instead. -->
+  <Target Name="PinSiblingPackageVersions" AfterTargets="_GetProjectReferenceVersions">
+    <ItemGroup>
+      <_ProjectReferencesWithVersions>
+        <ProjectVersion>[%(_ProjectReferencesWithVersions.ProjectVersion)]</ProjectVersion>
+      </_ProjectReferencesWithVersions>
+    </ItemGroup>
+  </Target>
+
+</Project>

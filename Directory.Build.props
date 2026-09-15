@@ -8,7 +8,11 @@
 
   <!-- Package metadata (applied to any project that is packed). -->
   <PropertyGroup>
-    <Version>0.0.0-alpha-1</Version>
+    <!-- Prerelease labels are compared as text when they contain a non-digit, and `alpha-N` is a single
+         label: `alpha-10` sorts BELOW `alpha-9`, so the eleventh release would read as a downgrade to
+         anything resolving the newest prerelease. The dot splits it into two labels and the second is
+         purely numeric, which compares numerically. Keep the dot. -->
+    <Version>0.0.0-alpha-1.0</Version>
     <Authors>Schnauzer Software Ltd</Authors>
     <Company>Schnauzer Software Ltd</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

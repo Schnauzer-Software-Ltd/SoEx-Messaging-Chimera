@@ -89,4 +89,6 @@ knowing when an event-driven system has come to rest ships in `SoEx.Messaging.Ch
 
 ## Status
 
-Alpha. The engine is complete and tested; the API may still change.
+Alpha, and nothing has been published before this. The API and the on-disk format can both still
+change, and a format change would strand an existing topic's files. Read
+[Limits, and how you find out](docs/explanation/limits.md) before you depend on it.
