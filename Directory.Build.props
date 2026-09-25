@@ -12,7 +12,7 @@
          label: `alpha-10` sorts BELOW `alpha-9`, so the eleventh release would read as a downgrade to
          anything resolving the newest prerelease. The dot splits it into two labels and the second is
          purely numeric, which compares numerically. Keep the dot. -->
-    <Version>0.0.0-alpha-1.0</Version>
+    <Version>0.0.0-alpha-1.1</Version>
     <Authors>Schnauzer Software Ltd</Authors>
     <Company>Schnauzer Software Ltd</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

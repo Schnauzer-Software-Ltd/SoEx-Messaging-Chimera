@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>SoEx.Messaging.Chimera</RootNamespace>
     <AssemblyName>SoEx.Messaging.Chimera</AssemblyName>
-    <Description>A durable event log that runs inside the process, storing each topic as a local SQLite file. Subscribers keep their own positions, so a topic fans out without copying, and nothing depends on a broker.</Description>
+    <Description>Durable messageing for InProc single process</Description>
   </PropertyGroup>
 
   <!-- The only storage dependency, and it stays behind an internal seam. This project deliberately has
