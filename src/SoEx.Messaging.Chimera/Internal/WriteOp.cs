@@ -3,8 +3,8 @@ using Microsoft.Data.Sqlite;
 namespace SoEx.Messaging.Chimera.Internal;
 
 /// <summary>
-/// One unit of work for a file's single writer. Everything that changes a file goes through this, which is how
-/// the one-writer-per-file rule survives callers on many threads without a lock on the file itself.
+/// One unit of work for the single writer of a file. All changes to a file go through this type. Thus the
+/// one-writer-per-file rule holds for callers on many threads, with no lock on the file itself.
 /// </summary>
 internal sealed class WriteOp
 {

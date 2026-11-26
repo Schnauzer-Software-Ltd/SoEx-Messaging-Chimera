@@ -1,23 +1,24 @@
 namespace SoEx.Messaging.Chimera.Internal;
 
 /// <summary>
-/// The clock as a writer is allowed to see it: never earlier than the last time it answered, and never
-/// earlier than the newest stamp already in the file being written.
+/// The clock as a writer sees it. It never answers earlier than its last answer, or earlier than the newest stamp
+/// already in the file that it writes.
 /// </summary>
 /// <remarks>
-/// Three things here read a stamp and then act on the sequence beside it — the scheduled floor, the
-/// retention cutoff, and the seek that finds the oldest record after a time — and each of them assumes a
-/// later row never carries an earlier stamp. The default clock is the wall clock, which an NTP correction,
-/// a resumed virtual machine or somebody setting the date can move backwards. One step backwards is enough
-/// to write a scheduled row underneath a floor that only ever rises, where nothing will offer it again, or
-/// to hand retention a cutoff sequence that carries unexpired records away with it.
+/// Three operations read a stamp and then act on the sequence beside it: the scheduled floor, the retention cutoff,
+/// and the seek that finds the oldest record after a time. Each of them assumes that a later row never carries an
+/// earlier stamp. The default clock is the wall clock. An NTP correction, a resumed virtual machine or a manual
+/// change of the date can move it backwards. One backward step can write a scheduled row below a floor that only
+/// rises. Nothing offers that row again. One backward step can also give retention a cutoff sequence that removes
+/// unexpired records.
 ///
-/// Holding time still instead costs a message published just after a step: due now becomes due when the
-/// wall clock catches up, which is late by the size of the step rather than never. The seed is what carries
-/// that across a restart, the high-water itself being no more than a field.
+/// A clock that holds time still has a cost for a message published immediately after a step. A message due now becomes
+/// due when the wall clock catches up. It arrives late by the size of the step, and it does arrive. The seed
+/// carries the high-water across a restart. The high-water itself is only a field.
 ///
-/// Two writers with two clocks on one topic directory are still two clocks, and nothing a single file knows
-/// can order them. That residue is disclosed rather than fixed.
+/// The rule holds within one file. Writers of different files in one root directory use separate clocks. The data in
+/// one file cannot order the stamps of two clocks.
+/// This remaining risk is disclosed, and it has no fix.
 /// </remarks>
 internal sealed class MonotonicClock
 {
@@ -36,8 +37,8 @@ internal sealed class MonotonicClock
         long read = Sqlite.ToUnixMs(_clock.GetUtcNow());
         long seen = Interlocked.Read(ref _highWater);
 
-        // Every caller today is on a writer thread, so this only ever spins against itself. It is written to
-        // survive a second one anyway: a compare-exchange is the difference between a guarantee and a habit.
+        // Every caller today is on a writer thread, so this loop spins only against itself. The compare-exchange
+        // keeps the guarantee for a second thread too.
         while (read > seen)
         {
             long found = Interlocked.CompareExchange(ref _highWater, read, seen);

@@ -7,10 +7,10 @@ internal static class Sqlite
 {
     internal static SqliteConnection OpenWriter(string path, ChimeraOptions options)
     {
-        // Checked here rather than where a batch is drained, for the same reason the busy timeout is: it
-        // fails quietly. A batch size below one used to be clamped to one, so the setting a caller wrote was
-        // not the setting they got and nothing said so — a burst of concurrent appends then cost one commit
-        // each rather than one between them, which is a throughput cliff with no signal at the bottom of it.
+        // This check runs when the writer opens, for the same reason as the busy timeout check: a bad value fails
+        // quietly. Earlier versions clamped a batch size below one to one. The caller then got a different setting
+        // from the one written, and no message told them. A burst of concurrent appends then cost one commit for
+        // each append, where a batch costs one commit for all of them. That is a throughput cliff with no signal.
         if (options.MaxAppendBatch < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.MaxAppendBatch,
@@ -34,8 +34,8 @@ internal static class Sqlite
     }
 
     /// <summary>
-    /// Opens a reader. The mode flag stops this connection writing database content; it does not stop SQLite
-    /// creating the -wal and -shm sidecars, so the process still needs write permission on the directory.
+    /// Opens a reader. The mode flag stops this connection from a change to database content. SQLite still creates
+    /// the -wal and -shm sidecars, so the process needs write permission on the directory.
     /// </summary>
     internal static SqliteConnection OpenReader(string path, ChimeraOptions options)
     {
@@ -52,19 +52,19 @@ internal static class Sqlite
     }
 
     /// <summary>
-    /// The wait every connection here depends on, checked because getting it wrong fails quietly. Zero or
-    /// less reaches SQLite as a disabled busy handler, so a connection that meets a lock — a checkpoint, or
-    /// another connection committing — fails on the spot with SQLITE_BUSY instead of waiting the moment the
-    /// file is busy, which is the moment it matters. A positive timeout shorter than a millisecond truncates
-    /// to the same thing, so it is rounded up rather than turned off.
+    /// The busy wait that every connection here depends on. The method checks it because a bad value fails quietly.
+    /// SQLite takes zero or less as a disabled busy handler. A connection that meets a lock, such as a checkpoint
+    /// or a commit from a different connection, then fails at once with SQLITE_BUSY. It does not wait, and it fails
+    /// at the moment when the file is busy, which is when the wait matters. A positive timeout shorter than one
+    /// millisecond truncates to the same value, so the method rounds it up.
     /// </summary>
     private static int BusyMilliseconds(ChimeraOptions options)
     {
         if (options.BusyTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(options), options.BusyTimeout,
-                "The busy timeout must be greater than zero: zero or less disables SQLite's busy handler, so " +
-                "a connection meeting a lock fails immediately rather than waiting for it.");
+                "The busy timeout must be greater than zero. At zero or less, SQLite turns off its busy " +
+                "handler. Each lock then fails the connection at once.");
         }
 
         return (int)Math.Clamp(options.BusyTimeout.TotalMilliseconds, 1, int.MaxValue);
@@ -89,6 +89,7 @@ internal static class Sqlite
 
     internal static DateTimeOffset FromUnixMs(long value) => DateTimeOffset.FromUnixTimeMilliseconds(value);
 
-    /// <summary>Time-ordered and globally unique, so an id sorts usefully without being mistaken for a position.</summary>
+    /// <summary>Time-ordered and globally unique. An id sorts in a useful order, and its form is different from a
+    /// position, so nobody mistakes one for the other.</summary>
     internal static string NewMessageId() => Guid.CreateVersion7().ToString("n");
 }

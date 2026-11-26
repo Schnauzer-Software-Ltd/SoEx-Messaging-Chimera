@@ -3,19 +3,19 @@ using Microsoft.Data.Sqlite;
 namespace SoEx.Messaging.Chimera.Internal;
 
 /// <summary>
-/// One subscriber's own file: its position in each topic, what it currently has in flight, and what it has set
-/// aside. Written by this instance alone, which is why nothing here needs a lease or a visibility timeout —
-/// a lock can only ever be held by one subscriber in one process, and if that process is gone so is the lock.
+/// The subscriber file. It holds the subscriber's position in each topic, its in-flight deliveries and
+/// its set-aside messages. Only this instance writes the file. Only one subscriber in one process can hold a
+/// lock. When that process stops, its lock ends. Thus the store needs no lease and no visibility timeout.
 /// </summary>
 internal sealed class SubscriberStore : IAsyncDisposable
 {
     /// <summary>
-    /// How many stores this process currently has reading each subscriber-and-topic pair, so that recovery
-    /// can tell deliveries nobody is holding from deliveries a subscription is working on right now.
+    /// The number of stores in this process that read each subscriber-and-topic pair. Recovery uses it to tell
+    /// deliveries that nobody holds from deliveries that a subscription has in hand now.
     /// </summary>
     private static readonly Dictionary<string, int> Reading = new(StringComparer.Ordinal);
 
-    /// <summary>The identity each path spelling this process has opened resolves to. See <see cref="Key"/>.</summary>
+    /// <summary>The identity of each path spelling that this process opened. See <see cref="Key"/>.</summary>
     private static readonly Dictionary<string, string> Identities = new(StringComparer.Ordinal);
 
     private readonly SingleWriter _writer;
@@ -37,10 +37,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
     internal string Path { get; }
 
     /// <summary>
-    /// Opens the store, and binds it to a topic while doing so if the caller already knows which log it is
-    /// about to read. Binding here rather than on the first read is what makes a starting position mean
-    /// "where this subscriber came into existence": a subscriber created before a burst of publishing and
-    /// retention should see that as loss, and one created after it should not.
+    /// Opens the store. If the caller already knows which log it will read, the open also binds the store to
+    /// that topic. A bind at open, before the first read, makes a starting position mean "where this
+    /// subscriber came into existence". A subscriber created before a burst of publishing and retention sees
+    /// that burst as loss. A subscriber created after the burst does not.
     /// </summary>
     internal static SubscriberStore Open(string subscriber, ChimeraOptions options, string? topic = null,
         Attachment? attach = null)
@@ -56,9 +56,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
 
             if (topic is not null)
             {
-                // Worked out before the lock is taken: naming the file asks the filesystem a question the
-                // first time it sees a path, and every other store in this process opening any subscriber
-                // would be waiting behind it.
+                // The key is computed before the lock is taken. The first time Key sees a path, it queries
+                // the filesystem. Inside the lock, every other store in this process that opens any
+                // subscriber would wait behind that query.
                 string key = Key(path, topic);
                 lock (Reading)
                 {
@@ -77,8 +77,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 transaction.Commit();
             }
 
-            // Seeded from this file's own stamps, for the reason the topic file is: a deferral aged out from
-            // a stamp older than the event it describes can reach destruction under a dead bound.
+            // The clock starts from the stamps in this file, for the same reason as the topic file clock. A
+            // deferral aged out from a stamp older than the event that it describes can be destroyed under a
+            // dead bound.
             var stamps = new MonotonicClock(options.Clock, NewestStamp(connection));
 
             return new SubscriberStore(subscriber, path, topic,
@@ -94,11 +95,11 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// How the file and topic a store is reading are named to the guard above. The path is folded to one
-    /// identity where the filesystem holding it ignores case, so two components configured with roots that
-    /// differ only in spelling find each other rather than each believing the other's deliveries are stale.
-    /// Asked once per path and remembered: the answer cannot change while the file is open, and a store
-    /// releasing its count has to name what it registered even if the file has since been deleted.
+    /// The name of the file and topic that a store reads, for the guard above. If the filesystem ignores case,
+    /// the path folds to one identity. Two components with roots that differ only in spelling then find each
+    /// other. Otherwise, each component would treat the deliveries of the other as stale.
+    /// The identity is computed once per path and kept. It cannot change while the file is open. A store that
+    /// releases its count must name the key that it registered, even if the file was deleted after that.
     /// </summary>
     private static string Key(string path, string topic)
     {
@@ -111,9 +112,8 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// The newest moment this file has already been stamped with. Only the two stamps this store writes are
-    /// consulted: a set-aside row also carries the moment the topic published it, which belongs to another
-    /// file's clock.
+    /// The newest stamp in this file. The query reads only the two stamps that this store writes. A set-aside
+    /// row also holds the time that the topic published it. That time comes from the clock of another file.
     /// </summary>
     private static long NewestStamp(SqliteConnection connection)
     {
@@ -143,30 +143,35 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Anything in flight when this file is first opened was in flight in a process that is no longer running,
-    /// so it becomes available again. This is the entire crash-redelivery mechanism, and the reason there is no
-    /// visibility timeout anywhere in this library.
+    /// When this file is first opened, each in-flight delivery belongs to a process that stopped. This method
+    /// makes those deliveries available again. It is the full crash-redelivery mechanism. Because of it, this
+    /// library has no visibility timeout.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// It is scoped to one topic, and it is skipped when this process is already reading that topic as this
-    /// subscriber. One subscriber file holds one subscriber's positions across every topic it reads, so a
-    /// subscriber reading two topics is two subscriptions over one file — the documented shape, and the
-    /// second of them used to reset every delivery the first was holding. Those went straight back out on top
-    /// of handlers still running, with the attempt count raised, and both subscriptions then settled the same
-    /// message. Nothing written in the file distinguishes "in flight in a process that is gone" from "in
-    /// flight in this one", so what this process is reading right now has to.
+    /// Recovery applies to one topic. It is skipped if this process already reads that topic as this
+    /// subscriber. One subscriber file holds the positions of one subscriber in all the topics that it reads.
+    /// Thus a subscriber that reads two topics is two subscriptions over one file. This is the documented shape.
+    /// The second subscription used to reset every delivery that the first held. Those deliveries went out
+    /// again while their handlers still ran, with the attempt count raised. Both subscriptions then settled the
+    /// same message.
     /// </para>
     /// <para>
-    /// It counts what is being read rather than remembering what has been recovered, so closing a
-    /// subscription and opening it again — one subscriber restarting inside a host that keeps running —
-    /// recovers exactly as a process restart does, whether or not its siblings stayed open.
+    /// The file records "in flight in a process that stopped" and "in flight in this process" in the same way.
+    /// The count of the stores that this process has open for reading now tells the two apart.
     /// </para>
-    /// The row is released rather than deleted, so the attempt count survives. Deleting it would let a message
-    /// that brings the process down be retried for ever, its counter starting again on every restart — which is
-    /// the exact scenario counting attempts exists to stop. Service Bus and JetStream both persist a delivery
-    /// count across a redelivery, so resetting it here would also be more forgiving than the places this is
-    /// meant to be swapped for.
+    /// <para>
+    /// The guard counts the current readers. It keeps no record of past recoveries. Thus a subscription that
+    /// closes and opens again, for example a restart of one subscriber in a host that continues to run,
+    /// recovers in the same way as a process restart. This is true whether or not its siblings stayed open.
+    /// </para>
+    /// <para>
+    /// Recovery releases the row and keeps it, so the attempt count survives. If recovery deleted the row, a
+    /// message that stops the process would be retried for ever, because its count would start again on each
+    /// restart. The attempt count exists to stop that scenario. Service Bus and JetStream both keep a delivery
+    /// count across a redelivery. A reset here would also be more lenient than the brokers that this library
+    /// is meant to be swapped for.
+    /// </para>
     /// </remarks>
     private static void RecoverInFlight(SqliteConnection connection, string topic)
     {
@@ -194,9 +199,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Binds this subscriber to a topic, checking that the position it holds belongs to the log it is about to
-    /// read. A mismatch means a restore has put the two out of step, and carrying on would silently skip
-    /// messages as the log reissues sequences the position already treats as done.
+    /// Binds this subscriber to a topic. The bind checks that the stored position belongs to the log that the
+    /// subscriber will read. A mismatch means that a restore put the two out of step. If the read continued,
+    /// the log would reissue sequences that the position already treats as done. The subscriber would skip
+    /// those messages silently.
     /// </summary>
     internal async ValueTask<long> AttachTopicAsync(string topic, string logUuid, StartAt start = default,
         CancellationToken ct = default)
@@ -205,9 +211,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 new Attachment(topic, logUuid, start)), ct).ConfigureAwait(false);
 
     /// <summary>
-    /// Records this subscriber's position in a topic, or checks the one it already holds. A starting position
-    /// only ever applies to a position being created: once there is one it is the truth, and nothing about how
-    /// the subscription happens to be configured this time may move it.
+    /// Records this subscriber's position in a topic, or checks the stored position. A starting position
+    /// applies only when the position is created. After that, the stored position is the truth. The
+    /// configuration of a later subscription cannot move it.
     /// </summary>
     private static long Attach(SqliteConnection connection, SqliteTransaction transaction, string subscriber,
         Attachment attach)
@@ -252,7 +258,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
     internal ValueTask<long> ReadMarkAsync(string topic, CancellationToken ct = default)
         => _writer.EnqueueAsync((c, t) => MarkOf(c, t, topic), ct);
 
-    /// <summary>Finishes a delivery and lets the mark absorb whatever it now can.</summary>
+    /// <summary>Finishes a delivery. The mark then absorbs all the entries that it can.</summary>
     internal ValueTask<long> CompleteAsync(string topic, EntrySource source, long id, CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
         {
@@ -260,12 +266,13 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return AdvanceMark(connection, transaction, topic);
         }, ct);
 
-    /// <summary>Records that a delivery is finished with, whichever way it finished.</summary>
+    /// <summary>Marks a delivery as finished, for every way that a delivery can finish.</summary>
     /// <remarks>
-    /// It updates the row the claim left and never writes a new one. Every settle follows a claim, so an entry
-    /// that is not there is one a position has already passed: retention overtaking a subscriber mid-delivery
-    /// moves the mark over the record and drops its entry, and the settle that arrives afterwards used to put
-    /// a row back underneath the mark, where nothing looks and nothing can ever delete it.
+    /// The method updates the row that the claim wrote. It never writes a new row. Every settle follows a
+    /// claim. Thus, if the entry is missing, a position has already passed it. When retention overtakes a
+    /// subscriber during a delivery, the mark moves over the record and its entry is dropped. The settle that
+    /// arrived after that used to put a row back below the mark. No read looks there, and nothing can delete
+    /// that row.
     /// </remarks>
     private void MarkTerminal(SqliteConnection connection, SqliteTransaction transaction,
         string topic, EntrySource source, long id)
@@ -281,12 +288,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Moves the mark over contiguous finished log entries, deleting each as it goes.
+    /// Moves the mark over contiguous finished log entries. Each entry that the mark passes is deleted.
     /// </summary>
     /// <remarks>
-    /// Contiguous is the whole point. Jumping to the highest finished sequence would swallow everything still
-    /// in flight below it — the failure looks like nothing at all until a message that was being processed
-    /// during a crash never comes back.
+    /// The entries must be contiguous. A jump to the highest finished sequence would pass over every in-flight
+    /// entry below it. That failure shows no symptom until a crash. A message that was in process during the
+    /// crash then never comes back.
     /// </remarks>
     internal static long AdvanceMark(SqliteConnection connection, SqliteTransaction transaction, string topic)
     {
@@ -330,28 +337,26 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Moves a message out of the flow and into this subscriber's own store, payload and all, then lets the
-    /// mark move past it. Copying the payload is what makes a set-aside row survive log retention, and what
-    /// makes replay mean "deliver this row" rather than "hope the original is still there".
+    /// Moves a message, with its payload, out of the flow into this subscriber's store. The mark then
+    /// moves past it. The copy of the payload lets a set-aside row survive log retention. Replay thus delivers
+    /// this row. It needs no original record in the log.
     /// </summary>
     /// <remarks>
-    /// The bounds on the deferred set are read here rather than by the caller, inside the transaction that
-    /// inserts the row. A check in one write op and an insert in another is not a bound: two handlers
-    /// deferring at the same moment both read the set as it stood before either of them wrote, both find room
-    /// and both insert, and a set bounded at one ends up holding as many rows as there are deliveries in
-    /// flight. Reading the counts where the row is written makes the answer the caller is given the one that
-    /// was true when it was written.
+    /// This method reads the bounds on the deferred set inside the transaction that inserts the row. A check
+    /// in one write op and an insert in another op do not hold a bound. Two handlers that defer at the same
+    /// moment both read the set before either of them writes. Both find room, and both insert. A set with a
+    /// bound of one then holds as many rows as there are in-flight deliveries. When the counts are read where
+    /// the row is written, the caller gets the answer that was true at the write.
     /// </remarks>
     /// <returns>
-    /// The row that was written and what it was filed as — which is dead if a deferral did not fit — or a
-    /// refusal, when what it would have been filed as is something this subscriber cannot keep.
+    /// The written row and the kind that it was filed as, or a refusal. A deferral that does not fit is filed
+    /// dead. A refusal means that this subscriber cannot keep a row of the kind that it would be filed as.
     /// </returns>
     /// <remarks>
-    /// A refusal is returned rather than thrown from inside the write. The exception belongs to the caller
-    /// that caused it, and throwing here would roll the whole batch back: everyone else's work would fail
-    /// with somebody else's refusal, and a bound being reached is an ordinary thing that happens under load
-    /// rather than a fault. The decision is still made inside the transaction, against the set the row would
-    /// have joined.
+    /// The write returns a refusal as a value. The exception belongs to the caller that caused it. A throw
+    /// inside the write would roll back the whole batch. Every other op in the batch would then fail with a
+    /// refusal that belongs to another caller. A bound reached under load is an ordinary event. The decision
+    /// is still made inside the transaction, against the set that the row would join.
     /// </remarks>
     internal async ValueTask<SetAsideOutcome> SetAsideAsync(SetAsideKind kind, string topic,
         EntrySource source, long id, string messageId, DateTimeOffset enqueuedAt, long attempts, string? reason,
@@ -370,9 +375,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
             sizes = default;
             string? why = reason;
 
-            // Nothing is ever dropped to make room: a message that vanished because a bound was reached is
-            // exactly the silent loss the rest of this design goes to some length to avoid. A deferral that
-            // does not fit becomes a dead letter, and says so.
+            // A full deferred set keeps every message it holds. A message lost because a bound was reached is
+            // silent loss. The design avoids silent loss. A deferral that does not fit becomes a dead letter,
+            // with a reason that says so.
             if (filedAs == SetAsideKind.Deferred)
             {
                 SetAsideSizes size = SetAsideSize(connection, transaction, topic);
@@ -383,19 +388,19 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 }
                 else if (bounds.MaxDeferredBytes is { } maxBytes && size.DeferredBytes + bytes.Length > maxBytes)
                 {
-                    // Says what happened to it rather than what was full: this row is joining the store it
-                    // was measured against, and a reason reading "the store is full" next to a row that just
-                    // grew it is the sort of thing an operator has to read the source to understand.
+                    // The reason states what happened to the row. This row joins the store that it was
+                    // measured against. An operator who sees the reason "the store is full" next to a row that
+                    // made the store larger must read the source code to understand it.
                     filedAs = SetAsideKind.Dead;
                     why = $"deferring would exceed the deferred byte bound ({maxBytes} bytes); filed dead";
                 }
             }
 
-            // Filed dead and too big to be kept: this subscriber destroys the oldest to stay inside its byte
-            // bound, and this row is over that bound on its own, so the trim takes it whatever room the set
-            // has. Writing it would be storing the message in order to lose it, so nothing is written and the
-            // caller is told. What it would cost the rest of the set is nothing either way — an unkeepable
-            // row is charged to nothing — so the refusal is about this message and not about the others.
+            // A row filed dead and too big to keep. This subscriber destroys the oldest rows to stay inside
+            // its byte bound. This row alone is over that bound, so the trim takes it, whatever room the set
+            // has. A write would store the message only to lose it. Thus nothing is written. The caller gets
+            // a refusal. An unkeepable row is charged to nothing, so it costs the rest of the set nothing in
+            // either case. The refusal concerns this message only.
             if (filedAs == SetAsideKind.Dead
                 && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
                 && bounds.MaxDeadBytes is { } maxDead && bytes.Length > maxDead)
@@ -419,9 +424,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 insert.Parameters.AddWithValue("$m", messageId);
                 insert.Parameters.AddWithValue("$e", Sqlite.ToUnixMs(enqueuedAt));
 
-                // The clock is read here, where the row is written, and not where the call was made. An age
-                // stamped before the write queued is an age the row never had: a writer with a backlog longer
-                // than the deferred age would file a message that ages out the moment it lands.
+                // The clock is read here, where the row is written. A stamp taken before the write queued
+                // gives the row an age that it never had. A writer with a backlog longer than the deferred age
+                // would then file a message that ages out when it lands.
                 insert.Parameters.AddWithValue("$a", _clock.NowMs());
                 insert.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
                 insert.Parameters.AddWithValue("$n", attempts);
@@ -444,15 +449,15 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Holds the dead bound to the set inside the write that just changed it, and answers with the sizes the
-    /// caller needs to decide whether the subscriber should stop.
+    /// Applies the dead bound to the set inside the write that changed the set. Returns the sizes that the
+    /// caller uses to decide if the subscriber stops.
     /// </summary>
     /// <remarks>
-    /// This runs here, in the transaction that filed the row, rather than in a second write op afterwards. A
-    /// settle made of two ops can commit the first and then fail the second — a cancelled token is checked at
-    /// the door of every op, so the ordinary way to hit it is to cancel a settle whose insert is already
-    /// queued — and the caller is then told the settle failed over an effect that is durable. It retries, and
-    /// the same message is filed dead twice. One op cannot half-happen, so there is nothing left to fail.
+    /// This method runs in the transaction that filed the row, in the same write op. A settle made of two ops
+    /// can commit the first op and then fail the second. Each op checks for a cancelled token before it
+    /// starts. Thus the usual cause is a cancel of a settle whose insert is already queued. The caller is then
+    /// told that the settle failed, but the effect of the first op is durable. The caller retries, and the
+    /// same message is filed dead twice. One op commits fully or not at all, so no part is left to fail.
     /// </remarks>
     private static SetAsideSizes EnforceDead(SqliteConnection connection, SqliteTransaction transaction,
         string topic, SetAsideKind filedAs, SetAsidePolicy bounds, long filed)
@@ -460,8 +465,8 @@ internal sealed class SubscriberStore : IAsyncDisposable
         if (filedAs != SetAsideKind.Dead || (bounds.MaxDeadCount is null && bounds.MaxDeadBytes is null))
             return default;
 
-        // A limit is a maximum, so dropping trims back to it and stopping happens on reaching it — a
-        // subscriber that stops has no way to take another one anyway.
+        // A limit is a maximum. A drop trims the set back to the limit. A stop occurs when the set reaches
+        // the limit, because a stopped subscriber cannot take another dead letter.
         if (bounds.DeadOverflow == DeadLetterOverflow.DropOldest)
         {
             TrimDeadTo(connection, transaction, topic, bounds.MaxDeadCount, bounds.MaxDeadBytes, filed);
@@ -472,29 +477,32 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Re-files a row already in this store as something else, and holds the bounds to what that leaves.
+    /// Re-files a row that is already in this store as a different kind. Then applies the bounds to the set
+    /// that results.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// One write op, for the reason <see cref="EnforceDead"/> gives: the settles that reach here are the ones
-    /// that give a delivery back when they throw, so anything that can throw after the row has moved is a
-    /// failure reported over a durable effect.
+    /// The method is one write op, for the reason that <see cref="EnforceDead"/> gives. The settles that call
+    /// this method give a delivery back when they throw. If anything throws after the row moved, the failure
+    /// is reported over a durable effect.
     /// </para>
     /// <para>
-    /// The deferred bounds are consulted only when the row is joining the deferred set from outside it. A row
-    /// re-filed as what it already is adds neither a row nor a byte, and measuring it against a set it is
-    /// already inside is how a message replayed and deferred again at the bound was dead-lettered for a set
-    /// that was not growing. A row moving the other way — dead to deferred — is genuinely joining, so it is
-    /// measured, and a deferral that does not fit stays dead and says so, exactly as one arriving fresh does.
+    /// The deferred bounds apply only when the row joins the deferred set from outside it. A row re-filed as
+    /// its current kind adds zero rows and zero bytes. A measure of such a row against the set that already
+    /// holds it caused a defect. A message replayed and deferred again at the bound was dead-lettered, although
+    /// the set did not grow. A row that moves from dead to deferred joins the set, so it is measured. A
+    /// deferral that does not fit stays dead, with a reason that says so. A fresh arrival behaves the same way.
     /// </para>
     /// <para>
-    /// The keepability refusal is made here as well, and on the same terms as everywhere else: a row is
-    /// refused when it is joining the dead set and is larger than the whole byte bound. Knowing what the row
-    /// already is, is the reason the decision belongs in this write rather than at the call site. A caller
-    /// cannot tell a deferral being downgraded — which is arriving in the dead set, and meets the refusal a
-    /// fresh arrival meets — from a dead letter being re-filed as what it already is, which joins nothing:
-    /// refusing that one gives a reason untrue of it, since the row is already held and keeping it costs the
-    /// set nothing, and it leaves a replayed dead letter no way back into the store it came out of.
+    /// This method also makes the keepability refusal, on the same terms as all other paths. A row is refused
+    /// when it joins the dead set and is larger than the whole byte bound. The decision needs the current kind
+    /// of the row. Thus the decision belongs in this write, and not at the call site.
+    /// </para>
+    /// <para>
+    /// The caller cannot tell two cases apart. A downgraded deferral arrives in the dead set, and gets the
+    /// same refusal as a fresh arrival. A dead letter re-filed as dead joins no set. A refusal of that row
+    /// gives a false reason, because the set already holds the row and its stay costs the set nothing. That
+    /// refusal also leaves a replayed dead letter no way back into the store that it came from.
     /// </para>
     /// </remarks>
     internal async ValueTask<SetAsideOutcome> RefileAsync(long asideId, string topic, SetAsideKind kind,
@@ -539,9 +547,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 }
             }
 
-            // Joining the dead set and too big for this subscriber to hold: nothing is written, for the
-            // reason the fresh arrival is turned away. A row already filed dead is not joining it, and is
-            // re-filed as what it already is without complaint — the set it is in is the set it stays in.
+            // A row that joins the dead set and is too big for this subscriber to hold: nothing is written,
+            // for the same reason as for a fresh arrival. A row already filed dead does not join the set. It
+            // is re-filed as dead with no refusal, and it stays in the same set.
             if (filedAs == SetAsideKind.Dead && was != SetAsideKind.Dead
                 && bounds.DeadOverflow == DeadLetterOverflow.DropOldest
                 && bounds.MaxDeadBytes is { } maxDead && length > maxDead)
@@ -560,8 +568,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 command.Parameters.AddWithValue("$held", (int)SetAsideDelivery.Held);
                 command.Parameters.AddWithValue("$r", (object?)why ?? DBNull.Value);
 
-                // Re-stamped, because the age bounds measure how long a row has sat as what it now is: a
-                // message deferred a moment ago has not been sitting there since it was first set aside.
+                // The row gets a new stamp. The age bounds measure how long a row has held its current kind.
+                // The age of a message deferred a moment ago starts at that deferral, and not at its first
+                // set-aside.
                 command.Parameters.AddWithValue("$now", _clock.NowMs());
                 command.Parameters.AddWithValue("$i", asideId);
                 command.ExecuteNonQuery();
@@ -574,7 +583,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return new SetAsideOutcome(asideId, filedAs, refused, sizes);
     }
 
-    /// <summary>Lists what is set aside. Reads go through the writer, which keeps one connection per file.</summary>
+    /// <summary>Lists the set-aside rows. Reads go through the writer, with one connection per file.</summary>
     internal async ValueTask<List<SetAsideEntry>> ListSetAsideAsync(string topic, SetAsideKind kind,
         CancellationToken ct = default)
     {
@@ -608,15 +617,15 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return rows;
     }
 
-    /// <summary>Makes a set-aside row deliverable again. The ordinary read loop then picks it up.</summary>
+    /// <summary>Makes a set-aside row deliverable again. The ordinary read loop then takes it.</summary>
     /// <remarks>
-    /// A row a handler is holding is left alone. Re-arming one would hand the same row to a second handler
-    /// under the delivery tag the first is still carrying, and a tag can only be settled once: the second
-    /// settle is refused for ever and the in-flight slot behind it never comes back. Service Bus will not let
-    /// a deferred message be received twice at once either, so refusing is also what a consumer moving there
-    /// will meet.
+    /// Replay skips a row that a handler holds. A re-arm of that row would give it to a second handler, under
+    /// the delivery tag that the first handler still holds. A tag can be settled once only. The second settle
+    /// is then refused for ever. The in-flight slot behind it never comes back. Service Bus also refuses to
+    /// let a deferred message be received twice at the same time. A consumer that moves to Service Bus gets
+    /// the same refusal.
     /// </remarks>
-    /// <returns>True if the message is now waiting to be delivered, false if it is gone or in a handler's hands.</returns>
+    /// <returns>True if the message now waits for delivery. False if it is gone or a handler holds it.</returns>
     internal async ValueTask<bool> ReplayAsync(long asideId, CancellationToken ct = default)
         => await _writer.EnqueueAsync((connection, transaction) =>
         {
@@ -628,13 +637,16 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteNonQuery();
         }, ct).ConfigureAwait(false) > 0;
 
-    /// <summary>Destroys a set-aside message. The only place this library throws something away on purpose.</summary>
+    /// <summary>
+    /// Destroys a set-aside message at the caller's request. This is the only operation that destroys a message
+    /// because a caller asked for it.
+    /// </summary>
     /// <remarks>
-    /// Like replay, this leaves a row a handler is holding where it is. Deleting one underneath a delivery
-    /// makes every answer that follows it untrue: the settle finds nothing to settle, and a failure below the
-    /// attempt limit says the message will be delivered again when there is no longer anything to deliver.
+    /// Like replay, discard skips a row that a handler holds. A delete under a delivery makes every later
+    /// answer false. The settle finds nothing to settle. A failure below the attempt limit reports a
+    /// redelivery, but no message remains to deliver.
     /// </remarks>
-    /// <returns>True if the message was destroyed, false if it was gone already or is in a handler's hands.</returns>
+    /// <returns>True if the message was destroyed. False if it was already gone or a handler holds it.</returns>
     internal async ValueTask<bool> DiscardAsync(long asideId, CancellationToken ct = default)
         => await _writer.EnqueueAsync((connection, transaction) =>
         {
@@ -646,8 +658,8 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct).ConfigureAwait(false) > 0;
 
     /// <summary>
-    /// Removes the row behind a delivery that has just been completed, which is the one caller entitled to
-    /// destroy a row that is in flight: it is the handler holding it, saying it is finished with.
+    /// Removes the row behind a completed delivery. This is the one caller that can destroy an in-flight row.
+    /// The caller is the handler that holds the row, and the call says that the handler is finished with it.
     /// </summary>
     internal ValueTask<long> RemoveSetAsideAsync(long asideId, CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
@@ -659,24 +671,31 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Takes a delivery only if nothing already holds it and the position has not passed it. An entry above
-    /// the mark is either in flight now or finished but not yet absorbed, and neither should be delivered
-    /// again.
+    /// Takes a delivery if nothing holds it and the position is below it. An entry above the mark is in
+    /// flight now, or it is finished and not yet absorbed. Neither type of entry is delivered again.
     /// </summary>
     /// <remarks>
-    /// The position is checked inside this statement and not by the caller, because the caller's reading of it
-    /// is stale by the time the claim runs. Choosing a candidate and claiming it are separate write ops, and a
-    /// second reader of the same subscriber — a sibling instance, or a second enumerator — can complete the
-    /// same record in between, whereupon the mark absorbs it and <em>deletes its entry</em>. An unguarded
-    /// upsert then reads that absence as "never delivered" and inserts a fresh claim below the mark: the
-    /// message goes to a second handler on a path where nothing failed, and the row it leaves behind sits
-    /// where no position will ever absorb it — counted by every poll and every inspection for the life of the
-    /// file, and answered over by <c>ReleaseAsync</c> as if a redelivery were coming that no read will offer.
-    /// Selecting from the cursor row makes the claim and the check one statement: a log claim is valid only
-    /// above the mark, a scheduled one only above the floor, which needs the row's due time because the floor
-    /// orders by due time and then id — the same comparison <c>TopicReader.Due</c> makes.
+    /// <para>
+    /// This statement checks the position. The reading of the position by the caller is stale by the time the
+    /// claim runs. The choice of a candidate and its claim are separate write ops. Between them, a second
+    /// reader of the same subscriber can complete the same record. That reader is a sibling instance or a
+    /// second enumerator. The mark then absorbs the record and <em>deletes its entry</em>.
+    /// </para>
+    /// <para>
+    /// An unguarded upsert then reads the missing entry as "never delivered" and inserts a fresh claim below
+    /// the mark. The message goes to a second handler on a path where nothing failed. The row that the claim
+    /// leaves sits where no position will absorb it. Every poll and every inspection counts that row for the
+    /// life of the file. <c>ReleaseAsync</c> answers for it as if a redelivery will come, but no read will
+    /// offer one.
+    /// </para>
+    /// <para>
+    /// A select from the cursor row makes the claim and the check one statement. A log claim is valid only
+    /// above the mark. A scheduled claim is valid only above the floor. That check needs the due time of the
+    /// row, because the floor orders by due time and then by id. <c>TopicReader.Due</c> makes the same
+    /// comparison.
+    /// </para>
     /// </remarks>
-    /// <returns>The attempt number, or 0 if this message is already spoken for or already absorbed.</returns>
+    /// <returns>The attempt number, or 0 if this message is already claimed or already absorbed.</returns>
     internal ValueTask<long> TryClaimAsync(string topic, EntrySource source, long id, long dueAtMs,
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
@@ -705,14 +724,14 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteScalar() as long? ?? 0L;
         }, ct);
 
-    /// <summary>Hands a failed delivery back, leaving the attempt count where it is.</summary>
+    /// <summary>Gives a failed delivery back. The attempt count stays the same.</summary>
     /// <remarks>
-    /// The row stays rather than being deleted. Deleting it would lose the attempt count, and a message that
-    /// fails every time would then be retried forever with the counter starting again on each delivery.
+    /// The row stays. A delete would lose the attempt count. A message that fails every time would then be
+    /// retried forever, because its count would start again on each delivery.
     /// </remarks>
     /// <returns>
-    /// One if the delivery was handed back, zero if there was no longer an entry to hand back — which means a
-    /// position has passed the record and no read will offer it again.
+    /// One if the delivery was given back. Zero if the entry is gone. A missing entry means that a position
+    /// has passed the record. No read will offer the record again.
     /// </returns>
     internal ValueTask<long> ReleaseAsync(string topic, EntrySource source, long id, CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
@@ -728,24 +747,27 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Measures the loss below a surviving minimum, moves the position over it, and drops the entries it
-    /// passes — in the one write, so the gap that is measured is the gap that is closed.
+    /// Measures the loss below a surviving minimum, moves the position over the loss and drops the entries
+    /// that it passes. One write does all three, so the measured gap is the closed gap.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Only for the case where retention removed records this subscriber had not read. The mark advances over
-    /// contiguous entries, so leaving it below a gap that can never be filled would freeze it there for good
-    /// and the exception set would grow without limit. Acknowledging the loss is the only way back to a
-    /// consistent position, which is why it is reported at the same time rather than done quietly.
+    /// Use this method only when retention removed records that this subscriber had not read. The mark
+    /// advances over contiguous entries. A mark below a gap that can never fill would stay there for good. The
+    /// exception set would then grow without limit. An acknowledgement of the loss is the only way back to a
+    /// consistent position. Thus the method reports the loss at the same time as it moves the position.
     /// </para>
     /// <para>
-    /// Measuring and moving used to be separate ops, and two readers of the same subscriber — a sibling
-    /// instance, or a second enumerator — interleaved them: both read the un-moved mark, both measured the
-    /// same gap, and both reported it, doubling the one number the loss contract says an operator can act on.
-    /// In one op, whichever call finds the mark already moved measures a gap of nothing and reports nothing:
-    /// the report belongs to the call that moved the position. The opening no-op write is part of that — it
-    /// takes the file's write lock before the mark is read, so a sibling's move lands before this
-    /// measurement rather than between it and the write behind it.
+    /// The measure and the move used to be separate ops. Two readers of the same subscriber interleaved them.
+    /// Each reader was a sibling instance or a second enumerator. Both read the mark before it moved, both
+    /// measured the same gap, and both reported it. That doubled the one number that, by the loss contract, an
+    /// operator can act on.
+    /// </para>
+    /// <para>
+    /// In one op, a call that finds the mark already moved measures an empty gap and reports zero. The report
+    /// belongs to the call that moved the position. The no-op write at the start is part of this. It takes the
+    /// write lock of the file before the mark is read. A move by a sibling thus lands before this measurement,
+    /// and never between the measurement and the write after it.
     /// </para>
     /// </remarks>
     /// <returns>The moved mark, how many records were lost, and the bounds of the gap they were lost in.</returns>
@@ -771,11 +793,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 return 0;
             }
 
-            // Records a handler is holding, or has already settled, are not lost to this subscriber however
-            // they left the log: counting them would name messages someone has in their hands as ones that
-            // never arrived. An entry left Available is neither — a delivery that failed and was handed back
-            // is owed another attempt only the log can make. Read before the delete below takes them, and
-            // read as ids rather than as a number so the gap this reports is the gap it counted.
+            // Records that a handler holds, or has already settled, are not lost to this subscriber, however
+            // they left the log. A count of them would report messages that a handler has as messages that
+            // never arrived. An entry left Available is neither held nor settled. A delivery that failed and
+            // was given back is owed another attempt, and only the log can make that attempt. The ids are read
+            // before the delete below removes them. They are read as a set of ids, so the gap that this
+            // reports is the gap that it counted.
             var held = new HashSet<long>();
             using (var rows = Sqlite.Command(connection, transaction,
                 """
@@ -793,15 +816,17 @@ internal sealed class SubscriberStore : IAsyncDisposable
                     held.Add(reader.GetInt64(0));
             }
 
-            // Everything in the gap except the deliveries that are still out. Those are left where they are
-            // deliberately: the mark is about to move past them, and an entry is then the only remaining
-            // record that this subscriber was handed the message at all. Deleting it — which is what used to
-            // happen — meant the settle that followed found nothing to hand back, so the failure was answered
-            // honestly and the message was counted by nobody: not here, because a handler held it when this
-            // ran, and not afterwards, because nothing was left to notice. What is left instead is swept by
-            // the pass over entries below the mark, which reports the ones still owed and is where the second
-            // ending for these lives. Bounded below by the mark as well, so an entry a previous gap left
-            // behind is that pass's to report and is not quietly taken from underneath it here.
+            // The delete takes every entry in the gap except the in-flight deliveries. Those stay on purpose.
+            // The mark will move past them. After that, the entry is the only record that this subscriber
+            // received the message. This code used to delete it. The settle that followed then found nothing
+            // to give back. The failure was answered honestly, but no count included the message. This pass
+            // did not count it, because a handler held it at the time. No later pass counted it, because
+            // nothing was left to see.
+            //
+            // The pass over entries below the mark sweeps the entries that stay. That pass reports the
+            // entries that are still owed. It is the second ending for these entries. The mark is also the
+            // lower bound of the delete. An entry that a previous gap left is thus for that pass to report.
+            // This delete does not take it silently.
             using (var entries = Sqlite.Command(connection, transaction,
                 """
                 DELETE FROM entry
@@ -827,9 +852,9 @@ internal sealed class SubscriberStore : IAsyncDisposable
             moved = AdvanceMark(connection, transaction, topic);
             lost = Math.Max(0, min - mark - 1 - held.Count);
 
-            // The bounds name records this report counted, and not the span it looked at. An operator given a
-            // range that takes in messages the subscriber is holding or has already dealt with goes looking
-            // for messages that are not missing.
+            // The bounds name the first and last records that this report counted. If the range included
+            // messages that the subscriber holds or has already finished, an operator would look for messages
+            // that are present.
             first = mark + 1;
             while (first < min && held.Contains(first))
                 first++;
@@ -842,26 +867,30 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Clears the log entries the position has already passed, and says which of them were still owed.
+    /// Clears the log entries that the position has already passed. Returns the ids of the entries that were
+    /// still owed.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The mark only moves over an entry once there is nothing left to do about it, with one exception: the
-    /// settle above moves it over a gap retention left, and it leaves the deliveries that were out at the
-    /// time to be settled afterwards. Those entries come to rest underneath the mark, where no claim can
-    /// reach them — the claim guard is what makes that true — and nothing else will ever absorb them. This is
-    /// their ending, and which ending it is depends on how the delivery finished. Finished with is finished
-    /// with, however the record left the log. Handed back is a redelivery this subscriber was promised and
-    /// the log can no longer make, which is the definition of the loss it reports. A crash reaches the same
-    /// place: recovery hands its in-flight deliveries back, and the ones under the mark are owed.
+    /// The mark moves over an entry only when no work on it remains, with one exception. The loss settle above
+    /// moves the mark over a gap that retention left. It leaves the deliveries that were in flight at that time
+    /// to be settled later. Those entries come to rest below the mark. The claim guard makes sure that no claim
+    /// can reach them there. Nothing else will absorb them.
     /// </para>
     /// <para>
-    /// The mark is read inside the delete and the rows are named by what the delete removed, so the report
-    /// belongs to the caller that removed them. A sibling, or a second enumerator, running this at the same
-    /// moment takes no rows and reports nothing rather than reporting the same loss over again. A delivery
-    /// claimed since the caller looked is left alone by the state clause for the same reason it is left alone
-    /// by the settle above: naming a message as lost while a handler holds it is the mistake in the report
-    /// that the guard exists to stop in the file.
+    /// This method is their ending. The type of ending depends on how the delivery finished. A finished
+    /// delivery is finished, however the record left the log. A delivery that was given back is a redelivery
+    /// that this subscriber was promised and that the log can no longer make. That is the definition of the
+    /// loss that this method reports. A crash reaches the same state. Recovery gives its in-flight deliveries
+    /// back, and the ones below the mark are owed.
+    /// </para>
+    /// <para>
+    /// The delete reads the mark, and the report names the rows that the delete removed. Thus the report
+    /// belongs to the caller that removed them. A sibling or a second enumerator that runs this at the same
+    /// moment takes no rows and reports zero. It does not report the same loss again. The state clause skips
+    /// a delivery claimed after the caller looked, for the same reason as the loss settle above. A report that
+    /// names a message as lost while a handler holds it makes the same mistake that the guard stops in the
+    /// file.
     /// </para>
     /// </remarks>
     internal async ValueTask<List<long>> ForgetStrandedAsync(string topic, CancellationToken ct = default)
@@ -892,9 +921,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// What this subscriber knows about the records above a position: what it is holding, and what it has
-    /// finished with but not yet absorbed. One read, so a batch of candidates can be sorted out in memory
-    /// rather than by trying to claim each one in turn.
+    /// The state of every entry row for one topic and source. Entry rows exist only for deliveries that the
+    /// position has not yet absorbed: the deliveries that this subscriber holds, and the finished deliveries
+    /// waiting to be absorbed. One read gives all of them. The caller
+    /// thus sorts a batch of candidates in memory, with no claim attempt for each one in turn.
     /// </summary>
     internal async ValueTask<Dictionary<long, EntryState>> EntryStatesAsync(string topic, EntrySource source,
         CancellationToken ct = default)
@@ -914,7 +944,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return states;
     }
 
-    /// <summary>This subscriber's place in the scheduled table.</summary>
+    /// <summary>This subscriber's position in the scheduled table.</summary>
     internal async ValueTask<ScheduledFloor> ReadScheduledFloorAsync(string topic, CancellationToken ct = default)
     {
         ScheduledFloor floor = ScheduledFloor.Start;
@@ -932,13 +962,13 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Moves the scheduled floor over a run of settled rows and drops the entries that recorded them.
+    /// Moves the scheduled floor over a run of settled rows. Drops the entries that recorded those rows.
     /// </summary>
     /// <remarks>
-    /// The same reasoning as the log mark, and the same danger: the run has to be contiguous in the order the
-    /// reader takes rows in, or the floor swallows something still in flight and it never comes back. The
-    /// caller passes the ids it is absorbing rather than a range, so what is deleted is exactly what it
-    /// checked. The floor never moves backwards, which is what makes a stale advance harmless.
+    /// The log mark has the same rule and the same risk. The run must be contiguous in the order in which the
+    /// reader takes rows. Otherwise, the floor passes over an in-flight row, and that row never comes back.
+    /// The caller passes each id that it absorbs, as a list of ids. Thus the delete removes only the rows that
+    /// the caller checked. The floor never moves backwards. Because of this, a stale advance causes no harm.
     /// </remarks>
     internal ValueTask<long> AbsorbScheduledAsync(string topic, ScheduledFloor floor, IReadOnlyList<long> settled,
         CancellationToken ct = default)
@@ -969,16 +999,16 @@ internal sealed class SubscriberStore : IAsyncDisposable
         }, ct);
 
     /// <summary>
-    /// Deletes the entries recording scheduled rows that are no longer in the topic file.
+    /// Deletes the entries for scheduled rows that the topic file no longer holds.
     /// </summary>
     /// <remarks>
-    /// An entry is normally deleted by the floor absorbing the row it records, and the floor only moves over
-    /// rows it saw as candidates. A row retention removed before that happened never appears as a candidate
-    /// again, so its entry has nothing left that could absorb it: it stays for good, and anything reading this
-    /// file counts it for good. This is the other way an entry ends, and the only one that is not a position
-    /// moving.
+    /// Usually, an entry is deleted when the floor absorbs the row that it records. The floor moves only over
+    /// rows that it saw as candidates. If retention removed a row before that, the row never appears as a
+    /// candidate again. Nothing can then absorb its entry. The entry stays for good, and each reader of this
+    /// file counts it for good. This method is the other way that an entry ends. It is the only ending that is
+    /// not a move of a position.
     /// </remarks>
-    /// <returns>The ids whose entry this actually removed, which is not always the ids it was given.</returns>
+    /// <returns>The ids whose entries this method removed. They can differ from the ids that it got.</returns>
     internal async ValueTask<List<long>> ForgetScheduledAsync(string topic, IReadOnlyList<long> ids,
         CancellationToken ct = default)
     {
@@ -987,11 +1017,12 @@ internal sealed class SubscriberStore : IAsyncDisposable
         {
             forgotten.Clear();
 
-            // The in-flight guard belongs in the statement and not only in the caller's reading of the states
-            // it last saw. What to forget is decided from a set read a moment earlier, and a delivery claimed
-            // since — by a sibling on the same subscriber and topic — would otherwise have its entry deleted
-            // underneath it and be named as owed-and-lost while a handler was holding it. Same rule as
-            // everywhere else here: nothing acts on a row while a handler has it.
+            // The statement holds the in-flight guard, in addition to the check on the states that the caller
+            // last saw. The caller decides what to forget from a set that it read a moment earlier. A sibling
+            // on the same subscriber and topic can claim a delivery after that read. Without the guard, the
+            // delete would remove the entry of that delivery. The report would then name the delivery as owed
+            // and lost while a handler held it. The rule here is the same as everywhere in this file: nothing
+            // acts on a row that a handler holds.
             using var delete = Sqlite.Command(connection, transaction,
                 "DELETE FROM entry WHERE topic = $t AND source = $s AND id = $i AND state <> $inflight;");
             delete.Parameters.AddWithValue("$t", topic);
@@ -1040,7 +1071,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
         return entry;
     }
 
-    /// <summary>Puts a set-aside delivery back to held, or to ready if it should be tried again.</summary>
+    /// <summary>Sets a set-aside delivery back to held, or to ready for another attempt.</summary>
     internal ValueTask<long> SettleSetAsideAsync(long asideId, SetAsideDelivery delivery,
         CancellationToken ct = default)
         => _writer.EnqueueAsync((connection, transaction) =>
@@ -1052,10 +1083,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
             return command.ExecuteNonQuery();
         }, ct);
 
-    /// <summary>How much this subscriber currently has set aside: a count and a payload total for each kind.</summary>
+    /// <summary>The size of the set-aside store: a count and a payload total for each kind.</summary>
     /// <remarks>
-    /// Kept apart rather than totalled because the two sets are bounded separately, and they are bounded
-    /// separately because only one of them has somewhere to pass a message that does not fit.
+    /// The sizes are kept per set because each set has a separate bound. The bounds are separate because only
+    /// one of the sets has a place to pass on a message that does not fit.
     /// </remarks>
     internal async ValueTask<SetAsideSizes> SetAsideSizeAsync(string topic, CancellationToken ct = default)
     {
@@ -1094,24 +1125,28 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Turns deferred messages that have sat too long into dead letters. They are not destroyed: a deferred
-    /// message that quietly evaporated would be the silent loss this whole design exists to avoid.
+    /// Changes deferred messages that have waited too long into dead letters. The pass keeps each message. A
+    /// deferred message lost without a report would be silent loss, and this design exists to avoid silent
+    /// loss.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A row a handler is holding is left alone. It has not sat anywhere; it is being worked on now, and the
-    /// settle that follows would put a dead letter straight back to ready. Its age is measured again on the
-    /// next pass, from wherever that settle leaves it.
+    /// The pass skips a row that a handler holds. That row has not waited. A handler works on it now. The
+    /// settle that follows would put a dead letter back to ready at once. The next pass measures its age
+    /// again, from the state that the settle leaves.
     /// </para>
     /// <para>
-    /// Everything else keeps whatever delivery state it had. The pass used to park each row it changed, which
-    /// silently cancelled a replay: a deferral an operator had asked to see again was turned into a held dead
-    /// letter and the request evaporated without a word. Only the kind changes now, so a row on its way out is
-    /// still on its way out and the next read delivers it — as a dead letter, which is what replaying one has
-    /// always meant. Leaving the row alone instead would have been the other way to stop cancelling the
-    /// replay, and it is the worse one: a delivery interrupted by a restart comes back as ready, so every
-    /// deferral a redeploy caught mid-flight would have been exempt from the age bound for as long as nobody
-    /// read the subscriber — which, for a subscriber stopped at a full dead set, is indefinitely.
+    /// Every other row keeps its delivery state. The pass used to park each row that it changed. That
+    /// cancelled a replay silently. A deferral that an operator had asked to see again became a held dead
+    /// letter, and the request was lost with no report. Now only the kind changes. A row on its way out stays
+    /// on its way out, and the next read delivers it as a dead letter. A replay of a dead letter has always
+    /// meant this.
+    /// </para>
+    /// <para>
+    /// The other way to stop the cancel was to leave such a row unchanged. That way is worse. A delivery
+    /// interrupted by a restart comes back as ready. Every deferral that a redeploy caught in flight would
+    /// then escape the age bound for as long as no reader read the subscriber. For a subscriber stopped at a
+    /// full dead set, that time has no end.
     /// </para>
     /// </remarks>
     internal ValueTask<long> AgeOutDeferredAsync(string topic, DateTimeOffset cutoff, string reason,
@@ -1134,40 +1169,45 @@ internal sealed class SubscriberStore : IAsyncDisposable
                 aged = command.ExecuteNonQuery();
             }
 
-            // Recorded in the file, in the write that did it, for the reason the drop count is. A pass is
-            // three writes, and one that failed after this one — a cancelled token is checked at the door of
-            // every op, so a host handing its shutdown token to a maintenance pass is the ordinary way there
-            // — used to report nothing at all, and the next pass had nothing left to count: the deferrals
-            // were already dead by then and no arithmetic could recover the number.
+            // The count is recorded in the file, in the write that aged the rows, for the same reason as the
+            // drop count. A pass is three writes. Each op checks for a cancelled token before it starts. Thus
+            // a host that gives its shutdown token to a maintenance pass is the usual cause of a failure after
+            // this write. A pass that failed there used to report nothing. The next pass then had nothing to
+            // count, because the deferrals were already dead. No calculation could recover the number.
             if (aged > 0)
                 Bump(connection, transaction, AgedKey(topic), aged);
 
             return aged;
         }, ct);
 
-    /// <summary>Destroys the oldest dead letters down to a limit. Real loss, and the only path here that causes any.</summary>
+    /// <summary>
+    /// Destroys the oldest dead letters down to a limit, under <see cref="DeadLetterOverflow.DropOldest"/>. This is
+    /// real loss. It is the only path in this file where a bound destroys messages.
+    /// </summary>
     /// <remarks>
     /// <para>
-    /// It is given the limit and works out the excess itself, inside the one write that does the deleting. A
-    /// caller that reads the size and then asks for that many rows to be destroyed is deciding how many to
-    /// destroy against a set that other settles are trimming at the same time: each of them measures the same
-    /// backlog, each is told to remove it, and between them they empty a set that only had to lose its oldest
-    /// few. Same rule as the insert side, on the side that does the destroying.
+    /// The method gets the limit and calculates the excess, inside the one write that deletes. A caller can
+    /// read the size and then ask for that number of rows to be destroyed. Other settles can trim the same set
+    /// at the same time. Each of them measures the same backlog and is told to remove it. Together they empty
+    /// a set that had to lose only its oldest few rows. This is the same rule as on the insert side, applied
+    /// to the side that destroys.
     /// </para>
     /// <para>
-    /// A dead letter someone has replayed and is handling now is not dropped, for the same reason a discard
-    /// leaves one alone: the handler is about to be told what happened to a row that would no longer be there.
-    /// It still counts towards the limit, so the set can sit one or two above itself while those deliveries
-    /// finish, and the next pass trims what they leave behind.
+    /// The trim keeps a dead letter that was replayed and that a handler holds now. The reason is the same as
+    /// for discard. The handler will be told what happened to the row. After a trim, the row would be gone.
+    /// The row still counts towards the limit. Thus the set can be one or two rows above its limit while those
+    /// deliveries finish. The next pass trims what they leave.
     /// </para>
     /// <para>
-    /// A row that has been replayed but not yet handed out is not spared, and that is a decision rather than
-    /// an oversight. Nothing has been told anything about it that this could falsify — the answer replay gave
-    /// was about the store as it stood, the same kind of answer an append gives about a record retention may
-    /// later reach. And the exemption cannot be widened to cover it safely: deliveries in flight are capped by
-    /// <c>MaxInFlight</c>, whereas any number of rows can be made ready at once, so sparing them would let a
-    /// caller who replayed a whole set suspend the bound entirely. A bound that can be switched off is worse
-    /// than loss that is counted, which is what this option exists to provide.
+    /// The trim can destroy a row that was replayed and not yet given to a handler. This is a decision. No
+    /// answer about that row becomes false. The answer from replay was about the store at that time. An
+    /// append gives the same kind of answer about a record that retention can later reach.
+    /// </para>
+    /// <para>
+    /// The exemption cannot safely cover these rows. <c>MaxInFlight</c> limits the in-flight deliveries, but
+    /// any number of rows can be made ready at once. If the trim spared ready rows, a caller that replayed a
+    /// whole set would suspend the bound. A bound that a caller can switch off is worse than counted loss.
+    /// Counted loss is the purpose of this option.
     /// </para>
     /// </remarks>
     internal ValueTask<long> TrimDeadToAsync(string topic, long? count, long? bytes,
@@ -1177,40 +1217,42 @@ internal sealed class SubscriberStore : IAsyncDisposable
 
     /// <inheritdoc cref="TrimDeadToAsync"/>
     /// <remarks>
-    /// Given the connection rather than the writer, so that the settle which filed the row can trim inside the
-    /// write that filed it. What a bound destroys and what put the set over it belong in one transaction.
+    /// This method takes the connection. The settle that filed the row can then trim inside the write that
+    /// filed it. The rows that a bound destroys and the row that put the set over the bound belong in one
+    /// transaction.
     /// </remarks>
     private static long TrimDeadTo(SqliteConnection connection, SqliteTransaction transaction, string topic,
         long? count, long? bytes, long? filed)
     {
         long dropped;
-        // Numbered and totalled newest first, so what a bound keeps is the newest of the set and what it
-        // drops is everything the newest of the set has pushed out. A row being delivered is numbered and
-        // totalled like any other — it still occupies the set — but it is never the row deleted.
+        // The rows are numbered and totalled newest first. A bound thus keeps the newest rows of the set and
+        // drops every row that the newest rows pushed out. An in-flight row is numbered and totalled like any
+        // other row, because it still occupies the set. The delete never takes it.
         //
-        // The row this write just filed is the newest arrival whatever its aside_id says, which is the whole
-        // of $filed. A re-filed row keeps the id it was given when it was first set aside, so ordering by id
-        // alone made a replayed message settled dead the oldest row in the set by construction: the trim its
-        // own settle triggers destroyed it, and the settle answered "filed" about a message that had gone.
-        // Sorting it to the front is what fixes that — numbered first and totalled first, it is kept and what
-        // it pushes out is the oldest of the rest, exactly as a fresh insert has always behaved.
+        // The row that this write filed is the newest arrival, whatever its aside_id is. That is the full
+        // meaning of $filed. A re-filed row keeps the id from its first set-aside. With an order by id alone,
+        // a replayed message settled dead was always the oldest row in the set. The trim that its own settle
+        // started destroyed it. The settle then answered "filed" about a message that was gone. The sort puts
+        // this row first. It is numbered first and totalled first, so the trim keeps it and pushes out the
+        // oldest of the other rows. A fresh insert has always behaved the same way.
         //
-        // Excluding it from the delete as well makes "a settle never destroys the row it is filing" true of
-        // this statement rather than true only while every route into the set turns away a row it could not
-        // keep. It is here because that would otherwise be a guarantee assembled out of call sites and a
-        // validation rule, and the defect it was written for is what that looks like when one of them is a
-        // bound out of step with the one that fires.
+        // The delete also excludes this row. Thus this statement itself makes this rule true: "a settle never
+        // destroys the row that it files". Without the exclusion, the rule holds only while every route into
+        // the set refuses a row that it cannot keep. The guarantee would then depend on call sites and a
+        // validation rule. The defect that this exclusion was written for shows that failure: one of those
+        // parts was a bound out of step with the bound that fires.
         //
-        // A row whose own payload is larger than the whole byte bound is charged to nothing and destroyed
-        // wherever it sits. Totalling it like any other row made one unkeepable row push the running sum
-        // past the bound for every row older than it, so a set that was comfortably inside the bound was
-        // emptied by a single arrival it could never have kept — the age-out pass files exactly such a row,
-        // and the maintenance trim that followed took the rest of the set with it. Both bounds now count
-        // only what this subscriber can keep, so the collateral is gone and what is destroyed is the row
-        // that cannot be held, counted as the loss it is. The delete says so directly rather than relying on
-        // the sum, because a row too big for the bound is over it alone and stays over it however the set
-        // around it shrinks; the in-flight and $filed exclusions still come first, since a handler about to
-        // be told what happened to a row, and the row a write is filing, are spared whatever their size.
+        // A row with a payload larger than the whole byte bound is charged to nothing. The delete destroys it
+        // wherever it sits. When such a row was totalled like other rows, it pushed the running sum past the
+        // bound for every older row. A single arrival that the set could never keep then emptied a set that
+        // was well inside the bound. The age-out pass files such a row, and the maintenance trim after it took
+        // the rest of the set. Both bounds now count only the rows that this subscriber can keep. The trim
+        // destroys only the row that it cannot hold, and counts that row as loss.
+        //
+        // The delete names unkeepable rows directly, and does not rely on the sum. A row too big for the bound
+        // is over the bound alone, and stays over it however much the set shrinks. The in-flight and $filed
+        // exclusions still apply first. The trim spares, whatever their size, a row that a handler holds and
+        // the row that a write files. That handler will be told what happened to its row.
         using (var command = Sqlite.Command(connection, transaction,
             """
             DELETE FROM set_aside WHERE aside_id IN (
@@ -1241,10 +1283,10 @@ internal sealed class SubscriberStore : IAsyncDisposable
             dropped = command.ExecuteNonQuery();
         }
 
-        // Recorded in the same write that destroyed them. A count held in memory is a count a close or a
-        // crash takes with it, and what it was counting is loss nobody can reconstruct afterwards: the
-        // rows are gone. Kept in the file, it belongs to the subscriber rather than to whichever object
-        // happened to be settling at the time, and the next pass reports it whoever runs it.
+        // The count is recorded in the write that destroyed the rows. A close or a crash loses a count held
+        // in memory. Nobody can reconstruct that loss afterwards, because the rows are gone. In the file, the
+        // count belongs to the subscriber, whatever object settled at the time. The next pass reports it,
+        // whoever runs that pass.
         if (dropped > 0)
             Bump(connection, transaction, DroppedKey(topic), dropped);
 
@@ -1252,14 +1294,15 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// What has happened to this subscriber's set-aside store since anyone last asked: deferrals aged into
-    /// dead letters, and dead letters destroyed by a bound.
+    /// The changes to this subscriber's set-aside store since the last call: deferrals aged into dead
+    /// letters, and dead letters destroyed by a bound.
     /// </summary>
     /// <remarks>
-    /// Read and reset in one write, so two passes cannot both report the same numbers and a pass that reports
-    /// them cannot leave them behind to be reported again. The two are taken together because both are now
-    /// counted the same way — by whatever did the work, in the write that did it — and a pass that took one
-    /// from the file and the other from a local variable lost the local one every time it failed part-way.
+    /// One write reads and resets both counters. Thus two passes cannot report the same numbers. A pass that
+    /// reports the numbers also clears them, so they are not reported again. The two counters are taken
+    /// together because both are now counted the same way: by the code that did the work, in the write that
+    /// did it. A pass that took one count from the file and the other from a local variable lost the local
+    /// count each time it failed part-way.
     /// </remarks>
     internal async ValueTask<(long AgedOut, long Dropped)> TakeCountersAsync(string topic,
         CancellationToken ct = default)
@@ -1298,7 +1341,7 @@ internal sealed class SubscriberStore : IAsyncDisposable
 
     private static string AgedKey(string topic) => $"deferred_aged:{topic}";
 
-    /// <summary>Everything this subscriber knows about a topic, for checking the invariant in one go.</summary>
+    /// <summary>All that this subscriber knows about a topic, read in one write op to check the invariant.</summary>
     internal async ValueTask<StoreSnapshot> SnapshotAsync(string topic, CancellationToken ct = default)
     {
         long mark = 0;
@@ -1335,14 +1378,14 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// Closes the file and gives back the count this store holds against it.
+    /// Closes the file. Gives back the count that this store holds against the file.
     /// </summary>
     /// <remarks>
-    /// Given back once, whoever gets there first. Two calls that both read a plain flag before either set it
-    /// would each give the same reader back, and the count for this file and topic would reach nothing while a
-    /// sibling subscription was still holding deliveries — which is the one condition that lets the next open
-    /// run crash recovery, handing that sibling's in-flight work to somebody else. Closing twice is a thing
-    /// callers are entitled to do, so it is made safe here rather than asked for.
+    /// The first call gives the count back, once. If two calls both read a plain flag before either set it,
+    /// each would give the same reader back. The count for this file and topic would then reach zero while a
+    /// sibling subscription still held deliveries. A count of zero is the one condition that lets the next
+    /// open run crash recovery. That recovery gives the in-flight work of the sibling to another reader.
+    /// Callers are permitted to close twice, so this method makes a second close safe.
     /// </remarks>
     public async ValueTask DisposeAsync()
     {
@@ -1354,39 +1397,39 @@ internal sealed class SubscriberStore : IAsyncDisposable
     }
 }
 
-/// <summary>Where a subscriber that has never read a topic before begins in it.</summary>
+/// <summary>The start position in a topic for a subscriber with no position in that topic yet.</summary>
 internal readonly record struct StartAt(long Mark, ScheduledFloor Floor);
 
-/// <summary>A subscriber binding itself to one topic, with the position to take if it has none yet.</summary>
+/// <summary>The bind of a subscriber to one topic, with the start position to use if it has no position yet.</summary>
 internal readonly record struct Attachment(string Topic, string LogUuid, StartAt Start);
 
-/// <summary>A subscriber's whole view of one topic at a moment in time.</summary>
+/// <summary>The full view that a subscriber has of one topic at one moment.</summary>
 internal sealed record StoreSnapshot(long Mark, Dictionary<long, EntryState> Entries, List<string> SetAsideOrigins);
 
-/// <summary>What became of a row this subscriber tried to set aside.</summary>
+/// <summary>The result when this subscriber tries to set a row aside.</summary>
 /// <param name="AsideId">The identifier of the set-aside row that was written.</param>
-/// <param name="Kind">What the row was filed as.</param>
-/// <param name="Refused">Nothing was written: what it would have been filed as is something this subscriber
-/// cannot keep, so the caller is told instead of being answered with a row that is already gone.</param>
+/// <param name="Kind">The kind that the row was filed as.</param>
+/// <param name="Refused">Nothing was written. This subscriber cannot keep a row of the kind that it would have
+/// been filed as. The caller gets this refusal, and no answer about a row that is already gone.</param>
 /// <param name="Sizes">
-/// What the dead set held once the write had finished with it, for a subscriber that stops at a bound rather
-/// than trimming to one. Read in the same transaction that filed the row, so the answer the caller acts on is
-/// the one that was true when it landed. Empty for the other overflow policy, which needs no answer.
+/// The contents of the dead set after the write, for a subscriber that stops at a bound. The trim policy
+/// leaves this empty, because it needs no answer. The sizes are read in the transaction that filed the row.
+/// Thus the caller acts on the answer that was true when the row landed.
 /// </param>
 internal readonly record struct SetAsideOutcome(long AsideId, SetAsideKind Kind, bool Refused,
     SetAsideSizes Sizes);
 
-/// <summary>What one subscriber has set aside: a count and a payload total for each of the two sets.</summary>
+/// <summary>The set-aside store of one subscriber: a count and a payload total for each of the two sets.</summary>
 /// <param name="Deferred">Deferred messages held.</param>
 /// <param name="Dead">Dead letters held, including ones on their way out after a replay.</param>
-/// <param name="DeferredBytes">Payload bytes the deferred messages hold between them.</param>
-/// <param name="DeadBytes">Payload bytes the dead letters hold between them.</param>
+/// <param name="DeferredBytes">The total payload bytes of the deferred messages.</param>
+/// <param name="DeadBytes">The total payload bytes of the dead letters.</param>
 /// <param name="DeadHeld">
-/// Dead letters nobody is working on — the ones parked in the set rather than on their way out of it. A
-/// subscriber that stops at a full dead set counts these, not every dead row: replay is the documented way to
-/// clear the stop, and a replayed row that still counted would leave the subscriber stopped against the only
-/// remedy it has.
+/// Dead letters that are parked in the set, with no work on them. A replayed dead letter is on its way out,
+/// and this count excludes it. A subscriber that stops at a full dead set counts only these rows. Replay is
+/// the documented way to clear the stop. If a replayed row still counted, the subscriber would stay stopped
+/// after its only remedy.
 /// </param>
-/// <param name="DeadHeldBytes">Payload bytes those parked dead letters hold between them.</param>
+/// <param name="DeadHeldBytes">The total payload bytes of those parked dead letters.</param>
 internal readonly record struct SetAsideSizes(long Deferred, long Dead, long DeferredBytes, long DeadBytes,
     long DeadHeld, long DeadHeldBytes);

@@ -3,8 +3,8 @@ using Microsoft.Data.Sqlite;
 namespace SoEx.Messaging.Chimera.Internal;
 
 /// <summary>
-/// The topic file's schema, and the identity stamped into it. The schema is readable by anything that can open
-/// SQLite, which is a feature, so treat it as an interface and change it deliberately.
+/// The schema of the topic file, and the identity stamped into it. Any tool that can open SQLite can read the
+/// schema. This is a feature. Treat the schema as an interface, and change it deliberately.
 /// </summary>
 internal static class TopicSchema
 {
@@ -66,16 +66,16 @@ internal static class TopicSchema
     }
 
     /// <summary>
-    /// Refuses a file a later version of this library wrote, rather than opening it and appending into a
-    /// layout this version does not know.
+    /// Refuses a file that a later version of this library wrote. This version does not know that layout, and does
+    /// not open the file or append into it.
     /// </summary>
     /// <remarks>
-    /// The reader has always refused one (<see cref="TopicReader.TryOpen"/>), and refusing there alone left
-    /// the gap on the side that can do damage: the publisher holds the only connection that writes, and
-    /// without this it created its tables into whatever was there and stamped the version back down to its
-    /// own. A file with no version recorded is not treated as newer, the same leniency the subscriber file
-    /// has and for the same reason: either this library has not written it yet, or something outside it has,
-    /// and the schema below builds both into shape.
+    /// The reader always refused such a file (<see cref="TopicReader.TryOpen"/>). A refusal there alone left a gap
+    /// on the side that can do damage. The publisher holds the only connection that writes. Without this check, the
+    /// publisher created its tables into the existing layout and stamped the version back down to its own. A file
+    /// with no recorded version does not count as newer. The subscriber file has the same leniency, for the same
+    /// reason: either this library has not written the file yet, or something outside the library has. The schema
+    /// below brings both into shape.
     /// </remarks>
     internal static void EnsureNotNewer(SqliteConnection connection, SqliteTransaction? transaction, string topic)
     {
@@ -116,13 +116,13 @@ internal static class TopicSchema
     }
 
     /// <summary>
-    /// Reads identity from a log opened read-only, or null if the file is not ready to be read yet.
+    /// Reads the identity from a log opened read-only. Returns null if the file is not ready to read.
     /// </summary>
     /// <remarks>
-    /// A publisher creates the file when it opens the connection and commits the schema afterwards, so there is
-    /// a window where the file exists and contains nothing. A subscriber that arrives in that window must wait,
-    /// not fail: the topic is being created, which is a normal thing for it to be doing. Because the schema and
-    /// the identity are written in one transaction, an identity that is readable means the whole schema is.
+    /// A publisher creates the file when it opens the connection, and commits the schema after that. Thus, for a
+    /// period, the file exists and is empty. A subscriber that arrives in that period must wait, and must not fail.
+    /// The topic is in creation, which is a normal state. The schema and the identity are written in one
+    /// transaction. Thus a readable identity means that the whole schema is readable.
     /// </remarks>
     internal static (string Uuid, int SchemaVersion)? TryReadIdentity(SqliteConnection connection)
     {
@@ -137,9 +137,9 @@ internal static class TopicSchema
         if (uuid is null)
             return null;
 
-        // Tolerant in the same direction as the guard above: a version nobody can parse is treated as absent
-        // rather than thrown from, because the file this reads may be one something else wrote and a caller
-        // asking whether a log is ready should get an answer from the library's own vocabulary.
+        // Tolerant in the same direction as the guard above. A version that nobody can parse counts as absent, and
+        // the method does not throw. The file can be one that something else wrote. A caller that asks if a log is
+        // ready gets an answer in the terms of this library.
         string? version = Get(connection, null, MetaSchemaVersion);
         return (uuid, int.TryParse(version, out int parsed) ? parsed : 0);
     }

@@ -4,15 +4,15 @@ using Microsoft.Data.Sqlite;
 namespace SoEx.Messaging.Chimera.Internal;
 
 /// <summary>
-/// The one writer for one file. Callers queue work and await their own result; the loop drains whatever is
-/// waiting and commits it in a single transaction, so a burst of concurrent appends costs one commit rather
-/// than one each.
+/// The one writer for one file. Callers queue work and await their own result. The loop drains all waiting work and
+/// commits it in a single transaction. Thus a burst of concurrent appends costs one commit for the burst, and not
+/// one commit for each append.
 /// </summary>
 /// <remarks>
-/// A batch is all-or-nothing: if one operation throws, the transaction is rolled back and nothing in that batch
-/// committed. The caller whose operation threw gets that exception unchanged, because it may well be a
-/// deliberate refusal it is expected to catch. The others are told plainly that someone else's failure took
-/// their write with it, which is the truth and is not something they could have caused.
+/// A batch is all-or-nothing. If one operation throws, the writer rolls back the transaction, and no part of that
+/// batch commits. The caller whose operation threw gets that exception unchanged, because it can be a deliberate
+/// refusal that the caller expects to catch. The other callers get a clear message: the failure of a different
+/// write took their write with it. This is true, and those callers could not cause it.
 /// </remarks>
 internal sealed class SingleWriter : IAsyncDisposable
 {
@@ -32,9 +32,9 @@ internal sealed class SingleWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Queues work and completes when it is durable. Cancellation is checked before the work is queued and not
-    /// afterwards: once it is in the queue it will be attempted, because reporting a cancelled append that in
-    /// fact committed would be a lie the caller could not detect.
+    /// Queues work and completes when the work is durable. The method checks cancellation only before it queues the
+    /// work. Queued work always gets an attempt. A report of a cancelled append that in fact committed is false,
+    /// and the caller cannot detect it.
     /// </summary>
     internal async ValueTask<long> EnqueueAsync(
         Func<SqliteConnection, SqliteTransaction, long> execute, CancellationToken cancellationToken)
@@ -67,18 +67,18 @@ internal sealed class SingleWriter : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Nothing above should get here — a failing batch is answered inside RunBatch — but a loop that
-            // ends without saying so is the worst failure this class has: every caller in the batch waits on a
-            // result that will never be set, and every later caller queues work nobody will ever drain. So the
-            // loop ending for any other reason is turned into an answer for everyone rather than a silence.
+            // RunBatch answers a failed batch, so no exception from the code above is expected here. A loop that
+            // ends silently is the worst failure of this class. Every caller in the batch waits on a result that
+            // never comes, and every later caller queues work that nothing drains. Thus any other end of the loop
+            // becomes an answer for every caller.
             Poison(ex, batch);
         }
     }
 
     /// <summary>
-    /// Stops the writer and tells everyone waiting on it. Called only when the loop itself has failed, which
-    /// is not a state anything can carry on from: the connection is in an unknown condition and there is
-    /// nobody left to run the queue.
+    /// Stops the writer and tells every waiting caller. The loop calls it only when the loop itself has failed. The
+    /// writer cannot continue from that state: the condition of the connection is unknown, and nothing is left to
+    /// run the queue.
     /// </summary>
     private void Poison(Exception cause, List<WriteOp> batch)
     {
@@ -101,9 +101,9 @@ internal sealed class SingleWriter : IAsyncDisposable
         int offender = -1;
         Exception? cause = null;
 
-        // Inside the try, because it can fail too — a broken connection or a disk error can surface at BEGIN
-        // rather than at the statement that follows, and a throw from here used to leave the loop and take
-        // every waiting caller with it in silence.
+        // BEGIN is inside the try because it can fail too. A broken connection or a disk error can surface at
+        // BEGIN, before the next statement. In an earlier version, a throw from here left the loop, and every
+        // waiting caller got no answer.
         SqliteTransaction? transaction = null;
         try
         {
@@ -130,8 +130,7 @@ internal sealed class SingleWriter : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Beginning or committing failed, so nobody in the batch is at fault and everybody gets the same
-            // answer.
+            // BEGIN or COMMIT failed. No operation in the batch caused it, so every caller gets the same answer.
             cause = ex;
             offender = -1;
             if (transaction is not null)
@@ -161,14 +160,14 @@ internal sealed class SingleWriter : IAsyncDisposable
     private static void Rollback(SqliteTransaction transaction)
     {
         try { transaction.Rollback(); }
-        catch { /* the connection is already unhappy; there is nothing useful to add */ }
+        catch { /* the connection already has a fault. A second error adds no useful information. */ }
     }
 
     public async ValueTask DisposeAsync()
     {
         _queue.Writer.TryComplete();
         try { await _loop.ConfigureAwait(false); }
-        catch { /* a loop that failed has already answered everyone it left waiting */ }
+        catch { /* a failed loop has already answered every caller that it left waiting */ }
 
         while (_queue.Reader.TryRead(out WriteOp? stranded))
             stranded.Completion.TrySetException(new ChimeraException("The store was closed before the write ran."));

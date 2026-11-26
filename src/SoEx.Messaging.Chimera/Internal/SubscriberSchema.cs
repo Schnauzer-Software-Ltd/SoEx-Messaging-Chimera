@@ -2,38 +2,38 @@ using Microsoft.Data.Sqlite;
 
 namespace SoEx.Messaging.Chimera.Internal;
 
-/// <summary>What a delivery is doing right now.</summary>
+/// <summary>The current state of a delivery.</summary>
 internal enum EntryState
 {
     InFlight = 0,
 
-    /// <summary>Finished with, however it finished. Completed, deferred and dead all land here, because as far
-    /// as the position is concerned there is nothing left to do about the message.</summary>
+    /// <summary>Finished, by any path. Completed, deferred and dead messages all go to this state. For the
+    /// position, nothing remains to do for the message.</summary>
     Complete = 1,
 
     /// <summary>
-    /// Handed back after a failure and waiting to be delivered again. The row stays only to carry the attempt
-    /// count: delete it and a message that fails forever would be retried forever, with the counter starting
-    /// again on every delivery.
+    /// Given back after a failure, and waits for a new delivery. The row stays only to hold the attempt count. If
+    /// the row is deleted, a message that always fails gets retries forever, because the counter starts again on
+    /// each delivery.
     /// </summary>
     Available = 2,
 }
 
-/// <summary>Where a set-aside row is in its own small lifecycle.</summary>
+/// <summary>The state of a set-aside row in its small lifecycle.</summary>
 internal enum SetAsideDelivery
 {
-    /// <summary>Sitting there. Nothing will deliver it until someone asks.</summary>
+    /// <summary>Stored. Nothing delivers it until a caller asks for it.</summary>
     Held = 0,
 
-    /// <summary>Replay was asked for; the next read picks it up.</summary>
+    /// <summary>Replay was requested. The next read picks it up.</summary>
     Ready = 1,
 
-    /// <summary>Being delivered now. Reset to <see cref="Ready"/> when the store is opened, since whoever held
-    /// it is gone.</summary>
+    /// <summary>In delivery now. The store resets it to <see cref="Ready"/> when the store opens, because the
+    /// previous holder is gone.</summary>
     InFlight = 2,
 }
 
-/// <summary>The subscriber file's schema. One file per subscriber, written only by that subscriber.</summary>
+/// <summary>The schema of the subscriber file. One file per subscriber. Only that subscriber writes it.</summary>
 internal static class SubscriberSchema
 {
     internal const int Version = 1;
@@ -112,14 +112,14 @@ internal static class SubscriberSchema
     }
 
     /// <summary>
-    /// Refuses a file a later version of this library wrote, rather than opening it and guessing at a layout
-    /// this version does not know.
+    /// Refuses a file that a later version of this library wrote. This version does not open the file, and does not
+    /// guess at a layout that it does not know.
     /// </summary>
     /// <remarks>
-    /// The same rule the topic file has had, and for a stronger reason: this file holds positions. Reading one
-    /// under the wrong layout does not fail, it answers — and a wrong answer here redelivers everything or
-    /// skips it. A file with no version recorded is not treated as newer: either this library has not written
-    /// it yet, or something outside it has, and both are cases the schema below rebuilds into shape.
+    /// The topic file has the same rule. The reason here is stronger: this file holds positions. A read under the
+    /// wrong layout does not fail. It gives an answer, and a wrong answer here redelivers everything or skips it. A
+    /// file with no recorded version does not count as newer. Either this library has not written it yet, or
+    /// something outside the library has. In both cases the schema below rebuilds the file into shape.
     /// </remarks>
     internal static void EnsureNotNewer(SqliteConnection connection, SqliteTransaction? transaction,
         string subscriber)
