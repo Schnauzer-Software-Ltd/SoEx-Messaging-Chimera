@@ -133,7 +133,7 @@ about one message always agree on whether work runs.
    message. The row that holds that count is deleted when the position absorbs it. This deletion keeps the
    subscriber file from growing with the log.
 
-## What these cannot tell you: that nothing was lost
+## Limits of the inspector
 
 `ChimeraInspector.Overview` and `ChimeraInspector.StatusOf` read the files as they are now. When Chimera
 destroys a message, it also destroys the records that show the message existed. Thus `Completed` and

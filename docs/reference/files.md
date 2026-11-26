@@ -16,13 +16,13 @@ escapes each upper-case letter, and `Orders` and `orders` stay two topics on all
 A name of only lower-case ASCII letters, digits, `-` and `_` is its own filename. Each other character becomes
 an escape of up to five characters. Allow for this length if you have long names and a path limit.
 
-## One writer, any number of readers
+## Writers and readers
 
 The whole design depends on this rule: each file has one writer. Thus SQLite's single-writer limit never
 applies. No lease or visibility timeout is necessary. Only one subscriber in one process can hold a lock. When
 that process stops, its lock goes with it.
 
-### The rule is yours to keep
+### Enforcing the rule
 
 You must keep to the one-writer rule. Chimera does not refuse a second writer. This is by design.
 
@@ -41,7 +41,7 @@ These methods differ in these properties:
 
 Choose the method that fits your system. The measurement below shows the result of a broken rule.
 
-### A broken rule gives duplicate handling
+### Two writers on one file
 
 In a measurement, two processes read one topic through the *same* subscriber file. They handled 200 messages
 in about 210 deliveries. No message was lost, and the file was readable after the test.

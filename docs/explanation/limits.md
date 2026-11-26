@@ -1,4 +1,4 @@
-# Limits, and how you find out
+# Limits
 
 Chimera has three operating rules:
 
@@ -23,7 +23,7 @@ processes on one subscriber file handled 200 messages in about 210 deliveries. N
 file stayed readable. The result of the break is duplicate handling, which at-least-once delivery
 permits. Thus a break of this rule can go unnoticed. Keep one writer on each file.
 
-## Messages can be removed before they are read
+## Retention
 
 Retention removes records from the log by age, size or count, read or unread. Retention does not wait for
 the slowest subscriber. Thus one stuck subscriber cannot stop writes to the topic.
@@ -31,13 +31,13 @@ the slowest subscriber. Thus one stuck subscriber cannot stop writes to the topi
 Chimera bounds each loss, names the subscriber that had the loss, and reports it at three times: before,
 during and after the retention pass.
 
-### Before a loss: lag
+### Lag
 
 `LagAsync` gives the lag of one subscriber as a count and as a duration. Use the duration to compare the
 lag with a retention policy written in hours. The lag includes the scheduled table and the log, because
 the age bound removes rows from both. Set an alarm for when the lag approaches the retention window.
 
-### During a retention pass: the retention report
+### Retention report
 
 `ApplyRetentionAsync` reads the subscriber files. Its report names each subscriber that had not reached
 the removed records, and the count that each subscriber lost. Log this report at warning level.
@@ -46,7 +46,7 @@ The report counts from the position of each subscriber. It can thus name a subsc
 message that the subscriber later completes. This count is the view of the log from outside. The
 subscriber's report, `MessagesLostException`, knows the result of each delivery.
 
-### After a loss: `MessagesLostException`
+### `MessagesLostException`
 
 On its next read, the subscriber throws `MessagesLostException`. The exception gives the count and the
 range of sequences. The count includes:
@@ -103,7 +103,7 @@ can replace:
 
 `SubscriptionOptions.Start` applies once, when Chimera first records the position.
 
-## A full dead-letter set
+## Dead-letter bound
 
 By default (`DeadLetterOverflow.StopDelivering`), a subscriber with a full dead-letter set stops delivery
 until somebody acts. No message is
@@ -140,13 +140,13 @@ Replayed rows are not exempt. `MaxInFlight` caps in-flight deliveries, so their 
 known amount of slack. No cap limits how many rows can be made ready at once. An exemption for those rows
 would let a caller that replays a whole set disable the bound.
 
-### How you find out
+### Dropped dead letters
 
 `SetAsideReport.DeadDropped` counts each destroyed dead letter. The count is durable and survives the
 process. The next pass that asks reports it. If you need a guarantee that no dead letter is destroyed, use
 `StopDelivering`.
 
-## Scheduled messages stay in the file after they are delivered
+## Scheduled messages
 
 A scheduled message stays in the scheduled table of the topic file. It does not move into the log.
 Delivery does not remove it. Only retention removes these rows, for two reasons:
@@ -214,7 +214,7 @@ subscriber has passed, and nobody would receive it. Service Bus reads a past sch
 same way. Chimera reads the due time when it commits the row, not when the call occurs. Thus a publisher
 with writes queued behind a burst cannot put a row under a position that moved in the meantime.
 
-## A crash loses nothing that was acknowledged
+## Crashes
 
 `AppendAsync` returns when the record is durable. The default setting survives a process crash, but not
 a power cut. `Durability.PowerLoss` adds an fsync per commit and also survives a power cut.
@@ -222,7 +222,7 @@ a power cut. `Durability.PowerLoss` adds an fsync per commit and also survives a
 A delivery that a crash interrupts comes back. Chimera counts it. A message that crashes the process is
 dead-lettered. Chimera does not retry it for ever.
 
-## Delivery order is not guaranteed
+## Delivery order
 
 Append order is total and stable. Delivery order can differ from append order for two reasons:
 
@@ -232,7 +232,7 @@ Append order is total and stable. Delivery order can differ from append order fo
 Service Bus and JetStream make the same distinction. Code written for Chimera thus continues to work
 when you move to one of them. If you need ordering, use one of them, or a workflow.
 
-## Retries and waits
+## Retries
 
 A failed message comes back at once, up to a limit. A deferred message stays deferred until you request
 it. For a durable wait, use a durable workflow.
@@ -242,7 +242,7 @@ before it reads again. The wait uses `ChimeraOptions.Clock`, as all the time rea
 This matters if you supply a clock that you control. No timer runs per message. Nothing starts in order
 to deliver one particular message.
 
-## A clock that goes backwards
+## Clock changes
 
 Each file stamps a record with a time no earlier than the newest time it has recorded. Chimera reads that
 time from the file when it opens the file. An NTP correction or a resumed virtual machine thus cannot
@@ -259,7 +259,7 @@ catches up. It is late by the size of the step. No message is dropped or hidden.
 The rule holds within one file. Processes that write different files in one root directory use separate
 clocks. No single file can put the stamps of two clocks in order. This is the one-machine rule again.
 
-## Deleting is not erasing
+## Erasure
 
 Retention removes records from the database. The old content stays on the disk for a time:
 

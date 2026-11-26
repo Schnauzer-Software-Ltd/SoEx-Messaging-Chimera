@@ -1,4 +1,4 @@
-# Why a log and not a queue
+# The log model
 
 A Chimera topic is a log. The log has these rules:
 
@@ -33,5 +33,5 @@ A poison message becomes a dead letter of one subscriber. The other subscribers 
 Retention removes messages by policy, read or unread. It does not collect the positions of the
 subscribers first. Thus a stopped subscriber cannot stop the publisher.
 
-Retention can remove a message before a subscriber reads it. [Limits, and how you find out](limits.md)
-describes this loss and how you find out about it.
+Retention can remove a message before a subscriber reads it. [Limits](limits.md)
+describes this loss and how Chimera reports it.

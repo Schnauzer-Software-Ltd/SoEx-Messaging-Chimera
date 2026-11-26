@@ -68,7 +68,7 @@ Rules and limits:
 - Consume throughput is about 800 messages a second with 16 in flight, on a 4-core machine. Publish
   throughput is close to NATS JetStream.
 
-[Limits, and how you find out](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/limits.md) gives the detail.
+[Limits](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/limits.md) gives the detail.
 
 ## Packages
 
@@ -88,8 +88,8 @@ Chimera is a standalone library. The SoEx event transport for Chimera is `SoEx.T
 - [Testing a system built on Chimera](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/how-to/testing.md)
 - [API reference](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/reference/api.md)
 - [Files on disk](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/reference/files.md)
-- [Why a log and not a queue](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/log-not-queue.md)
-- [Limits, and how you find out](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/limits.md)
+- [The log model](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/log-not-queue.md)
+- [Limits](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/blob/main/docs/explanation/limits.md)
 
 ## Status
 

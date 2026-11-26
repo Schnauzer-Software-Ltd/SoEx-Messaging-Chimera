@@ -82,7 +82,7 @@ processes is a supported layout. Tests use this layout. Each of these files has 
 If two processes write the same subscriber file, some messages are handled twice. The file is not damaged. In a
 measurement, 200 messages gave about 210 deliveries, and none were lost.
 
-You must enforce the one-writer rule. [Files](files.md#one-writer-any-number-of-readers) gives the reason that
+You must enforce the one-writer rule. [Files](files.md#writers-and-readers) gives the reason that
 Chimera does not enforce it.
 
 Chimera resolves root paths before it compares them. Thus `/var/events` and `/var/./events` are the same root,
