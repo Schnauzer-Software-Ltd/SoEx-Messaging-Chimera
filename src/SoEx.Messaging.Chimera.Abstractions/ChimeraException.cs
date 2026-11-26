@@ -3,7 +3,13 @@ namespace SoEx.Messaging.Chimera;
 /// <summary>Base for every failure this library raises deliberately.</summary>
 public class ChimeraException : Exception
 {
+    /// <summary>Creates the exception with a message that says what failed.</summary>
+    /// <param name="message">What failed, for the person reading the log.</param>
     public ChimeraException(string message) : base(message) { }
+
+    /// <summary>Creates the exception with a message and the failure that caused it.</summary>
+    /// <param name="message">What failed, for the person reading the log.</param>
+    /// <param name="inner">The exception that caused this one.</param>
     public ChimeraException(string message, Exception inner) : base(message, inner) { }
 }
 
@@ -14,6 +20,8 @@ public class ChimeraException : Exception
 /// </summary>
 public sealed class LogIdentityException : ChimeraException
 {
+    /// <summary>Creates the exception with a message that names the subscriber and the log.</summary>
+    /// <param name="message">What does not match, for the person reading the log.</param>
     public LogIdentityException(string message) : base(message) { }
 }
 
@@ -28,6 +36,13 @@ public sealed class LogIdentityException : ChimeraException
 /// </remarks>
 public sealed class MessagesLostException : ChimeraException
 {
+    /// <summary>Creates the exception with a message built from its values.</summary>
+    /// <param name="topic">The topic the messages were removed from.</param>
+    /// <param name="subscriber">The subscriber that was owed them.</param>
+    /// <param name="count">How many messages were lost.</param>
+    /// <param name="from">The first sequence or identifier in the range the loss was found in.</param>
+    /// <param name="to">The last sequence or identifier in that range.</param>
+    /// <param name="scheduled">True when the loss was in the scheduled table.</param>
     public MessagesLostException(string topic, string subscriber, long count, long from, long to,
         bool scheduled = false)
         : base(Describe(topic, subscriber, count, from, to, scheduled))
@@ -40,8 +55,13 @@ public sealed class MessagesLostException : ChimeraException
         Scheduled = scheduled;
     }
 
+    /// <summary>The topic the messages were removed from.</summary>
     public string Topic { get; }
+
+    /// <summary>The subscriber that was owed them.</summary>
     public string Subscriber { get; }
+
+    /// <summary>How many messages this subscriber lost.</summary>
     public long Count { get; }
 
     /// <summary>
@@ -75,6 +95,10 @@ public sealed class MessagesLostException : ChimeraException
 /// </summary>
 public sealed class PayloadTooLargeException : ChimeraException
 {
+    /// <summary>Creates the exception with a message built from its values.</summary>
+    /// <param name="topic">The topic the payload was published to.</param>
+    /// <param name="size">The size of the payload, in bytes.</param>
+    /// <param name="limit">The topic's payload limit, in bytes.</param>
     public PayloadTooLargeException(string topic, int size, int limit)
         : base($"A payload of {size} bytes exceeds the {limit}-byte limit on topic '{topic}'.")
     {
@@ -83,15 +107,23 @@ public sealed class PayloadTooLargeException : ChimeraException
         Limit = limit;
     }
 
+    /// <summary>The topic the payload was published to.</summary>
     public string Topic { get; }
+
+    /// <summary>The size of the payload, in bytes.</summary>
     public int Size { get; }
+
+    /// <summary>The topic's payload limit, in bytes.</summary>
     public int Limit { get; }
 }
 
 /// <summary>Which kind of limit a store reached: how many rows it holds, or how many bytes.</summary>
 public enum SizeBound
 {
+    /// <summary>The bound is on the number of rows.</summary>
     Count = 0,
+
+    /// <summary>The bound is on the payload bytes the rows hold between them.</summary>
     Bytes = 1,
 }
 
@@ -102,6 +134,13 @@ public enum SizeBound
 /// </summary>
 public sealed class SubscriberStoppedException : ChimeraException
 {
+    /// <summary>Creates the exception with a message built from its values.</summary>
+    /// <param name="topic">The topic the subscriber has stopped reading.</param>
+    /// <param name="subscriber">The subscriber that has stopped.</param>
+    /// <param name="deadLetters">How many dead letters it holds.</param>
+    /// <param name="deadBytes">The payload bytes they hold between them.</param>
+    /// <param name="limit">The limit that was reached, in the units of <paramref name="bound"/>.</param>
+    /// <param name="bound">Which bound was reached.</param>
     public SubscriberStoppedException(string topic, string subscriber, long deadLetters, long deadBytes,
         long limit, SizeBound bound)
         : base(Describe(topic, subscriber, deadLetters, deadBytes, limit, bound))
@@ -114,7 +153,10 @@ public sealed class SubscriberStoppedException : ChimeraException
         Bound = bound;
     }
 
+    /// <summary>The topic the subscriber has stopped reading.</summary>
     public string Topic { get; }
+
+    /// <summary>The subscriber that has stopped.</summary>
     public string Subscriber { get; }
 
     /// <summary>Dead letters held, whichever bound stopped the subscriber.</summary>
@@ -126,6 +168,7 @@ public sealed class SubscriberStoppedException : ChimeraException
     /// <summary>The limit that was reached, in the units of <see cref="Bound"/>.</summary>
     public long Limit { get; }
 
+    /// <summary>Which bound was reached: the number of dead letters, or their bytes.</summary>
     public SizeBound Bound { get; }
 
     private static string Describe(string topic, string subscriber, long deadLetters, long deadBytes,
@@ -159,6 +202,11 @@ public sealed class SubscriberStoppedException : ChimeraException
 /// </remarks>
 public sealed class DeadLetterTooLargeException : ChimeraException
 {
+    /// <summary>Creates the exception with a message built from its values.</summary>
+    /// <param name="topic">The topic the delivery came from.</param>
+    /// <param name="subscriber">The subscriber that tried to file the dead letter.</param>
+    /// <param name="size">The size of the message's payload, in bytes.</param>
+    /// <param name="limit">The subscriber's dead-letter byte bound.</param>
     public DeadLetterTooLargeException(string topic, string subscriber, int size, long limit)
         : base($"Subscriber '{subscriber}' cannot file a {size}-byte dead letter on topic '{topic}': its " +
                $"dead-letter bound is {limit} bytes and it drops the oldest to stay inside it, so this one " +
@@ -172,9 +220,16 @@ public sealed class DeadLetterTooLargeException : ChimeraException
         Limit = limit;
     }
 
+    /// <summary>The topic the delivery came from.</summary>
     public string Topic { get; }
+
+    /// <summary>The subscriber that tried to file the dead letter.</summary>
     public string Subscriber { get; }
+
+    /// <summary>The size of the message's payload, in bytes.</summary>
     public int Size { get; }
+
+    /// <summary>The subscriber's dead-letter byte bound, which the message exceeds on its own.</summary>
     public long Limit { get; }
 }
 
@@ -193,6 +248,12 @@ public sealed class DeadLetterTooLargeException : ChimeraException
 /// </remarks>
 public sealed class ScheduleRefusedException : ChimeraException
 {
+    /// <summary>Creates the exception with a message built from its values.</summary>
+    /// <param name="topic">The topic the message was scheduled on.</param>
+    /// <param name="scheduled">Scheduled messages the topic holds that are not yet due.</param>
+    /// <param name="bytes">The payload bytes those messages hold between them.</param>
+    /// <param name="limit">The limit that was reached, in the units of <paramref name="bound"/>.</param>
+    /// <param name="bound">Which bound was reached.</param>
     public ScheduleRefusedException(string topic, long scheduled, long bytes, long limit, SizeBound bound)
         : base(bound == SizeBound.Bytes
             ? $"Topic '{topic}' is holding {bytes} bytes of scheduled messages that are not yet due, which " +
@@ -209,6 +270,7 @@ public sealed class ScheduleRefusedException : ChimeraException
         Bound = bound;
     }
 
+    /// <summary>The topic the message was scheduled on.</summary>
     public string Topic { get; }
 
     /// <summary>
@@ -224,5 +286,6 @@ public sealed class ScheduleRefusedException : ChimeraException
     /// <summary>The limit that was reached, in the units of <see cref="Bound"/>.</summary>
     public long Limit { get; }
 
+    /// <summary>Which bound was reached: the number of scheduled messages, or their bytes.</summary>
     public SizeBound Bound { get; }
 }

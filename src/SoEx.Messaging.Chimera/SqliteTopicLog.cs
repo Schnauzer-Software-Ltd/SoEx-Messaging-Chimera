@@ -25,6 +25,7 @@ public sealed class SqliteTopicLog : ITopicLog
         _stamps = stamps;
     }
 
+    /// <inheritdoc/>
     public string Topic { get; }
 
     /// <summary>The file backing this topic. Open it read-only with any tool; it will not disturb anything.</summary>
@@ -36,6 +37,15 @@ public sealed class SqliteTopicLog : ITopicLog
     /// </summary>
     public string LogUuid { get; }
 
+    /// <summary>Opens the writer for <paramref name="topic"/>. The first open creates the topic's file.</summary>
+    /// <remarks>
+    /// Share one instance per topic per process. Each file has one writer. A second writer on the same file
+    /// shows up as lock contention.
+    /// </remarks>
+    /// <param name="topic">The topic's name.</param>
+    /// <param name="options">The root directory and the settings shared by every topic and subscriber under it.</param>
+    /// <param name="topicOptions">Settings for this topic. The defaults apply if this is null.</param>
+    /// <returns>The open log. Dispose it to close it.</returns>
     public static SqliteTopicLog Open(string topic, ChimeraOptions options, TopicOptions? topicOptions = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(topic);
@@ -94,6 +104,7 @@ public sealed class SqliteTopicLog : ITopicLog
         }
     }
 
+    /// <inheritdoc/>
     public ValueTask<long> AppendAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
         EnsureWithinLimit(payload);
@@ -117,6 +128,7 @@ public sealed class SqliteTopicLog : ITopicLog
         }, cancellationToken);
     }
 
+    /// <inheritdoc/>
     public async ValueTask<long> ScheduleAsync(ReadOnlyMemory<byte> payload, DateTimeOffset dueAt,
         CancellationToken cancellationToken = default)
     {
@@ -222,6 +234,7 @@ public sealed class SqliteTopicLog : ITopicLog
             : null;
     }
 
+    /// <inheritdoc/>
     public async ValueTask<bool> CancelScheduledAsync(long scheduledId, CancellationToken cancellationToken = default)
     {
         long removed = await _writer.EnqueueAsync((connection, transaction) =>
@@ -235,6 +248,7 @@ public sealed class SqliteTopicLog : ITopicLog
         return removed > 0;
     }
 
+    /// <inheritdoc/>
     public async ValueTask<IReadOnlyList<SubscriberPosition>> InspectSubscribersAsync(
         CancellationToken cancellationToken = default)
     {
@@ -244,6 +258,7 @@ public sealed class SqliteTopicLog : ITopicLog
         return SubscriberScan.Positions(_options, Topic, LogUuid, highest);
     }
 
+    /// <inheritdoc/>
     public async ValueTask<RetentionReport> ApplyRetentionAsync(CancellationToken cancellationToken = default)
     {
         RetentionPolicy policy = _topicOptions.Retention;
@@ -376,5 +391,6 @@ public sealed class SqliteTopicLog : ITopicLog
         return result is long l ? l : 0;
     }
 
+    /// <inheritdoc/>
     public ValueTask DisposeAsync() => _writer.DisposeAsync();
 }

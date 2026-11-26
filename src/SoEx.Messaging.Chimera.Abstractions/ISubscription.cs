@@ -84,7 +84,10 @@ public readonly record struct SubscriptionLag(long Behind, TimeSpan? OldestUnrea
 /// </summary>
 public interface ISubscription : IAsyncDisposable
 {
+    /// <summary>The subscriber this subscription reads as. Its position and set-aside messages are stored under this name.</summary>
     string Subscriber { get; }
+
+    /// <summary>The topic this subscription reads.</summary>
     string Topic { get; }
 
     /// <summary>
@@ -128,6 +131,7 @@ public interface ISubscription : IAsyncDisposable
     /// <summary>What this subscriber has set aside. A view over its own store, not a copy in another topic.</summary>
     ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default);
 
+    /// <summary>What this subscriber has dead-lettered. A view over its own store, not a copy in another topic.</summary>
     ValueTask<IReadOnlyList<SetAsideEntry>> DeadLettersAsync(CancellationToken cancellationToken = default);
 
     /// <summary>Makes a set-aside message deliverable again, from its own stored copy.</summary>

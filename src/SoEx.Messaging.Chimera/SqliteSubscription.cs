@@ -176,9 +176,26 @@ public sealed class SqliteSubscription : ISubscription
     /// </summary>
     private static ChimeraException Closed() => new("The store is closed.");
 
+    /// <inheritdoc/>
     public string Subscriber { get; }
+
+    /// <inheritdoc/>
     public string Topic { get; }
 
+    /// <summary>Opens a subscription for <paramref name="subscriber"/> on <paramref name="topic"/>.</summary>
+    /// <remarks>
+    /// The first open records the subscriber's starting position. The subscriber name is a durable identity:
+    /// a new name starts from a new position. If the topic's file is absent, the subscription waits for the
+    /// publisher to create it.
+    /// </remarks>
+    /// <param name="subscriber">The subscriber's name. Its position and set-aside messages are stored under it.</param>
+    /// <param name="topic">The topic to read.</param>
+    /// <param name="options">The root directory and the settings shared by every topic and subscriber under it.</param>
+    /// <param name="subscriptionOptions">Settings for this subscription. The defaults apply if this is null.</param>
+    /// <returns>The open subscription. Dispose it to close it.</returns>
+    /// <exception cref="LogIdentityException">
+    /// The subscriber's stored position belongs to a different incarnation of the log, for example after a restore.
+    /// </exception>
     public static SqliteSubscription Open(string subscriber, string topic, ChimeraOptions options,
         SubscriptionOptions? subscriptionOptions = null)
     {
@@ -281,6 +298,7 @@ public sealed class SqliteSubscription : ISubscription
         return true;
     }
 
+    /// <inheritdoc/>
     public async IAsyncEnumerable<EventEnvelope> ReadAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -709,6 +727,7 @@ public sealed class SqliteSubscription : ISubscription
         return result;
     }
 
+    /// <inheritdoc/>
     public ValueTask CompleteAsync(EventEnvelope envelope, CancellationToken cancellationToken = default)
         => Discard(SettlingAsync(envelope, async () =>
         {
@@ -722,6 +741,7 @@ public sealed class SqliteSubscription : ISubscription
             return true;
         }));
 
+    /// <inheritdoc/>
     public ValueTask<bool> FailAsync(EventEnvelope envelope, string reason,
         CancellationToken cancellationToken = default)
         => SettlingAsync(envelope, async () =>
@@ -794,6 +814,7 @@ public sealed class SqliteSubscription : ISubscription
         return present ?? true;
     }
 
+    /// <inheritdoc/>
     public ValueTask DeferAsync(EventEnvelope envelope, string? reason = null,
         CancellationToken cancellationToken = default)
         => Discard(SettlingAsync(envelope, async () =>
@@ -802,6 +823,7 @@ public sealed class SqliteSubscription : ISubscription
             return true;
         }));
 
+    /// <inheritdoc/>
     public ValueTask DeadLetterAsync(EventEnvelope envelope, string reason,
         CancellationToken cancellationToken = default)
         => Discard(SettlingAsync(envelope, async () =>
@@ -898,6 +920,7 @@ public sealed class SqliteSubscription : ISubscription
         return null;
     }
 
+    /// <inheritdoc/>
     public async ValueTask<SetAsideReport> ApplyRetentionAsync(CancellationToken cancellationToken = default)
     {
         SetAsidePolicy policy = _subscriptionOptions.SetAside;
@@ -933,18 +956,23 @@ public sealed class SqliteSubscription : ISubscription
         return new SetAsideReport(aged, dropped);
     }
 
+    /// <inheritdoc/>
     public async ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default)
         => await _store.ListSetAsideAsync(Topic, SetAsideKind.Deferred, cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc/>
     public async ValueTask<IReadOnlyList<SetAsideEntry>> DeadLettersAsync(CancellationToken cancellationToken = default)
         => await _store.ListSetAsideAsync(Topic, SetAsideKind.Dead, cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc/>
     public ValueTask<bool> ReplayAsync(long asideId, CancellationToken cancellationToken = default)
         => _store.ReplayAsync(asideId, cancellationToken);
 
+    /// <inheritdoc/>
     public ValueTask<bool> DiscardAsync(long asideId, CancellationToken cancellationToken = default)
         => _store.DiscardAsync(asideId, cancellationToken);
 
+    /// <inheritdoc/>
     public async ValueTask<SubscriptionLag> LagAsync(CancellationToken cancellationToken = default)
     {
         if (!await TryAttachAsync(cancellationToken).ConfigureAwait(false))
@@ -976,6 +1004,7 @@ public sealed class SqliteSubscription : ISubscription
             oldest is null ? null : now - oldest.Value, due);
     }
 
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
         try

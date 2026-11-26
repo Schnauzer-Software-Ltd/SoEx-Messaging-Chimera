@@ -71,6 +71,7 @@ public sealed record ChimeraOptions
     /// <summary>Directory holding the topic and subscriber files. Created if absent.</summary>
     public required string RootDirectory { get; init; }
 
+    /// <summary>How durable each commit is. <see cref="Durability.ProcessCrash"/> by default.</summary>
     public Durability Durability { get; init; } = Durability.ProcessCrash;
 
     /// <summary>How long a connection waits for a lock before failing. Also covers checkpointing pauses.</summary>
@@ -115,12 +116,14 @@ public sealed record ChimeraOptions
     /// file knows can order them. One machine is the stated boundary for that reason.
     /// </para>
     /// </remarks>
+    /// <summary>The clock used to stamp records and to decide what is due or old. Replace it in tests.</summary>
     public TimeProvider Clock { get; init; } = TimeProvider.System;
 }
 
 /// <summary>Settings for one topic log.</summary>
 public sealed record TopicOptions
 {
+    /// <summary>When the topic's old records are removed. The defaults of <see cref="RetentionPolicy"/> apply if this is not set.</summary>
     public RetentionPolicy Retention { get; init; } = new();
 
     /// <summary>

@@ -16,6 +16,11 @@ namespace SoEx.Messaging.Chimera;
 /// time for a set-aside one. Lag is measured against this.
 /// </param>
 /// <param name="Attempt">Delivery attempt, starting at 1.</param>
+/// <param name="Payload">The message body, exactly as it was published.</param>
+/// <param name="Tag">
+/// Names this delivery. Pass the envelope back to settle it; the tag is how the subscription knows which
+/// delivery is being settled.
+/// </param>
 public readonly record struct EventEnvelope(
     string MessageId,
     DateTimeOffset EnqueuedAt,

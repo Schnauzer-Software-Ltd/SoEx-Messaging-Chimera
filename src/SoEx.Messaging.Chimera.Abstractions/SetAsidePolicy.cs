@@ -76,6 +76,7 @@ public sealed record SetAsidePolicy
     /// </remarks>
     public long? MaxDeadBytes { get; init; } = 64L * 1024 * 1024;
 
+    /// <summary>The action at a full dead-letter bound. <see cref="DeadLetterOverflow.StopDelivering"/> by default.</summary>
     public DeadLetterOverflow DeadOverflow { get; init; } = DeadLetterOverflow.StopDelivering;
 }
 
@@ -94,5 +95,6 @@ public sealed record SetAsidePolicy
 /// drop-oldest setting is.</param>
 public readonly record struct SetAsideReport(long DeferredAgedOut, long DeadDropped)
 {
+    /// <summary>The pass aged out or dropped at least one message.</summary>
     public bool DidAnything => DeferredAgedOut > 0 || DeadDropped > 0;
 }

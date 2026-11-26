@@ -1364,6 +1364,8 @@ internal readonly record struct Attachment(string Topic, string LogUuid, StartAt
 internal sealed record StoreSnapshot(long Mark, Dictionary<long, EntryState> Entries, List<string> SetAsideOrigins);
 
 /// <summary>What became of a row this subscriber tried to set aside.</summary>
+/// <param name="AsideId">The identifier of the set-aside row that was written.</param>
+/// <param name="Kind">What the row was filed as.</param>
 /// <param name="Refused">Nothing was written: what it would have been filed as is something this subscriber
 /// cannot keep, so the caller is told instead of being answered with a row that is already gone.</param>
 /// <param name="Sizes">
@@ -1375,6 +1377,10 @@ internal readonly record struct SetAsideOutcome(long AsideId, SetAsideKind Kind,
     SetAsideSizes Sizes);
 
 /// <summary>What one subscriber has set aside: a count and a payload total for each of the two sets.</summary>
+/// <param name="Deferred">Deferred messages held.</param>
+/// <param name="Dead">Dead letters held, including ones on their way out after a replay.</param>
+/// <param name="DeferredBytes">Payload bytes the deferred messages hold between them.</param>
+/// <param name="DeadBytes">Payload bytes the dead letters hold between them.</param>
 /// <param name="DeadHeld">
 /// Dead letters nobody is working on — the ones parked in the set rather than on their way out of it. A
 /// subscriber that stops at a full dead set counts these, not every dead row: replay is the documented way to

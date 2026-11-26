@@ -4,15 +4,17 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+    <!-- Ships the XML docs in the packages for IntelliSense. A public member with no comment is a warning, and so
+         a build error under -warnaserror. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
 
   <!-- Package metadata (applied to any project that is packed). -->
   <PropertyGroup>
-    <!-- Prerelease labels are compared as text when they contain a non-digit, and `alpha-N` is a single
-         label: `alpha-10` sorts BELOW `alpha-9`, so the eleventh release would read as a downgrade to
-         anything resolving the newest prerelease. The dot splits it into two labels and the second is
-         purely numeric, which compares numerically. Keep the dot. -->
-    <Version>0.0.0-alpha-1.2</Version>
+    <!-- Prerelease labels are compared as text when they contain a non-digit, so `rc-10` would sort BELOW
+         `rc-9`. In `rc.N` the dot splits the label in two and the second part is purely numeric, which
+         compares numerically. Keep the dot. -->
+    <Version>1.0.0-rc.1</Version>
     <Authors>Schnauzer Software Ltd</Authors>
     <Company>Schnauzer Software Ltd</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

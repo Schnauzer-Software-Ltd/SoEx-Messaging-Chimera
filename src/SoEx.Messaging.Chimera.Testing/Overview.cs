@@ -3,6 +3,8 @@ namespace SoEx.Messaging.Chimera.Testing;
 /// <summary>
 /// What one subscriber is doing about one topic, at the moment it was read.
 /// </summary>
+/// <param name="Subscriber">The subscriber's name.</param>
+/// <param name="Topic">The topic it reads.</param>
 /// <param name="Behind">
 /// Log records published that this subscriber has not finished with. It counts what it is holding right now
 /// as well as what it has not been handed, because the position only moves past a record once that record is
@@ -139,6 +141,10 @@ public enum MessageState
 }
 
 /// <summary>What became of one message, for one subscriber.</summary>
+/// <param name="MessageId">The message asked about.</param>
+/// <param name="Topic">The topic it was published to.</param>
+/// <param name="Subscriber">The subscriber this status is for.</param>
+/// <param name="State">What has become of the message for this subscriber.</param>
 /// <param name="Attempts">
 /// Deliveries so far, as the files still record them. A message that succeeded reports zero: the row carrying
 /// its attempt count is deleted when the position absorbs it, which is what keeps a subscriber's file bounded

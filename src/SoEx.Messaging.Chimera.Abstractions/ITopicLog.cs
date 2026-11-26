@@ -6,6 +6,7 @@ namespace SoEx.Messaging.Chimera;
 /// </summary>
 public interface ITopicLog : IAsyncDisposable
 {
+    /// <summary>The topic this log holds.</summary>
     string Topic { get; }
 
     /// <summary>
@@ -91,6 +92,7 @@ public readonly record struct RetentionReport(
     long ScheduledRemoved,
     IReadOnlyList<SubscriberOvertaken> Overtaken)
 {
+    /// <summary>The pass removed at least one record from the log or the scheduled table.</summary>
     public bool RemovedAnything => LogRecordsRemoved > 0 || ScheduledRemoved > 0;
 
     /// <summary>Somebody lost messages they had not read. Worth a log line at warning, not information.</summary>
@@ -98,9 +100,14 @@ public readonly record struct RetentionReport(
 }
 
 /// <summary>How far a subscriber has got through a topic.</summary>
+/// <param name="Subscriber">The subscriber's name.</param>
+/// <param name="Mark">Its position: the log sequence it has finished with everything up to.</param>
 /// <param name="Behind">Messages between its position and the end of the log.</param>
 public readonly record struct SubscriberPosition(string Subscriber, long Mark, long Behind);
 
+/// <summary>A subscriber that a retention pass removed messages from before it had read them.</summary>
+/// <param name="Subscriber">The subscriber's name.</param>
+/// <param name="Mark">Its position when the pass ran.</param>
 /// <param name="Lost">
 /// Messages removed above this subscriber's position. Measured from the position, which is all a log can see
 /// of a subscriber, so it counts a record whose delivery was out at the time and went on to be completed.
