@@ -72,7 +72,7 @@ A test of one subscription can count messages. A test of several connected compo
 messages between them. That number belongs to the components. If somebody adds a hop, a count assertion
 fails. Assert that the system is at rest. Then assert the results.
 
-`SoEx.Messaging.Chimera.Testing` reads the state of the system from the files. It changes nothing:
+`SoEx.Messaging.Chimera.Testing` reads the state of the system from the files, read-only:
 
 ```csharp
 ChimeraOverview overview = ChimeraInspector.Overview(options);
@@ -91,9 +91,7 @@ if (overview.Settled && overview.DeadLettered == 0)
 2. Read `ChimeraInspector.Overview` until `Settled` is true twice in a row, with a gap between the two reads.
 
    The overview is a snapshot. The system continues to run while the inspector reads it. A handler that has
-   settled its message and is about to publish the next one looks quiet for that instant. If your binding
-   publishes before it settles, this window does not occur. Publish before you settle. This order is the
-   at-least-once shape, and we recommend it.
+   settled its message and is about to publish the next one looks quiet for that instant. A binding that publishes before settling closes this window. Publish first, then settle. This is the recommended at-least-once order.
 
 3. Assert `DeadLettered == 0` as a separate check.
 
@@ -136,22 +134,21 @@ about one message always agree on whether work runs.
 ## Limits of the inspector
 
 `ChimeraInspector.Overview` and `ChimeraInspector.StatusOf` read the files as they are now. When Chimera
-destroys a message, it also destroys the records that show the message existed. Thus `Completed` and
+destroys a message, it also destroys the records that show the message existed. `Completed` and
 `DeadLettered == 0` do not prove that nothing was lost. Each one fails in a different way:
 
 - `Completed` means settled successfully **or destroyed by the dead-letter bound**. A dropped dead letter
   loses the same records as a completed message. After the drop, the two cases look the same.
 - `Unknown` means that the topic holds no record with that id. This covers three cases: a message that was
   never published, a message that log retention removed unread, and a message that this subscriber completed
-  long ago. `StatusOf` starts from the topic file and stops when the record is gone. Thus a successful message
+  long ago. `StatusOf` starts from the topic file and stops when the record is gone. A successful message
   does not always stay `Completed`.
 - `Overview.DeadLettered` counts the dead letters held now. A dead letter that the bound destroyed has left the
   set, so it has also left the count.
 
 ### Assert on the set-aside report
 
-Chimera records each loss. The subscriber file counts each drop and each deferral that ages out, at the time it
-occurs. `ApplyRetentionAsync` returns the two counts:
+Chimera records each loss. The subscriber file counts each drop and each aged-out deferral immediately. `ApplyRetentionAsync` returns the two counts:
 
 ```csharp
 SetAsideReport report = await subscription.ApplyRetentionAsync(ct);
@@ -161,8 +158,7 @@ SetAsideReport report = await subscription.ApplyRetentionAsync(ct);
 
 1. Run the retention passes from the test harness.
 
-   The report is read once and then cleared. The first pass that asks for it gets it. If a maintenance loop
-   also runs passes, the loop can get the report before the test.
+   The report is read once and then cleared, by the first pass that asks. If a maintenance loop also runs passes, the loop can get the report before the test.
 
 2. Assert on the report that nothing was lost.
 
@@ -176,9 +172,7 @@ opt-in. By default, a full dead-letter set stops delivery and destroys nothing.
 1. To fake time, use `FakeTimeProvider` from `Microsoft.Extensions.TimeProvider.Testing`.
 
    Do not use a hand-rolled provider that only answers `GetUtcNow`. A reader waits on this clock when it has
-   nothing to deliver. A provider that does not drive timers leaves that wait on the real clock. The path that
-   wakes the reader at the due time then never runs. A test on such a provider passes only because the poll
-   interval fired. That test does not check what it claims to check.
+   nothing to deliver. A provider without timers leaves that wait on the real clock. The due-time wake-up path then never runs. The test passes only because the poll interval fired.
 
 The correct use of the clock depends on what the test is about.
 
@@ -195,7 +189,7 @@ A fake clock gives no advantage here, and it brings the problem in the next sect
 Examples are a message scheduled for later, retention, and deferred messages that age out. Use a fake clock,
 and obey these rules:
 
-1. Advance the clock only while nothing reads, between one read and the next.
+1. Advance the clock only between reads.
 
    An advance fires only the timers that are already registered. Some tests run several reader loops
    continuously for their full duration. Such a test has no quiet moment. A reader that misses the tick waits

@@ -1,16 +1,13 @@
 # Integrating with a messaging framework
 
-Chimera takes bytes and names. Your binding maps your contracts to topic names and your handlers to consumers.
-Broker clients use the same split: the framework maps a type to a queue name.
-
-A binding has three parts: a shared log per topic, a consume loop, and a declared topic name.
+Chimera publishes and reads byte payloads on named topics. A binding in your messaging framework maps each
+contract to a topic name and each handler to a subscription. It needs three things: one shared topic log per
+topic, a consume loop, and a fixed topic name.
 
 ## Share one log per topic
 
-1. Keep one `SqliteTopicLog` per topic in a shared place.
-
-   Frameworks usually create a new sender object for each call. A topic file permits one writer. If each sender
-   opens its own `SqliteTopicLog`, the file gets several writers.
+A topic file has one writer. Frameworks often create a sender per call, so open each `SqliteTopicLog` once
+and share it:
 
 ```csharp
 static readonly ConcurrentDictionary<string, SqliteTopicLog> Logs = new();
@@ -54,20 +51,13 @@ while (!stopping.IsCancellationRequested)
 }
 ```
 
-1. Catch `MessagesLostException` in an outer loop, outside the `await foreach`.
-
-   The outer loop is necessary. `MessagesLostException` comes from the enumeration itself, and it ends the
-   `await foreach`. If the loop catches exceptions only inside the body, consumption stops the first time
-   retention overtakes the subscriber.
-
-2. Restart the enumeration after the exception.
-
-   A restart loses nothing. Chimera raises the exception once, after the position has moved past the gap.
-
+1. Catch `MessagesLostException` in an outer loop. The exception comes from the enumeration and ends the
+   `await foreach`. A catch inside the loop body does not see it.
+2. Restart the enumeration. Chimera raises the exception once per gap, after the position has moved past it.
 3. Start the loop when your endpoint starts to listen.
 4. Cancel the loop when your endpoint closes.
 
-## Declare the topic name
+## Fix the topic name
 
 1. Take the topic name from configuration or from an attribute.
 2. Do not derive the topic name from a fully-qualified type name.
@@ -75,23 +65,13 @@ while (!stopping.IsCancellationRequested)
    The topic name is a filename. If you move a class to another namespace, the binding points at an empty
    file. The old backlog stays on disk under the old name.
 
-## Encryption and waiting
+## Encryption
 
-### Encryption
+Chimera stores payloads as given. Encrypt sensitive payloads before publication. With one key per
+subject, destroying a key makes that person's data unreadable in place.
 
-Chimera stores payloads as given.
+## Delayed retries
 
-1. Encrypt each message above Chimera.
-
-   At that level, you can scope a key to a subject. When you destroy that key, you erase the data of one
-   person. The store stays as it is.
-
-### Waiting
-
-`FailAsync` makes a message deliverable again at once.
-
-1. To try a message again after a delay, such as five minutes, wait inside the handler.
-
-   The wait holds an in-flight slot.
-
-2. If the wait must survive a restart, put it in a durable workflow.
+`FailAsync` makes a message deliverable again at once. To retry after a delay, such as five minutes, wait
+inside the handler. The wait holds an in-flight slot. For a wait that must survive a restart, use a durable
+workflow.

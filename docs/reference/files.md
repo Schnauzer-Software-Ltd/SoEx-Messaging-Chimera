@@ -1,16 +1,16 @@
 # Files on disk
 
-All Chimera files are in the root directory that you configure. Chimera uses two kinds of file:
+All Chimera files are in the configured root directory. Chimera uses two kinds of file:
 
-- `<topic>.topic.db` holds one topic. Its only writer is the `SqliteTopicLog` that you opened for that topic.
+- `<topic>.topic.db` holds one topic. Its only writer is the topic's `SqliteTopicLog`.
 - `<subscriber>.subscriber.db` holds the positions, in-flight deliveries and set-aside messages of one
-  subscriber, for all the topics that it reads. Its only writer is that subscriber.
+  subscriber, across all its topics. Its only writer is that subscriber.
 
 ## File names
 
 Chimera sanitises each name into a filename. Two different names always get two different files.
 
-Letter case is part of the name. Windows and macOS default to filesystems that ignore case. Thus Chimera
+Letter case is part of the name. Windows and macOS default to filesystems that ignore case. Chimera
 escapes each upper-case letter, and `Orders` and `orders` stay two topics on all platforms.
 
 A name of only lower-case ASCII letters, digits, `-` and `_` is its own filename. Each other character becomes
@@ -18,7 +18,7 @@ an escape of up to five characters. Allow for this length if you have long names
 
 ## Writers and readers
 
-The whole design depends on this rule: each file has one writer. Thus SQLite's single-writer limit never
+The whole design depends on this rule: each file has one writer. SQLite's single-writer limit never
 applies. No lease or visibility timeout is necessary. Only one subscriber in one process can hold a lock. When
 that process stops, its lock goes with it.
 
@@ -47,7 +47,7 @@ In a measurement, two processes read one topic through the *same* subscriber fil
 in about 210 deliveries. No message was lost, and the file was readable after the test.
 
 The result is duplicate handling, with no corruption and no loss. At-least-once delivery already permits
-duplicates, and a handler must tolerate them. Thus the error is easy to make by accident. No crash occurs. The
+duplicates, and a handler must tolerate them. The error is easy to make by accident. No crash occurs. The
 only sign is work done twice.
 
 ### Paths
@@ -70,7 +70,7 @@ grows for as long as you hold the transaction. In a test, two thousand small app
 grew a `-wal` file to 22 MB. A truncating checkpoint reclaimed none of it until the reader finished.
 
 Read-only mode applies only to the database file. SQLite still creates the `-wal` and
-`-shm` sidecar files. Thus the process needs write permission on the directory, though it never writes the
+`-shm` sidecar files. The process needs write permission on the directory, though it never writes the
 database. A read-only mount does not work.
 
 ## The schema
@@ -112,7 +112,7 @@ A subscriber holds two positions per topic, because the topic file has two table
 
 ### Metadata
 
-Chimera keeps metadata in columns, separate from the payload. Encrypt your payloads before you publish them.
+Chimera keeps metadata in columns, separate from the payload. Encrypt sensitive payloads before publication.
 With encrypted payloads, you can still measure lag, count messages and triage a backlog with `sqlite3`.
 
 ### Log identity

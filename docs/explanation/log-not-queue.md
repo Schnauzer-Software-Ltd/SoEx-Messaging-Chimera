@@ -1,37 +1,24 @@
 # The log model
 
-A Chimera topic is a log. The log has these rules:
+A Chimera topic is an append-only log of records.
 
-1. The topic is an append-only sequence of records.
-2. Each subscriber keeps a separate position in the topic.
-3. A read leaves the record in the log.
-4. Retention removes records by a policy. It does not use the positions of the subscribers.
+- Each subscriber has a separate position in the log.
+- Reading a record leaves it in the log.
+- Retention removes records by age, size or count.
 
-## Subscribers are independent
+## Independent subscribers
 
-A new subscriber changes nothing for the existing subscribers. A slow subscriber delays only itself.
-
-Two subscribers on one topic each receive every message. Each keeps an independent position. Neither
-can affect the progress of the other.
+Every subscriber receives every message. A slow or stopped subscriber delays only itself.
 
 ## Settling out of order
 
-A subscriber keeps a position and a small set of exceptions above it. It can thus settle a message out of
-order and continue. This is the Apache Pulsar model: a cumulative acknowledgement with individual
-acknowledgements above it.
+A subscriber stores its position and the settled messages above it. It can settle messages in any order. This
+is the Apache Pulsar model: a cumulative acknowledgement with individual acknowledgements above it.
 
-With this model, each subscriber can:
-
-- Set aside a message that it cannot handle now.
-- Dead-letter a message that failed too many times.
-- Continue past these messages. They do not block the head of the topic.
-
-A poison message becomes a dead letter of one subscriber. The other subscribers continue.
+Each subscriber can defer a message, dead-letter a message that failed too often, and read past both. A poison
+message becomes a dead letter for one subscriber. The other subscribers continue to read.
 
 ## Retention
 
-Retention removes messages by policy, read or unread. It does not collect the positions of the
-subscribers first. Thus a stopped subscriber cannot stop the publisher.
-
-Retention can remove a message before a subscriber reads it. [Limits](limits.md)
-describes this loss and how Chimera reports it.
+Retention removes records by policy, read or unread. The publisher never waits for a subscriber.
+[Limits](limits.md) describes how Chimera reports unread messages removed by retention.

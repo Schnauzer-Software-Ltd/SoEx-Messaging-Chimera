@@ -64,7 +64,7 @@ Rules and limits:
   reports each loss to the subscriber.
 - Append order is total and stable. Delivery order can differ from append order.
 - The default payload limit is 256 KB.
-- Chimera stores payloads as given. Encrypt sensitive payloads before you publish them.
+- Chimera stores payloads as given. Encrypt sensitive payloads before publication.
 - Consume throughput is about 800 messages a second with 16 in flight, on a 4-core machine. Publish
   throughput is close to NATS JetStream.
 

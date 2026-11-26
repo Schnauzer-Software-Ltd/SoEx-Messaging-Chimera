@@ -18,7 +18,7 @@ Appends the payload as a record. Returns when the record is durable. The default
 ### `ScheduleAsync(payload, dueAt)`
 
 Stores a scheduled message that becomes deliverable at the due time. The message stays in the scheduled table.
-It never moves into the log. Each subscriber reads the scheduled table and picks up the message itself. Thus a
+It never moves into the log. Each subscriber reads the scheduled table and picks up the message itself. A
 scheduled message needs no timer.
 
 Delivery occurs at the due time or later. Chimera sets no maximum delay after the due time. A due time in the
@@ -28,7 +28,7 @@ The retention policy sets a maximum number of scheduled messages that are not ye
 number, `ScheduleAsync` throws `ScheduleRefusedException` and stores nothing.
 
 Messages past their due time do not count toward this maximum. They are due for delivery, and `MaxAge` removes
-them. A message scheduled for now never counts, because Chimera stores its due time as now. Thus the count
+them. A message scheduled for now never counts, because Chimera stores its due time as now. The count
 bounds future-dated messages, and `MaxAge` bounds the rest. [Limits](../explanation/limits.md) gives the sizing
 arithmetic.
 
@@ -37,7 +37,7 @@ arithmetic.
 Removes the row of a scheduled message. Returns true if a row was there to remove.
 
 A true result does not mean that the cancel came in time. A delivered scheduled message keeps its row until
-retention removes it. Thus a cancel after delivery removes the row and returns true. Each subscriber records in
+retention removes it. A cancel after delivery removes the row and returns true. Each subscriber records in
 its subscriber file whether it handled the message. The topic log cannot read that record.
 
 ### `ApplyRetentionAsync()`
@@ -60,7 +60,7 @@ Opens a subscription. The subscriber name is a durable identity. A new name give
 subscription name on a Service Bus topic has the same role.
 
 If this subscriber has never read this topic, `Open` records its position. `Open` also refuses a stored
-position that belongs to a different incarnation of the log. Thus `LogIdentityException` comes from `Open`,
+position that belongs to a different incarnation of the log. `LogIdentityException` comes from `Open`,
 before the first read.
 
 If the topic has no file yet, `Open` succeeds and the subscription waits. When the publisher creates the file,
@@ -82,15 +82,14 @@ processes is a supported layout. Tests use this layout. Each of these files has 
 If two processes write the same subscriber file, some messages are handled twice. The file is not damaged. In a
 measurement, 200 messages gave about 210 deliveries, and none were lost.
 
-You must enforce the one-writer rule. [Files](files.md#writers-and-readers) gives the reason that
-Chimera does not enforce it.
+You must enforce the one-writer rule. [Files](files.md#writers-and-readers) explains the rule.
 
-Chimera resolves root paths before it compares them. Thus `/var/events` and `/var/./events` are the same root,
+Chimera resolves root paths before comparison. `/var/events` and `/var/./events` are the same root,
 with the same files. Chimera does not resolve symbolic links.
 
 ### `ReadAsync()`
 
-Yields messages until you cancel it. Delivery order can differ from append order. Settle every message:
+Yields messages until cancellation. Delivery order can differ from append order. Settle every message:
 
 | Result | Call | Effect |
 |---|---|---|
@@ -102,7 +101,7 @@ Yields messages until you cancel it. Delivery order can differ from append order
 ### Settle rules
 
 Settle each delivery once. A second settle of the same delivery throws `InvalidOperationException`. Each settle
-frees one in-flight slot. Thus a second settle would silently raise the in-flight limit that you set.
+frees one in-flight slot. A second settle would silently raise the configured in-flight limit.
 
 A settle finishes a delivery. If a failed message goes out again, a settle of the old delivery still throws.
 The new delivery is yours to settle. Service Bus uses its lock token in the same way.
@@ -114,10 +113,10 @@ A settle that throws has settled nothing. The delivery stays yours to settle aga
 - The message is now a dead letter.
 - Retention removed the record while you held the delivery. The caller cannot check for this case.
 
-In the second case, a later read reports the message as lost. Thus the loss is reported even if you do not
+In the second case, a later read reports the message as lost. The loss is reported even if you do not
 read the return value.
 
-Every settle is one durable write. Nothing that can fail runs after the write. Thus a settle that throws has
+Every settle is one durable write. Nothing that can fail runs after the write. A settle that throws has
 settled nothing.
 
 A queued write cannot be recalled. If you cancel a settle before Chimera queues its write, the cancel takes
@@ -132,8 +131,7 @@ settle in progress when the close starts commits, and returns to report the comm
 `DropOldest`, and the message is larger than the dead-letter byte bound.
 
 The trim would destroy such a message, whatever room the set has. Chimera refuses to store a message only to
-lose it. The rule applies to every source of the message. This includes a message with no attempts left, and
-a deferred message that you replayed.
+lose it. The rule applies to every source of the message. This includes a message with no attempts left, and a replayed deferred message.
 
 A settle that throws has settled nothing, so the delivery is still yours. Do one of these:
 
@@ -147,13 +145,13 @@ A bound lowered across a reopen works in the same way. The policy comes with eac
 with the row. The first retention pass that sees oversized rows removes all of them and counts them in
 `DeadDropped`. Dead letters that still fit stay in the set.
 
-The row that the current settle files is the one exception. The trim spares the row that it writes. Thus an
+The row that the current settle files is the one exception. The trim spares the new row. An
 oversized row survives its own pass. The next pass removes it.
 
 ### Close a subscription
 
 If you dispose a subscription that holds deliveries, it hands them back. The next read delivers them again.
-Each counts as one more attempt. A process stop has the same effect. Thus an overlapping redeploy causes a
+Each counts as one more attempt. A process stop has the same effect. An overlapping redeploy causes a
 redelivery, and every message stays reachable.
 
 The hand-back covers all deliveries that the subscription holds at the close. This includes a delivery in the
@@ -161,14 +159,13 @@ middle of its claim, and a delivery whose settle fails during the close. The clo
 
 1. It seals the subscription against new work.
 2. It waits for all operations in progress to stop.
-3. It hands back the deliveries that it finds.
+3. It hands back every outstanding delivery.
 
 You can close a subscription while its read loop runs. You do not have to cancel the loop first. The loop ends
 with the same closed-store answer as any other call. The loop gets no delivery as it ends. The close hands
 back a message claimed as the close started. No handler that cannot settle gets the message.
 
-A read that waits for an in-flight slot, or pauses between polls, wakes up and gets the same answer. Thus
-`ReadAsync` also ends when its token is never cancelled.
+A read that waits for an in-flight slot, or pauses between polls, wakes up and gets the same answer. `ReadAsync` also ends when its token is never cancelled.
 
 After a close, each call fails with an error about the close. Chimera does not throw a disposal error:
 
@@ -189,8 +186,7 @@ the log has removed the original.
 `DiscardAsync` destroys a set-aside message. It is the only deliberate loss in this library.
 
 If a handler holds the message now, `ReplayAsync` and `DiscardAsync` leave it and return false. A row cannot go
-to two handlers at the same time. If Chimera destroyed a row that a handler held, all later results to that
-handler would be untrue. Wait for the delivery to settle. Then call again.
+to two handlers at the same time. A row destroyed under a handler would make every later result to that handler untrue. Wait for the delivery to settle. Then call again.
 
 If `ReplayAsync` returns true, the row is marked for delivery. The delivery is not certain. No subscriber has
 read the row yet. Under `DropOldest`, the dead-letter bound can remove the row before a read.
@@ -216,20 +212,18 @@ tables, so retention can overtake a subscriber in either table.
 
 Ages out deferred messages and enforces the dead-letter bounds.
 
-Ageing out a deferred message files it as a dead letter. Nothing else changes. Thus ageing out does not cancel
+Ageing out a deferred message files it as a dead letter. Nothing else changes. Ageing out does not cancel
 a replay. The row stays on its way to you, and the next read delivers it as a dead letter. A replay of a dead
 letter always works in this way.
 
-Under `DropOldest`, the same pass then enforces the bound. It can destroy the row that it aged out in this pass, or a
-row that you replayed before. The report counts each destroyed row.
+Under `DropOldest`, the same pass then enforces the bound. It can destroy a row aged out in this pass, or an earlier replayed row. The report counts each destroyed row.
 
-The pass does not touch a message that a handler holds. That message is not set aside. The next pass measures
-its age again, from the place where its settle puts it.
+The pass skips in-flight messages, which are not set aside. A later pass measures the age of such a message again, from where its settle files it.
 
 The report also counts the dead letters destroyed since the last pass, from any cause. A settle that fills the
 set under `DropOldest` also causes real loss. The report counts the losses on both paths.
 
-Chimera keeps this count in the subscriber file. Thus the count stays if the process closes or stops before a
+Chimera keeps this count in the subscriber file. The count stays if the process closes or stops before a
 pass.
 
 ## Settings
@@ -243,7 +237,7 @@ survive a power cut. `PowerLoss` adds an fsync per commit.
 is 128. Concurrent appends share one commit. This gives most of the throughput. The value must be one or more.
 Chimera refuses a lower value and does not round it up.
 
-`BusyTimeout` is the time that a connection waits for a lock before it stops. The default is five seconds. The
+`BusyTimeout` is the maximum wait of a connection for a lock. The default is five seconds. The
 value must be more than zero. When a file opens, Chimera refuses a lower value. SQLite reads zero as "do not
 wait". With zero, normal contention causes failures.
 
@@ -261,8 +255,7 @@ The attempts follow each other with no delay.
   shorter than the whole history.
 - `Next` delivers only the messages that arrive after the open. A Service Bus subscription works in this way.
 
-With either value, a message scheduled before the subscriber existed arrives at its due time, if that due time
-is after the subscriber starts.
+With either value, a message scheduled before the subscriber existed arrives at its due time, if that due time is after the subscriber's start.
 
 The setting applies once, when Chimera first records the position. After that, the stored position controls
 the start. A change to `Start` does not move it.
@@ -291,19 +284,19 @@ the choices are to stop the subscriber or to destroy messages. `DeadOverflow` se
 By default, the subscriber stops when it reaches a dead-letter bound. It destroys nothing. It keeps its
 position and blocks no other subscriber. It starts again when you replay or discard the dead letters.
 
-The stop is a property of the stored set. Each poll reads the size of the set from the file. Thus a close and
+The stop is a property of the stored set. Each poll reads the size of the set from the file. A close and
 reopen of the subscription gives no more deliveries. A subscription that was already open when the set filled
 also stops.
 
 The bound counts the dead letters in the set:
 
-- A replayed dead letter leaves the count. Thus a stopped subscriber can work through the dead letters that
+- A replayed dead letter leaves the count. A stopped subscriber can work through the dead letters that
   stopped it.
 - If a replay fails back into the set, the message counts again.
 - If you defer a replayed dead letter, Chimera files it as deferred. This also removes it from the dead set.
 
 Under `DropOldest`, Chimera destroys the oldest dead letters. It never destroys a dead letter that a handler
-holds. That message still counts toward the bound. Thus the set can briefly exceed the bound until that
+holds. That message still counts toward the bound. The set can briefly exceed the bound until that
 delivery settles.
 
 The bound also never destroys the message that the current settle files. The message that Chimera reports as
