@@ -19,6 +19,9 @@
     <Copyright>Copyright (c) 2026 Schnauzer Software Ltd</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>messaging;events;sqlite;pubsub;durable;in-process</PackageTags>
+    <PackageProjectUrl>https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageOutputPath>$(MSBuildThisFileDirectory)artifacts</PackageOutputPath>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
