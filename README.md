@@ -93,8 +93,7 @@ Chimera is a standalone library. The SoEx event transport for Chimera is `SoEx.T
 
 ## Status
 
-Release candidate for 1.0.0. Report problems in the
-[issue tracker](https://github.com/Schnauzer-Software-Ltd/SoEx-Messaging-Chimera/issues).
+Release candidate for 1.0.0.
 
 ## License
 
