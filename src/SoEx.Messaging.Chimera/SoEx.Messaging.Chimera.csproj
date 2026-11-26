@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>SoEx.Messaging.Chimera</RootNamespace>
     <AssemblyName>SoEx.Messaging.Chimera</AssemblyName>
-    <Description>Durable messageing for InProc single process</Description>
+    <Description>An in-process durable publish/subscribe event log for .NET.</Description>
   </PropertyGroup>
 
   <!-- The only storage dependency, and it stays behind an internal seam. This project deliberately has

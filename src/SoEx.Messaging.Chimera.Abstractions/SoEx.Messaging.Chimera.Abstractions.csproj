@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>SoEx.Messaging.Chimera</RootNamespace>
     <AssemblyName>SoEx.Messaging.Chimera.Abstractions</AssemblyName>
-    <Description>Contracts for the SoEx.Chimera durable in-process event log: the log and subscription surfaces, the envelope, the entry states and the retention and delivery policies.</Description>
+    <Description>Interfaces, options and message types for SoEx.Messaging.Chimera.</Description>
   </PropertyGroup>
 
   <!-- A delivery has to name the row it came from so it can be settled, but a handler has no business knowing

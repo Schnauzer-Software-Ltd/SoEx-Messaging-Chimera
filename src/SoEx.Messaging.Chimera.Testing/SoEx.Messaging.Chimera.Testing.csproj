@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>SoEx.Messaging.Chimera.Testing</RootNamespace>
     <AssemblyName>SoEx.Messaging.Chimera.Testing</AssemblyName>
-    <Description>Reads what every subscriber under a Chimera root is doing, without disturbing any of them: how far behind each one is, what it is holding, and what became of one particular message. For asserting that an event-driven system has settled, and for finding out why it has not.</Description>
+    <Description>Read-only inspection of Chimera subscribers and messages, for tests.</Description>
   </PropertyGroup>
 
   <!-- This reads the files' internals rather than its own copy of the schema. Two readers of one layout drift,
