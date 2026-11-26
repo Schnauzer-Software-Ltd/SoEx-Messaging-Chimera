@@ -1,207 +1,327 @@
 # API
 
-## Publishing — `SqliteTopicLog`
+## `SqliteTopicLog`
 
-`Open(topic, options, topicOptions)` opens the one writer for a topic. Open it once per topic per process and
-share it: a second writer on the same file is the one thing the design does not allow, and the symptom is
-lock contention rather than an error.
+`SqliteTopicLog` is the topic log: the writer for one topic.
 
-`AppendAsync(payload)` returns once the record is durable. Payloads are capped, 256 KB by default.
+### `Open(topic, options, topicOptions)`
 
-`ScheduleAsync(payload, dueAt)` stores a message to become deliverable later. It is never moved into the log;
-subscribers read the scheduled table and pick it up themselves, which is why there is no timer per message.
-Delivery is no earlier than the due time and no promise is made about how much later. A due time that has
-already gone means due now, and is stored as now, which is how Service Bus reads one too.
+Opens the writer for a topic. Share one writer per topic per process.
 
-`CancelScheduledAsync(id)` removes the row. It returns true when there was a row to remove, which is not the
-same as having caught the message in time: a delivered scheduled message keeps its row until retention takes
-it, so cancelling one that has already been handled removes the row and returns true. Whether it was handled
-is each subscriber's own business, recorded in each subscriber's own file, and there is nothing here that
-could tell you.
+Do not open a second writer on the same topic file. The design does not allow it. A second topic writer
+causes lock contention. No error occurs.
 
-`ApplyRetentionAsync()` trims the log and reports what went, including which subscribers were overtaken.
-Call it from wherever you run maintenance.
+### `AppendAsync(payload)`
 
-`InspectSubscribersAsync()` reads every subscriber's file to see where they have got to. It is a read and
-only a read: truncation is never gated on it.
+Appends the payload as a record. Returns when the record is durable. The default payload limit is 256 KB.
 
-## Consuming — `SqliteSubscription`
+### `ScheduleAsync(payload, dueAt)`
 
-`Open(subscriber, topic, options, subscriptionOptions)`. The subscriber name is a durable identity: change it
-and you get a new position, not the old one. It is the same role as a subscription name on a Service Bus
-topic.
+Stores a scheduled message that becomes deliverable at the due time. The message stays in the scheduled table.
+It never moves into the log. Each subscriber reads the scheduled table and picks up the message itself. Thus a
+scheduled message needs no timer.
 
-Opening records the position, if this subscriber has never read this topic before. That is also where a
-position belonging to a different incarnation of the log is refused, so `LogIdentityException` comes out of
-`Open` rather than out of the first read. A topic with no file yet is not an error: the subscription waits,
-and binds when the publisher creates it.
+Delivery occurs at the due time or later. Chimera sets no maximum delay after the due time. A due time in the
+past means "due now". Chimera stores it as the current time. Service Bus reads a past due time in the same way.
 
-`ReadAsync()` yields messages until cancelled. Order is not guaranteed. Every message must be settled:
+The retention policy sets a maximum number of scheduled messages that are not yet due. If the topic holds that
+number, `ScheduleAsync` throws `ScheduleRefusedException` and stores nothing.
 
-| To say | Call | What happens |
+Messages past their due time do not count toward this maximum. They are due for delivery, and `MaxAge` removes
+them. A message scheduled for now never counts, because Chimera stores its due time as now. Thus the count
+bounds future-dated messages, and `MaxAge` bounds the rest. [Limits](../explanation/limits.md) gives the sizing
+arithmetic.
+
+### `CancelScheduledAsync(id)`
+
+Removes the row of a scheduled message. Returns true if a row was there to remove.
+
+A true result does not mean that the cancel came in time. A delivered scheduled message keeps its row until
+retention removes it. Thus a cancel after delivery removes the row and returns true. Each subscriber records in
+its subscriber file whether it handled the message. The topic log cannot read that record.
+
+### `ApplyRetentionAsync()`
+
+Removes old records from the log. Returns a report of what it removed and which subscribers it overtook. Call it
+from your maintenance task.
+
+### `InspectSubscribersAsync()`
+
+Reads every subscriber file and reports the position of each subscriber. It only reads. Truncation never
+depends on it.
+
+## `SqliteSubscription`
+
+`SqliteSubscription` is one subscriber that reads one topic.
+
+### `Open(subscriber, topic, options, subscriptionOptions)`
+
+Opens a subscription. The subscriber name is a durable identity. A new name gives a new position. A
+subscription name on a Service Bus topic has the same role.
+
+If this subscriber has never read this topic, `Open` records its position. `Open` also refuses a stored
+position that belongs to a different incarnation of the log. Thus `LogIdentityException` comes from `Open`,
+before the first read.
+
+If the topic has no file yet, `Open` succeeds and the subscription waits. When the publisher creates the file,
+the subscription binds to it.
+
+### One writer per subscriber file
+
+One subscriber can read several topics. Open one `SqliteSubscription` per topic. These subscriptions share the
+subscriber file and its set-aside store. You can open as many as you need. One does not disturb the deliveries
+of another.
+
+Do not open two subscriptions for the same subscriber and topic. The library does not prevent it. Two
+subscriptions are two writers on one file. Because each file has one writer, Chimera needs no lease and no
+visibility timeout.
+
+The rule applies across processes and in one process. A publisher in one process with its subscribers in other
+processes is a supported layout. Tests use this layout. Each of these files has one writer.
+
+If two processes write the same subscriber file, some messages are handled twice. The file is not damaged. In a
+measurement, 200 messages gave about 210 deliveries, and none were lost.
+
+You must enforce the one-writer rule. [Files](files.md#one-writer-any-number-of-readers) gives the reason that
+Chimera does not enforce it.
+
+Chimera resolves root paths before it compares them. Thus `/var/events` and `/var/./events` are the same root,
+with the same files. Chimera does not resolve symbolic links.
+
+### `ReadAsync()`
+
+Yields messages until you cancel it. Delivery order can differ from append order. Settle every message:
+
+| Result | Call | Effect |
 |---|---|---|
-| handled | `CompleteAsync` | the position absorbs it once everything before it is settled |
-| it threw | `FailAsync` | straight back for another attempt, or a dead letter once attempts run out |
-| not now | `DeferAsync` | out of the flow into your own store, until you ask for it |
-| never | `DeadLetterAsync` | filed, with its payload, so it stays replayable |
+| Handled | `CompleteAsync` | The position moves past the message when all earlier messages are settled. |
+| The handler threw | `FailAsync` | The message comes back immediately for another attempt. After the last attempt, it becomes a dead letter. |
+| Not now | `DeferAsync` | The message leaves the flow and goes into the set-aside store. It stays there until you ask for it. |
+| Never | `DeadLetterAsync` | Chimera files the message as a dead letter with its payload. You can replay it. |
 
-Settle each delivery once. A second call for the same message throws rather than being ignored: each settle
-frees one of the in-flight slots, so settling twice would quietly raise the limit you set. A settle that
-throws has settled nothing and leaves the delivery yours to settle again, so a retry is the right response to
-one. `FailAsync` returns whether the message is coming back — false means it is now a dead letter, or that
-retention removed the record while you were holding it, which is the one case no caller can check for itself.
-A message that ends the second way is reported as lost on a later read, so it is named somewhere rather than
-only being implied by a return value you might not have looked at.
+### Settle rules
 
-One subscriber reading several topics is one `SqliteSubscription` per topic, all sharing that subscriber's
-file and its set-aside store. Open them freely: they do not disturb each other's deliveries. Do not open two
-for the same subscriber and topic, though nothing stops you — that is two writers on one file, and the rule
-that there is only ever one is what removes the need for a lease or a visibility timeout anywhere here. It
-holds across processes as well as inside one: a publisher here and its subscribers over there is a supported
-shape, tested that way, because those are separate files with one writer each. Two processes on the *same*
-file is the thing to avoid, and what it costs when you do it is duplicate handling rather than damage —
-measured at around 210 deliveries for 200 messages, none lost. Holding to the rule is yours to arrange, and
-[files](files.md#one-writer-any-number-of-readers) says why it is not arranged for you. A
-root written two ways is one root: paths are resolved before they are compared, so `/var/events` and
-`/var/./events` are the same files to every part of this. Symbolic links are not resolved.
+Settle each delivery once. A second settle of the same delivery throws `InvalidOperationException`. Each settle
+frees one in-flight slot. Thus a second settle would silently raise the in-flight limit that you set.
 
-Disposing a subscription that is still holding deliveries hands them back rather than stranding them. They go
-out again on the next read, counted as further attempts, which is what the process stopping would have done
-to them — so an overlapping redeploy costs a redelivery rather than a message nobody can reach. That covers
-everything the subscription had at the moment you closed it, including a delivery it was in the middle of
-claiming and one whose settle was in the middle of failing: the close seals the subscription against new
-work, waits for what is already moving to come to rest, and only then hands back what it finds.
+A settle finishes a delivery. If a failed message goes out again, a settle of the old delivery still throws.
+The new delivery is yours to settle. Service Bus uses its lock token in the same way.
 
-You can close a subscription whose read loop is still running, and you do not have to cancel the loop first.
-The loop ends with the same closed-store answer as any other call, and it will not be handed a delivery on
-the way out: a message claimed as the close began is handed back, not given to a handler who could no longer
-settle it. A read waiting for an in-flight slot, or pausing between polls, is woken and told the same thing
-rather than left waiting — which matters because `ReadAsync` accepts a token you never cancel.
+A settle that throws has settled nothing. The delivery stays yours to settle again. Retry the settle.
 
-Using a subscription after it has closed is refused in its own terms rather than as a disposal error: a read
-says the store is closed, and a settle says the delivery is not this caller's to settle, naming the hand-back
-among the three things that can mean. Not that the message has already been settled: nothing was written, and
-it is there for the next subscription to be handed.
+`FailAsync` returns true if the message comes back for another attempt. It returns false in two cases:
 
-Settle each delivery once. A second settle of the same one throws `InvalidOperationException`, and it is the
-*delivery* that is finished with rather than the message: if a failed message has since been handed out again,
-settling the old delivery is still refused and the new one is still yours to settle. Service Bus draws the
-same line with its lock token.
+- The message is now a dead letter.
+- Retention removed the record while you held the delivery. The caller cannot check for this case.
 
-`ScheduleAsync` refuses rather than stores when the topic is already holding as many not-yet-due scheduled
-messages as its retention policy allows, throwing `ScheduleRefusedException`. Messages whose due time has
-passed do not hold the quota: they are on their way out, and what removes them is `MaxAge`. That includes a
-message scheduled for now — its due time is stored as now, so it never holds the quota at all — which makes
-the count a bound on future-dated work and `MaxAge` the bound on the rest; [limits](../explanation/limits.md)
-has the sizing arithmetic. `DeadLetterAsync` and `FailAsync` refuse in one narrow case too: a subscriber set
-to drop the oldest, with a dead-letter byte bound smaller than the message, cannot keep the row it is being
-asked to file — the message is over that bound on its own, so the trim destroys it whatever room the set has,
-and filing it would be storing the message in order to lose it — so it throws `DeadLetterTooLargeException`.
-That applies wherever the message is coming from, including one that has run out of attempts and one stored
-here as a deferral and replayed. A settle that threw has settled nothing, so the delivery is still yours —
-complete it to lose the message knowingly, or raise the bound.
+In the second case, a later read reports the message as lost. Thus the loss is reported even if you do not
+read the return value.
 
-A message already filed as a dead letter is the exception, and it is re-filed rather than refused: it is
-being held, so holding it costs the set nothing it was not already paying. That is how a bound lowered
-across a reopen behaves too — the policy goes with the open, not with the row — and the rows it has left
-oversized are removed by the first retention pass that sees them, however many that is, counted in
-`DeadDropped`, without taking the dead letters that still fit with them. The one that goes alone is the row a
-settle has just filed: the trim spares what it is writing, so an oversized one survives its own pass and dies
-on the next.
+Every settle is one durable write. Nothing that can fail runs after the write. Thus a settle that throws has
+settled nothing.
 
-Every settle is one durable write. Nothing runs after it that could fail, which is what makes "a settle that
-threw has settled nothing" a rule rather than a hope: a write already queued cannot be recalled, so cancelling
-a settle either takes effect before it is queued or does not take effect at all. Closing the subscription
-underneath a settle is held to the same rule. Closing drains the writes already queued rather than discarding
-them, so a settle that was in progress when the close began commits, and returns to say so.
+A queued write cannot be recalled. If you cancel a settle before Chimera queues its write, the cancel takes
+effect. After that point, the cancel has no effect.
 
-`DeferredAsync` and `DeadLettersAsync` list what is set aside. `ReplayAsync(asideId)` makes one deliverable
-again from its own stored copy, so it works even after the log has dropped the original. `DiscardAsync`
-destroys it, which is the only deliberate loss in this library. Both leave a message that is being handled
-right now alone and answer false: a row cannot be delivered to two handlers at once, and destroying one under
-a handler would make everything it is told afterwards untrue. Wait for the delivery to settle and ask again.
+The same rule applies if you close the subscription during a settle. The close drains the queued writes. A
+settle in progress when the close starts commits, and returns to report the commit.
 
-`ReplayAsync` answering true means the row is marked for delivery, not that the delivery will happen. Nothing
-has read it yet, and under `DropOldest` a dead-letter bound reached before it is read can still take it —
-`ReplayAsync` is no more able to promise that than `AppendAsync` can promise retention will not reach a record
-before somebody reads it. Only a message actually in a handler's hands is safe from that bound. Under
-`StopDelivering`, which is the default, nothing is destroyed and the question does not arise.
+### Dead letters larger than the bound
 
-`LagAsync()` reports how far behind this subscriber is: a count of log records it has not reached, the age of
-the oldest of them, and a count of scheduled messages that have come due and it has not finished with. The
-scheduled count is separate because the two tables are held by different bounds, and it is there at all
-because `MaxAge` removes from both — a subscriber can be overtaken on either side. It is safe to call while
-the subscription is reading, which is what it is for.
+`DeadLetterAsync` and `FailAsync` throw `DeadLetterTooLargeException` in one case. The subscriber uses
+`DropOldest`, and the message is larger than the dead-letter byte bound.
 
-`ApplyRetentionAsync()` ages out deferred messages and enforces the dead-letter bounds. Ageing one out
-changes what it is filed as and nothing else, so it does not itself cancel a replay: the row stays on its way
-to you and the next read delivers it, as a dead letter, which is what replaying one has always meant. Under
-`DropOldest` the same pass then enforces the bound, and that can destroy the row it has just aged out, or one
-you replayed earlier — counted, in the same report. The pass leaves a
-message a handler is holding alone entirely, because it has not been sitting anywhere; its age is measured
-again on the next pass, from wherever its settle leaves it. Its report also
-carries any dead letters destroyed since the last pass, wherever they were destroyed — a settle that fills
-the set under `DropOldest` causes real loss too, and it would be misleading to put a number next to one path
-and a silence next to the other. That count lives in the subscriber's file rather than in memory, so a
-process that closes or dies before running a pass does not take it with it.
+The trim would destroy such a message, whatever room the set has. Chimera refuses to store a message only to
+lose it. The rule applies to every source of the message. This includes a message with no attempts left, and
+a deferred message that you replayed.
 
-## Settings worth knowing
+A settle that throws has settled nothing, so the delivery is still yours. Do one of these:
 
-`ChimeraOptions.Durability` — `ProcessCrash` by default, which survives a crash but not a power cut.
-`PowerLoss` costs an fsync per commit.
+- Complete the message to lose it knowingly.
+- Raise the bound.
 
-`ChimeraOptions.MaxAppendBatch` — how many queued operations one transaction may commit together, 128 by
-default. Concurrent appends cost one commit between them rather than one each, which is most of the
-throughput here. It must be at least one and is refused below that rather than rounded up to it.
+A message that is already a dead letter is the exception. Chimera files it again and does not refuse it. The
+set already holds it, so it adds no cost to the set.
 
-`ChimeraOptions.BusyTimeout` — how long a connection waits for a lock before giving up, five seconds by
-default. It has to be greater than zero, and anything less is refused when a file is opened: SQLite reads
-zero as "do not wait", which turns ordinary contention into failures.
+A bound lowered across a reopen works in the same way. The policy comes with each open, and does not stay
+with the row. The first retention pass that sees oversized rows removes all of them and counts them in
+`DeadDropped`. Dead letters that still fit stay in the set.
 
-`SubscriptionOptions.MaxInFlight` — deliveries outstanding at once, across every source rather than each
-separately. Reading stops here until something is settled.
+The row that the current settle files is the one exception. The trim spares the row that it writes. Thus an
+oversized row survives its own pass. The next pass removes it.
 
-`SubscriptionOptions.MaxAttempts` — deliveries of one message before `FailAsync` dead-letters it. There is no
-delay between attempts.
+### Close a subscription
 
-`SubscriptionOptions.Start` — where a subscriber that has never read this topic before begins. `Beginning`,
-the default, delivers what the topic still holds, which is the retained window and not the whole history.
-`Next` delivers only what arrives from then on, which is what a Service Bus subscription does. Either way a
-message scheduled before the subscriber existed but due after it started still arrives when it falls due. The
-setting applies once, when the position is first recorded; after that the stored position is what matters and
-changing this does not move it.
+If you dispose a subscription that holds deliveries, it hands them back. The next read delivers them again.
+Each counts as one more attempt. A process stop has the same effect. Thus an overlapping redeploy causes a
+redelivery, and every message stays reachable.
 
-`SetAsidePolicy` — bounds on what one subscriber may set aside. Set-aside rows carry payload copies, so
-without these a consumer that defers freely fills the disk. There are four: `MaxDeferredCount` and
-`MaxDeferredBytes` on what may be deferred, `MaxDeadCount` and `MaxDeadBytes` on what may be dead-lettered.
-Breaching a deferred bound files the message as a dead letter rather than dropping it, and says so in the
-row's reason.
+The hand-back covers all deliveries that the subscription holds at the close. This includes a delivery in the
+middle of its claim, and a delivery whose settle fails during the close. The close has three steps:
 
-The bytes are counted per set rather than across both, because the two sets can answer a bound differently. A
-deferral that does not fit has somewhere to go; dead is where passing a message along stops, so the only
-answers there are to stop the subscriber or to destroy something, which is what `DeadOverflow` chooses
-between. A single number spanning both could only mean the first, and the dead set would grow past it one
-payload at a time while the setting said it was bounded.
+1. It seals the subscription against new work.
+2. It waits for all operations in progress to stop.
+3. It hands back the deliveries that it finds.
 
-When a dead-letter bound is reached the subscriber stops, by default, rather than destroying anything: it
-keeps its position, blocks nobody else, and starts again when the dead letters are dealt with. That is a
-property of the stored set and not of the object, so closing the subscription and opening it again does not
-buy another crop of deliveries, and neither does a subscription that was already open when the set filled: the
-size is read from the file on every poll rather than remembered from the first one. Replaying or discarding
-the dead letters is what clears it. What counts
-towards the bound is the dead letters parked in the set: replaying one takes it out of the count so that a
-stopped subscriber can still work through what stopped it, and a replay that fails its way back in puts it
-back. Deferring a replayed dead letter files it as deferred, which takes it out of the dead set too. Under
-`DropOldest` the oldest are destroyed instead, and a dead letter being handled right now is never one of
-them; it still counts towards the bound, so the set can sit briefly above it until that delivery settles.
-Neither is the message the settle is filing at that moment: whatever a bound destroys to make room for it, it
-is never the message you were told had been filed. A replayed message settled back into a full set counts as
-the newest arrival, not as the row it was when it first arrived.
+You can close a subscription while its read loop runs. You do not have to cancel the loop first. The loop ends
+with the same closed-store answer as any other call. The loop gets no delivery as it ends. The close hands
+back a message claimed as the close started. No handler that cannot settle gets the message.
 
-Every one of these values is checked when the subscription is opened, as retention's are when the log is
-opened. A negative or zero bound fails silently and destructively otherwise — a retention age below zero puts
-the cutoff in the future and removes the whole log — so `null` is how you say a bound is not wanted. Zero is
-allowed for `MaxDeferredAge` alone, where it means "age this out the next time a pass looks" and files the
-message dead rather than destroying it. A retention `MaxBytes` below the topic's `MaxPayloadBytes` is refused
-for the same kind of reason: it describes a topic that accepts messages no retention pass can keep, and one
-of them would be written and then destroyed unread by the next pass.
+A read that waits for an in-flight slot, or pauses between polls, wakes up and gets the same answer. Thus
+`ReadAsync` also ends when its token is never cancelled.
+
+After a close, each call fails with an error about the close. Chimera does not throw a disposal error:
+
+- A read reports that the store is closed.
+- A settle reports that the delivery is not this caller's to settle. The message names the hand-back as one of
+  three possible causes.
+
+This error does not mean that the message is settled. Chimera wrote nothing. The next subscription gets the
+message.
+
+### `DeferredAsync`, `DeadLettersAsync`, `ReplayAsync`, `DiscardAsync`
+
+`DeferredAsync` and `DeadLettersAsync` list the set-aside messages.
+
+`ReplayAsync(asideId)` makes one set-aside message deliverable again from its stored copy. Replay works after
+the log has removed the original.
+
+`DiscardAsync` destroys a set-aside message. It is the only deliberate loss in this library.
+
+If a handler holds the message now, `ReplayAsync` and `DiscardAsync` leave it and return false. A row cannot go
+to two handlers at the same time. If Chimera destroyed a row that a handler held, all later results to that
+handler would be untrue. Wait for the delivery to settle. Then call again.
+
+If `ReplayAsync` returns true, the row is marked for delivery. The delivery is not certain. No subscriber has
+read the row yet. Under `DropOldest`, the dead-letter bound can remove the row before a read.
+`AppendAsync` has the same limit: retention can remove a record before a read.
+
+Only a message in the hands of a handler is safe from that bound. Under `StopDelivering`, the default, Chimera
+destroys nothing.
+
+### `LagAsync()`
+
+Reports the lag of this subscriber as three values:
+
+- The count of log records that the subscriber has not reached.
+- The age of the oldest of those records.
+- The count of due scheduled messages that the subscriber has not finished.
+
+The scheduled count is separate because different bounds control the two tables. `MaxAge` removes from both
+tables, so retention can overtake a subscriber in either table.
+
+`LagAsync` is for use while the subscription reads. It is safe to call at that time.
+
+### `ApplyRetentionAsync()` on a subscription
+
+Ages out deferred messages and enforces the dead-letter bounds.
+
+Ageing out a deferred message files it as a dead letter. Nothing else changes. Thus ageing out does not cancel
+a replay. The row stays on its way to you, and the next read delivers it as a dead letter. A replay of a dead
+letter always works in this way.
+
+Under `DropOldest`, the same pass then enforces the bound. It can destroy the row that it aged out in this pass, or a
+row that you replayed before. The report counts each destroyed row.
+
+The pass does not touch a message that a handler holds. That message is not set aside. The next pass measures
+its age again, from the place where its settle puts it.
+
+The report also counts the dead letters destroyed since the last pass, from any cause. A settle that fills the
+set under `DropOldest` also causes real loss. The report counts the losses on both paths.
+
+Chimera keeps this count in the subscriber file. Thus the count stays if the process closes or stops before a
+pass.
+
+## Settings
+
+### `ChimeraOptions`
+
+`Durability` sets the durability level. The default, `ProcessCrash`, survives a process crash. It does not
+survive a power cut. `PowerLoss` adds an fsync per commit.
+
+`MaxAppendBatch` is the maximum number of queued operations that one transaction commits together. The default
+is 128. Concurrent appends share one commit. This gives most of the throughput. The value must be one or more.
+Chimera refuses a lower value and does not round it up.
+
+`BusyTimeout` is the time that a connection waits for a lock before it stops. The default is five seconds. The
+value must be more than zero. When a file opens, Chimera refuses a lower value. SQLite reads zero as "do not
+wait". With zero, normal contention causes failures.
+
+### `SubscriptionOptions`
+
+`MaxInFlight` is the maximum number of deliveries outstanding at one time. The default is 16. The limit applies
+to all sources together. When the limit is reached, reading stops until a delivery is settled.
+
+`MaxAttempts` is the number of deliveries of one message before `FailAsync` dead-letters it. The default is 3.
+The attempts follow each other with no delay.
+
+`Start` sets where a subscriber that has never read this topic starts:
+
+- `Beginning`, the default, delivers what the topic still holds. This is the retained window, which can be
+  shorter than the whole history.
+- `Next` delivers only the messages that arrive after the open. A Service Bus subscription works in this way.
+
+With either value, a message scheduled before the subscriber existed arrives at its due time, if that due time
+is after the subscriber starts.
+
+The setting applies once, when Chimera first records the position. After that, the stored position controls
+the start. A change to `Start` does not move it.
+
+### `SetAsidePolicy`
+
+`SetAsidePolicy` sets the bounds on what one subscriber can set aside. Set-aside rows hold copies of payloads.
+The bounds stop a subscriber that defers freely from filling the disk. There are four bounds:
+
+| Bound | Limits |
+|---|---|
+| `MaxDeferredCount` | The number of deferred messages. |
+| `MaxDeferredBytes` | The bytes of deferred messages. |
+| `MaxDeadCount` | The number of dead letters. |
+| `MaxDeadBytes` | The bytes of dead letters. |
+
+If a message exceeds a deferred bound, Chimera files it as a dead letter. Chimera does not drop it. The reason
+field of the row records the cause.
+
+Chimera counts the bytes of each set separately, because the two sets respond to a bound in different ways. A
+deferral that does not fit goes to the dead set. The dead set is the end of the path. At a dead-letter bound,
+the choices are to stop the subscriber or to destroy messages. `DeadOverflow` selects one of the two.
+
+### When a dead-letter bound is reached
+
+By default, the subscriber stops when it reaches a dead-letter bound. It destroys nothing. It keeps its
+position and blocks no other subscriber. It starts again when you replay or discard the dead letters.
+
+The stop is a property of the stored set. Each poll reads the size of the set from the file. Thus a close and
+reopen of the subscription gives no more deliveries. A subscription that was already open when the set filled
+also stops.
+
+The bound counts the dead letters in the set:
+
+- A replayed dead letter leaves the count. Thus a stopped subscriber can work through the dead letters that
+  stopped it.
+- If a replay fails back into the set, the message counts again.
+- If you defer a replayed dead letter, Chimera files it as deferred. This also removes it from the dead set.
+
+Under `DropOldest`, Chimera destroys the oldest dead letters. It never destroys a dead letter that a handler
+holds. That message still counts toward the bound. Thus the set can briefly exceed the bound until that
+delivery settles.
+
+The bound also never destroys the message that the current settle files. The message that Chimera reports as
+filed is never one that the bound destroys.
+
+A replayed message that settles back into a full set counts as the newest arrival. Its first arrival time does
+not apply.
+
+### Validation
+
+Chimera checks all these values when a subscription opens. It checks the retention values when the log opens.
+A zero or negative bound would otherwise fail silently and destroy data.
+
+For example, a negative retention age puts the cutoff in the future. The retention pass then removes the
+whole log. To turn off a bound, set it to `null`.
+
+`MaxDeferredAge` alone accepts zero. Zero means "age this out at the next pass". The pass files the message as
+a dead letter and does not destroy it.
+
+Chimera also refuses a retention `MaxBytes` below the `MaxPayloadBytes` of the topic. Such a topic accepts
+messages that no retention pass can keep. The next pass would destroy such a message before any read.

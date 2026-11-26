@@ -1,15 +1,16 @@
 # Integrating with a messaging framework
 
-This library takes bytes and names. Turning your contracts into topic names, and your handlers into something
-that consumes, is the binding you write on top — the same division as any broker client, where mapping a type
-to a queue name is the framework's job rather than the SDK's.
+Chimera takes bytes and names. Your binding maps your contracts to topic names and your handlers to consumers.
+Broker clients use the same split: the framework maps a type to a queue name.
 
-A binding needs three things.
+A binding has three parts: a shared log per topic, a consume loop, and a declared topic name.
 
-## One log per topic, shared
+## Share one log per topic
 
-Frameworks usually create the object that sends a message per call. If each of those opened its own
-`SqliteTopicLog`, you would have several writers on a file that permits one. Keep them somewhere shared:
+1. Keep one `SqliteTopicLog` per topic in a shared place.
+
+   Frameworks usually create a new sender object for each call. A topic file permits one writer. If each sender
+   opens its own `SqliteTopicLog`, the file gets several writers.
 
 ```csharp
 static readonly ConcurrentDictionary<string, SqliteTopicLog> Logs = new();
@@ -18,7 +19,7 @@ static SqliteTopicLog LogFor(ChimeraOptions options, string topic) =>
     Logs.GetOrAdd($"{Path.GetFullPath(options.RootDirectory)}|{topic}", _ => SqliteTopicLog.Open(topic, options));
 ```
 
-## A consume loop
+## Run a consume loop
 
 ```csharp
 while (!stopping.IsCancellationRequested)
@@ -53,24 +54,44 @@ while (!stopping.IsCancellationRequested)
 }
 ```
 
-The outer loop is not optional. `MessagesLostException` comes out of the enumeration itself rather than out
-of a handler, so it ends the `await foreach`, and a loop that only catches inside the body stops consuming
-the first time retention overtakes it. Nothing is lost by restarting the enumeration: the exception is
-raised once, after the position has already moved past the gap.
+1. Catch `MessagesLostException` in an outer loop, outside the `await foreach`.
 
-Start the loop when your endpoint starts listening and cancel it when it closes.
+   The outer loop is necessary. `MessagesLostException` comes from the enumeration itself, and it ends the
+   `await foreach`. If the loop catches exceptions only inside the body, consumption stops the first time
+   retention overtakes the subscriber.
 
-## A declared topic name
+2. Restart the enumeration after the exception.
 
-Take the topic from configuration or from an attribute. Do not derive it from a fully-qualified type name:
-here the topic is a filename, so moving a class to another namespace would point the binding at an empty file
-and leave the old backlog stranded on disk under the old name.
+   A restart loses nothing. Chimera raises the exception once, after the position has moved past the gap.
 
-## Two things this library will not do for you
+3. Start the loop when your endpoint starts to listen.
+4. Cancel the loop when your endpoint closes.
 
-**Encryption.** It stores the bytes you hand it. Encrypt above it, per message, where a key can be scoped to
-a subject and destroying that key erases one person's data without rewriting the store.
+## Declare the topic name
 
-**Waiting.** There is no delayed retry and no scheduler. If a handler wants to try again in five minutes, it
-can await inside the handler at the cost of holding an in-flight slot; if that wait has to survive a restart,
-it belongs in a durable workflow.
+1. Take the topic name from configuration or from an attribute.
+2. Do not derive the topic name from a fully-qualified type name.
+
+   The topic name is a filename. If you move a class to another namespace, the binding points at an empty
+   file. The old backlog stays on disk under the old name.
+
+## Encryption and waiting
+
+### Encryption
+
+Chimera stores payloads as given.
+
+1. Encrypt each message above Chimera.
+
+   At that level, you can scope a key to a subject. When you destroy that key, you erase the data of one
+   person. The store stays as it is.
+
+### Waiting
+
+`FailAsync` makes a message deliverable again at once.
+
+1. To try a message again after a delay, such as five minutes, wait inside the handler.
+
+   The wait holds an in-flight slot.
+
+2. If the wait must survive a restart, put it in a durable workflow.

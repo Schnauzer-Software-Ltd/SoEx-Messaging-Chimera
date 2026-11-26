@@ -1,30 +1,37 @@
 # Why a log and not a queue
 
-A queue is read destructively. One consumer takes a message and it is gone. That works until two components
-need the same message, at which point the queue has to hold a copy per consumer, and every one of those
-copies is a thing that can be delivered, retried and lost separately.
+A Chimera topic is a log. The log has these rules:
 
-A log is not read destructively. The topic is an append-only sequence and each subscriber remembers its own
-position in it. Adding a reader costs nothing, because nothing about the existing readers changes. A slow
-reader inconveniences only itself.
+1. The topic is an append-only sequence of records.
+2. Each subscriber keeps a separate position in the topic.
+3. A read leaves the record in the log.
+4. Retention removes records by a policy. It does not use the positions of the subscribers.
 
-The obvious objection is that a log gives up the things a queue is good at: taking a message out of the way
-because you cannot deal with it now, parking one that has failed too often, and not being blocked at the head
-by either. Those come back on the reader's side rather than the log's. A subscriber keeps a position plus a
-small set of exceptions above it, so it can say "this one is finished with" out of order and carry on. That
-is Apache Pulsar's model: a cumulative acknowledgement with individual ones above it.
+## Subscribers are independent
 
-## What that buys, concretely
+A new subscriber changes nothing for the existing subscribers. A slow subscriber delays only itself.
 
-Two subscribers on one topic each get every message, keep independent positions, and cannot affect each
-other's progress. A poison message becomes one subscriber's dead letter rather than a blockage everybody
-shares.
+Two subscribers on one topic each receive every message. Each keeps an independent position. Neither
+can affect the progress of the other.
 
-Messages are removed on a retention policy rather than when they have been read, so nothing depends on
-gathering positions from every subscriber before anything can be tidied up. That is what stops a stopped
-subscriber from stopping the publisher.
+## Settling out of order
 
-## What it costs
+A subscriber keeps a position and a small set of exceptions above it. It can thus settle a message out of
+order and continue. This is the Apache Pulsar model: a cumulative acknowledgement with individual
+acknowledgements above it.
 
-A message can be removed before a subscriber has read it. A queue cannot do that. This is a real trade and
-[Limits, and how you find out](limits.md) is about it.
+With this model, each subscriber can:
+
+- Set aside a message that it cannot handle now.
+- Dead-letter a message that failed too many times.
+- Continue past these messages. They do not block the head of the topic.
+
+A poison message becomes a dead letter of one subscriber. The other subscribers continue.
+
+## Retention
+
+Retention removes messages by policy, read or unread. It does not collect the positions of the
+subscribers first. Thus a stopped subscriber cannot stop the publisher.
+
+Retention can remove a message before a subscriber reads it. [Limits, and how you find out](limits.md)
+describes this loss and how you find out about it.

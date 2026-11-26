@@ -1,70 +1,89 @@
 # Files on disk
 
-Everything lives in the root directory you configure. There are two kinds of file.
+All Chimera files are in the root directory that you configure. Chimera uses two kinds of file:
 
-`<topic>.topic.db` holds one topic. It is written by the one `SqliteTopicLog` you opened for that topic and
-by nothing else.
+- `<topic>.topic.db` holds one topic. Its only writer is the `SqliteTopicLog` that you opened for that topic.
+- `<subscriber>.subscriber.db` holds the positions, in-flight deliveries and set-aside messages of one
+  subscriber, for all the topics that it reads. Its only writer is that subscriber.
 
-`<subscriber>.subscriber.db` holds one subscriber's positions, its in-flight deliveries and what it has set
-aside, across every topic it reads. It is written by that subscriber and by nothing else.
+## File names
 
-Names are sanitised into filenames, and no two names ever share a file. Letter case is part of that: Windows
-and macOS default to filesystems that ignore case, so an upper-case letter is escaped rather than written
-through, and `Orders` and `orders` stay two topics wherever you run. A name that is all lower-case ASCII
-letters, digits, `-` and `_` is its own filename; anything else picks up escapes and gets longer, by up to
-five characters per character, which is worth knowing if you have both long names and a path limit.
+Chimera sanitises each name into a filename. Two different names always get two different files.
+
+Letter case is part of the name. Windows and macOS default to filesystems that ignore case. Thus Chimera
+escapes each upper-case letter, and `Orders` and `orders` stay two topics on all platforms.
+
+A name of only lower-case ASCII letters, digits, `-` and `_` is its own filename. Each other character becomes
+an escape of up to five characters. Allow for this length if you have long names and a path limit.
 
 ## One writer, any number of readers
 
-This is the rule the whole design rests on. Because each file has exactly one writer, SQLite's single-writer
-limit never binds, and no lease or visibility timeout is needed anywhere: a lock can only be held by one
-subscriber in one process, and if that process is gone the lock is gone with it.
+The whole design depends on this rule: each file has one writer. Thus SQLite's single-writer limit never
+applies. No lease or visibility timeout is necessary. Only one subscriber in one process can hold a lock. When
+that process stops, its lock goes with it.
 
-**Keeping to it is yours, not the library's.** Nothing here refuses a second writer, and that is deliberate.
-There are several ways to hold one writer to a file — a lock file in the root, a named system mutex, a lease
-in whatever your system already coordinates with, or simply a supervisor that runs one instance — and they
-differ in the things that matter: whether the lock survives a kill, what happens on a stale one, whether it
-works across containers or only within a host. Picking one for you would put its failure mode in your system
-without your having chosen it, and an enforcement that looks like a guarantee and is not one is worse than a
-rule you can see. So this is stated rather than enforced, and what the library does instead is behave sanely
-when it is broken.
+### The rule is yours to keep
 
-What breaking it costs, measured rather than asserted: two processes reading one topic through the *same*
-subscriber file handled 200 messages in about 210 deliveries, with none lost and the file readable
-afterwards. That is duplicate handling, which at-least-once already allows and which a handler here should
-already tolerate — not corruption and not loss. Which is precisely why it is easy to do by accident: there is
-no crash to tell you, only work done twice.
+You must keep to the one-writer rule. Chimera does not refuse a second writer. This is by design.
 
-Two spellings of one path are one file to everything here, so a relative root and an absolute one, or
-`/var/events` and `/var/./events`, cannot become two writers by accident. A symbolic link still can: the
-paths are resolved textually, not followed.
+These methods can hold one writer to a file:
 
-It also means **you can open any of these files read-only, from any language, while the system is running**,
-without disturbing anything. You cannot corrupt them, advance anybody's position, or block a writer.
+- a lock file in the root directory
+- a named system mutex
+- a lease in the system that your application already coordinates with
+- a supervisor that runs one instance
+
+These methods differ in these properties:
+
+- whether the lock survives a kill
+- the result of a stale lock
+- whether the lock works across containers or only within one host
+
+Choose the method that fits your system. The measurement below shows the result of a broken rule.
+
+### A broken rule gives duplicate handling
+
+In a measurement, two processes read one topic through the *same* subscriber file. They handled 200 messages
+in about 210 deliveries. No message was lost, and the file was readable after the test.
+
+The result is duplicate handling, with no corruption and no loss. At-least-once delivery already permits
+duplicates, and a handler must tolerate them. Thus the error is easy to make by accident. No crash occurs. The
+only sign is work done twice.
+
+### Paths
+
+Chimera treats two spellings of one path as one file. A relative root and an absolute root, or `/var/events`
+and `/var/./events`, cannot become two writers by accident. A symbolic link can still give two writers. Chimera
+resolves paths as text, and it does not follow links.
+
+### Read-only access
+
+**Any process, in any language, can open these files read-only while the system runs.** A read-only reader
+does not disturb the system. It cannot corrupt a file, move the position of a subscriber or block a writer.
 
 ```
 sqlite3 'file:orders.topic.db?mode=ro' 'SELECT seq, enqueued_at, size FROM log ORDER BY seq DESC LIMIT 20;'
 ```
 
-Two things to know before you do.
+Keep read transactions short. A long read transaction stops the checkpoint of the write-ahead log. The log then
+grows for as long as you hold the transaction. In a test, two thousand small appends against one open snapshot
+grew a `-wal` file to 22 MB. A truncating checkpoint reclaimed none of it until the reader finished.
 
-Keep read transactions short. A long-lived one stops the write-ahead log being checkpointed, and it grows for
-as long as you hold it. Two thousand small appends against one open snapshot grew a `-wal` to 22 MB in
-testing, and a truncating checkpoint could not reclaim any of it until the reader finished.
-
-Read-only is read-only for the database, not for the directory. SQLite still creates the `-wal` and `-shm`
-sidecars, so the process needs write permission on the directory even though it never writes the database. A
-read-only mount will not work.
+Read-only mode applies only to the database file. SQLite still creates the `-wal` and
+`-shm` sidecar files. Thus the process needs write permission on the directory, though it never writes the
+database. A read-only mount does not work.
 
 ## The schema
 
-Treat it as an interface. It is versioned in the `meta` table, and it will not change without that version
-changing.
+Treat the schema as an interface. The `meta` table holds the schema version. Each change to the schema also
+changes that version.
 
-Both kinds of file refuse to be opened by a version of this library older than the one that wrote them, for
-writing as well as for reading, rather than working under a layout that has moved. For a topic that would misread records; for a
-subscriber it would misread positions, which does not fail, it answers, and the answer redelivers everything
-or skips it.
+A version of Chimera older than the version that wrote a file refuses to open that file. This applies to
+both kinds of file, for writing and for reading. An older version would use a layout that has changed:
+
+- In a topic file, it would misread records.
+- In a subscriber file, it would misread positions. That misread gives no error. It gives an answer, and the
+  answer redelivers all messages or skips them.
 
 ```sql
 -- <topic>.topic.db
@@ -81,14 +100,23 @@ entry(topic, source, id, state, attempts, updated)
 set_aside(aside_id, kind, topic, origin, msg_id, enqueued_at, aside_at, delivery, attempts, reason, payload)
 ```
 
-A subscriber holds two positions per topic, because the topic file holds two tables that are ordered
-differently. `mark` is the log sequence at or below which everything is settled. `due_floor` and `id_floor`
-are the same idea for the scheduled table, whose order is due time and then id. `entry` is only the exception
-set: what is in flight now, and what is finished with but not yet absorbed into a position.
+### Positions
 
-Metadata is in columns, never inside the payload. If you encrypt your payloads — which is where encryption
-belongs, not here — you can still measure lag, count messages and triage a backlog with `sqlite3`.
+A subscriber holds two positions per topic, because the topic file has two tables with different orders.
 
-`log_uuid` identifies this log across a restore. A subscriber records the one its position belongs to and
-refuses to carry on against a different one, because a log restored to an earlier point reissues sequences
-its readers already consider finished, and reading on would skip those messages silently.
+- `mark` is the log sequence at or below which all records are settled.
+- `due_floor` and `id_floor` are the position in the scheduled table. That table is in order of due time, then
+  id.
+- `entry` holds only the exceptions: the deliveries in flight now, and the finished messages that a position
+  has not absorbed yet.
+
+### Metadata
+
+Chimera keeps metadata in columns, separate from the payload. Encrypt your payloads before you publish them.
+With encrypted payloads, you can still measure lag, count messages and triage a backlog with `sqlite3`.
+
+### Log identity
+
+`log_uuid` identifies a log across a restore. A subscriber records the `log_uuid` of the log that its position
+belongs to. It refuses to continue against a different log. A log restored to an earlier point reissues
+sequences that its readers have already finished. A read past that point would skip those messages silently.

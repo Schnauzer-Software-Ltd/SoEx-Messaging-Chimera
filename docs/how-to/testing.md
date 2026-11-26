@@ -1,13 +1,16 @@
-# Testing a system built on this
+# Testing a system built on Chimera
 
-The point of an in-process event log is that a system wired together with one can be tested in a single
-process, with real files and real durability, at the speed of a unit test. Two things make that pleasant, and
-one of them is not obvious.
+Chimera runs in process. A test can run a system of several connected components in one process. The test
+uses real files and real durability, at the speed of a unit test. This page shows how to isolate each test, how to find
+when the system is at rest, and how to control time.
 
-## A directory per test
+## Use a directory per test
 
-Everything a run touches lives under `ChimeraOptions.RootDirectory`, so a fresh directory per test is a fresh
-world. Delete it at the end.
+All the files of a run are in `ChimeraOptions.RootDirectory`. A new directory for each test gives each test a
+clean state.
+
+1. Create a new root directory for each test.
+2. Delete the directory at the end of the test.
 
 ```csharp
 public sealed class ChimeraTestRoot : IDisposable
@@ -30,33 +33,46 @@ public sealed class ChimeraTestRoot : IDisposable
 }
 ```
 
-Four things about that cleanup are worth knowing rather than discovering.
+### Clean up a test root
 
-Close the logs and subscriptions before deleting. On Linux a delete under an open handle unlinks the file and
-looks like it worked; on Windows it throws. Swallowing `IOException` covers the difference without hiding a
-real failure, since the test has already made its assertions by then.
+1. Close the logs and subscriptions before you delete the directory.
 
-Delete the directory rather than the files. Each database has `-wal` and `-shm` sidecars. They go on a clean
-close, but not if the process was killed.
+   On Linux, a delete under an open handle unlinks the file and appears to succeed. On Windows, the delete
+   throws. The class above catches `IOException` for this difference. The test has made its assertions before
+   the cleanup, so the catch hides no real failure.
 
-Nothing here pools connections, so a closed log or subscription has really let go of its file. If your test
-opens its own connection to look inside one, set `Pooling=false` on it or call
-`SqliteConnection.ClearAllPools()` before deleting, or cleanup fails for reasons that look like nothing.
+2. Delete the full directory, with its files.
 
-An in-memory database is not an option, and not only because durability is the point. A shared-cache
-in-memory database has no write-ahead log, so a writer blocks readers instead of running alongside them; its
-locking reports `SQLITE_LOCKED`, which `busy_timeout` does not cover; and a connection cannot be both
-in-memory and read-only, so the guarantee that a subscriber physically cannot write a topic file disappears.
-If you want the speed, put the root on a memory-backed filesystem and keep the real semantics.
+   Each database has `-wal` and `-shm` sidecar files. A clean close removes them. After a process kill, they
+   stay on disk.
 
-## Knowing when the system has come to rest
+3. Set `Pooling=false` on each connection that your test opens to a Chimera file.
 
-A test over one subscription can count messages. A test over several components wired together cannot: how
-many messages flow between them is their business, and asserting on it makes the test fail whenever somebody
-adds a hop. What such a test can assert is that the system came to rest, and then that the right things
-happened.
+   As an alternative, call `SqliteConnection.ClearAllPools()` before the delete. Chimera opens its connections
+   without pooling, so a closed log or subscription releases its file. A pooled connection from your test keeps
+   the file open. The cleanup then fails with no clear cause.
 
-`SoEx.Messaging.Chimera.Testing` reads that from the files, without disturbing anything:
+### Use a memory-backed filesystem for speed
+
+1. For speed, put the root directory on a memory-backed filesystem.
+
+   The test keeps the real durability and locking behaviour.
+
+2. Do not use an in-memory SQLite database.
+
+   The tests need durability. A shared-cache in-memory database also has these differences:
+
+   - It has no write-ahead log. A writer blocks the readers.
+   - Its locking reports `SQLITE_LOCKED`. `busy_timeout` does not cover that error.
+   - A connection cannot be both in-memory and read-only. A subscriber then has write access to a topic file.
+
+## Find when the system is at rest
+
+A test of one subscription can count messages. A test of several connected components must not count the
+messages between them. That number belongs to the components. If somebody adds a hop, a count assertion
+fails. Assert that the system is at rest. Then assert the results.
+
+`SoEx.Messaging.Chimera.Testing` reads the state of the system from the files. It changes nothing:
 
 ```csharp
 ChimeraOverview overview = ChimeraInspector.Overview(options);
@@ -65,55 +81,77 @@ if (overview.Settled && overview.DeadLettered == 0)
     // every subscriber has caught up, nothing is being handled, nothing is waiting to go out again
 ```
 
-`Settled` means nothing will move on its own. Dead-lettered and deferred messages do not count against it,
-deliberately: both were parked on purpose, so a system holding them is at rest. It is not necessarily
-healthy, which is a different question — assert `DeadLettered == 0` separately, and a topology that gives up
-on everything fails with a count and a reason instead of waiting for a timeout. That count is what is held
-now, not what was ever given up on; the section below says what follows from that.
+1. Open the topic logs before the subscriptions.
 
-It is a snapshot taken while everything carries on running, not a barrier. A handler that has settled its
-message and is about to publish what comes next looks quiet for that instant, so wait for quiet twice in a
-row with a gap between rather than once. That window closes entirely if your binding publishes before it
-settles, which is the at-least-once shape and worth having anyway.
+   A subscription records its position at creation if the topic file exists at that time. If the file does
+   not exist yet, the subscriber is absent from the overview until its first read. A root with no other
+   outstanding work then reads as settled. With the logs open first, the overview shows each subscriber from
+   the start.
 
-One thing to arrange in the harness: a subscription records its position when it is created, but only if the
-topic file already exists. Open your logs before your subscriptions and every subscriber is visible from the
-start. Otherwise a subscriber that has not yet reached its first read is not in the answer at all, and a root
-with nothing else outstanding reads as settled.
+2. Read `ChimeraInspector.Overview` until `Settled` is true twice in a row, with a gap between the two reads.
 
-When it does not settle, `SubscriberActivity` says who is stuck on what — how far behind, how much scheduled
-work is due, what is in flight right now, what is waiting to be retried or replayed. And for one message:
+   The overview is a snapshot. The system continues to run while the inspector reads it. A handler that has
+   settled its message and is about to publish the next one looks quiet for that instant. If your binding
+   publishes before it settles, this window does not occur. Publish before you settle. This order is the
+   at-least-once shape, and we recommend it.
+
+3. Assert `DeadLettered == 0` as a separate check.
+
+   `Settled` means that nothing moves on its own. Dead-lettered and deferred messages are parked by intent, so
+   they do not prevent `Settled`. A system at rest can still have failures. With this check, a topology that
+   gives up on all its messages fails with a count and a reason, before the timeout. `DeadLettered` counts the
+   dead letters held now. The next section gives the result of this.
+
+### If the system does not settle
+
+`SubscriberActivity` shows each stuck subscriber and its work:
+
+- its lag
+- the scheduled work that is due
+- the deliveries in flight now
+- the messages that wait for a retry or a replay
+
+For one message, use `ChimeraInspector.StatusOf`:
 
 ```csharp
 MessageStatus status = ChimeraInspector.StatusOf(options, "orders", "billing", messageId);
 // Pending, NotYetDue, InFlight, AwaitingRetry, Completed, Deferred or DeadLettered, with the reason
 ```
 
-A deferred or dead-lettered message that has been replayed and is being handled right now reads as
-`InFlight`, not as parked. It agrees with the overview, which keeps such a subscriber unsettled: a test that
-waits for quiet and a test that asks about one message should never disagree about whether work is running.
+`StatusOf` reports `InFlight` for a replayed deferred or dead-lettered message during its handling. The
+overview keeps that subscriber unsettled at the same time. A test that waits for rest and a test that asks
+about one message always agree on whether work runs.
 
-Ask by message id, not by the sequence on an envelope: sequences come from two different tables and only look
-orderable. One thing it cannot tell you is how many attempts a message that succeeded took. The row carrying
-that count is deleted when the position absorbs it, which is what keeps a subscriber's file from growing with
-the log. If a test needs that, watch the deliveries — every envelope carries its own attempt number.
+1. Query by message id.
+
+   Do not use the sequence on an envelope. Sequences come from two different tables, and they cannot be
+   compared across the tables.
+
+2. To count the attempts of a successful message, watch the deliveries.
+
+   Each envelope carries its attempt number. `StatusOf` does not report the attempt count of a completed
+   message. The row that holds that count is deleted when the position absorbs it. This deletion keeps the
+   subscriber file from growing with the log.
 
 ## What these cannot tell you: that nothing was lost
 
-Both of these read the files as they are now, and destroying a message destroys what would say it had been
-there. So neither `Completed` nor `DeadLettered == 0` is a statement about loss, and it is worth knowing which
-way round each of them fails.
+`ChimeraInspector.Overview` and `ChimeraInspector.StatusOf` read the files as they are now. When Chimera
+destroys a message, it also destroys the records that show the message existed. Thus `Completed` and
+`DeadLettered == 0` do not prove that nothing was lost. Each one fails in a different way:
 
-`Completed` means settled successfully **or destroyed by the dead-letter bound**. Dropping a dead letter
-removes the same records completing it removes, so afterwards there is nothing left to tell the two apart.
-`Unknown` means the topic no longer holds a record with that id, which covers a message that was never
-published, one log retention removed unread, and one this subscriber completed long ago: the answer starts
-from the topic file, and a record that is gone ends it. So `Completed` is not a state every success stays in
-either. `Overview.DeadLettered` counts what is being held now, so a dead letter the bound destroyed has left
-that count with the set.
+- `Completed` means settled successfully **or destroyed by the dead-letter bound**. A dropped dead letter
+  loses the same records as a completed message. After the drop, the two cases look the same.
+- `Unknown` means that the topic holds no record with that id. This covers three cases: a message that was
+  never published, a message that log retention removed unread, and a message that this subscriber completed
+  long ago. `StatusOf` starts from the topic file and stops when the record is gone. Thus a successful message
+  does not always stay `Completed`.
+- `Overview.DeadLettered` counts the dead letters held now. A dead letter that the bound destroyed has left the
+  set, so it has also left the count.
 
-None of that is silent. Every drop and every deferral aged out is counted in the subscriber's file as it
-happens, and `ApplyRetentionAsync` returns the pair:
+### Assert on the set-aside report
+
+Chimera records each loss. The subscriber file counts each drop and each deferral that ages out, at the time it
+occurs. `ApplyRetentionAsync` returns the two counts:
 
 ```csharp
 SetAsideReport report = await subscription.ApplyRetentionAsync(ct);
@@ -121,33 +159,53 @@ SetAsideReport report = await subscription.ApplyRetentionAsync(ct);
 // report.DeferredAgedOut — deferrals that became dead letters because they sat too long
 ```
 
-That report is where a test asserts nothing was lost. It is read once and cleared, to whichever pass asks
-first, so a harness that wants it has to be the thing running the passes rather than sharing them with a
-maintenance loop. The simpler route, if the test does not care about the bound, is not to set
-`DeadLetterOverflow.DropOldest`: it is opt-in, and the default stops delivering instead of destroying
-anything.
+1. Run the retention passes from the test harness.
 
-## Controlling time
+   The report is read once and then cleared. The first pass that asks for it gets it. If a maintenance loop
+   also runs passes, the loop can get the report before the test.
 
-`ChimeraOptions.Clock` is a `TimeProvider`, and a fake one has to be a real fake: use
-`Microsoft.Extensions.TimeProvider.Testing`'s `FakeTimeProvider`, never a hand-rolled provider that only
-answers `GetUtcNow`. A reader waits on this clock when it has nothing to deliver, so a provider that does not
-drive timers leaves that wait on the real clock and the wake-at-the-due-time path never runs. A test written
-against one of those passes because the poll interval happened to fire, which is not what it says it checked.
+2. Assert on the report that nothing was lost.
 
-That same fact decides how to use it, and the answer differs by what you are testing.
+If the test does not need the dead-letter bound, do not set `DeadLetterOverflow.DropOldest`. This setting is
+opt-in. By default, a full dead-letter set stops delivery and destroys nothing.
 
-**If the test is about your components rather than about time**, leave this alone. Use the real clock and a
-short `PollInterval`, and settle the question of when to assert with the overview above. Faking time here
-buys nothing and costs the problem below.
+## Control time
 
-**If the test is about time** — a message scheduled for later, retention, deferred messages ageing out — then
-a fake clock is right, and one rule comes with it. Advancing only fires timers that have already been
-registered, so advance while nothing is reading, between one read and the next. In a test where several
-reader loops run continuously for its whole duration there is no such moment, and a reader that misses the
-tick waits until the next one. Pass a real-clock cancellation to every read loop regardless: it is the only
-thing that ends a wait on a fake clock that is not going to advance again.
+`ChimeraOptions.Clock` is a `TimeProvider`.
 
-Domain timing is a different matter and does not belong here at all. This library owns no scheduler on
-purpose. If a component says "do this in an hour", that is a durable workflow's timer, and the fake clock
-belongs to the workflow rather than to the transport underneath it.
+1. To fake time, use `FakeTimeProvider` from `Microsoft.Extensions.TimeProvider.Testing`.
+
+   Do not use a hand-rolled provider that only answers `GetUtcNow`. A reader waits on this clock when it has
+   nothing to deliver. A provider that does not drive timers leaves that wait on the real clock. The path that
+   wakes the reader at the due time then never runs. A test on such a provider passes only because the poll
+   interval fired. That test does not check what it claims to check.
+
+The correct use of the clock depends on what the test is about.
+
+### If the test is about your components
+
+1. Use the real clock.
+2. Set a short `PollInterval`.
+3. Use the overview to find when to assert.
+
+A fake clock gives no advantage here, and it brings the problem in the next section.
+
+### If the test is about time
+
+Examples are a message scheduled for later, retention, and deferred messages that age out. Use a fake clock,
+and obey these rules:
+
+1. Advance the clock only while nothing reads, between one read and the next.
+
+   An advance fires only the timers that are already registered. Some tests run several reader loops
+   continuously for their full duration. Such a test has no quiet moment. A reader that misses the tick waits
+   until the next tick.
+
+2. Pass a real-clock cancellation to every read loop.
+
+   This cancellation is the only thing that ends a wait on a fake clock that does not advance again.
+
+### Domain timing
+
+Keep domain timing out of these tests. Chimera schedules messages for a due time (`ScheduleAsync`). If a
+component must "do this in an hour", use a durable workflow timer. The fake clock then belongs to the workflow, above the transport.

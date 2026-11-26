@@ -1,205 +1,271 @@
 # Limits, and how you find out
 
-This library works while you have one machine and one writer per file, and the publisher and its subscribers
-stop and start together. Everything below follows from that, and nothing below is hidden.
+Chimera has three operating rules:
 
-One writer per file is the constraint, not one process. A publisher in one process and its subscribers in
-another is a supported shape — separate files, one writer each — and there are tests that run it that way:
-a publisher writing five hundred messages from another process, subscribers in other processes reading them,
-and two subscribers in two processes both getting everything. What is not supported is two writers on one
-file, and that is a rule rather than something the library refuses. Measured, breaking it costs duplicate
-handling and not corruption: two processes on one subscriber file handled 200 messages in about 210
-deliveries, with none lost and the file readable afterwards. At-least-once already allows that, which is why
-it is a rule you can break and not notice.
+1. It runs on one machine.
+2. Each file has one writer.
+3. The publisher and its subscribers stop and start together.
+
+Each limit on this page follows from these rules. Each section gives the limit, its cause, and how you
+find out about it.
+
+## One writer per file
+
+The rule applies to each file. A publisher and its subscribers can run in different processes, because
+each one writes to a different file. Tests run this configuration:
+
+- A publisher in one process writes five hundred messages.
+- Subscribers in other processes read them.
+- Two subscribers in two processes each receive all the messages.
+
+Two writers on one file break the rule. The library does not refuse them. In a measured run, two
+processes on one subscriber file handled 200 messages in about 210 deliveries. No message was lost. The
+file stayed readable. The result of the break is duplicate handling, which at-least-once delivery
+permits. Thus a break of this rule can go unnoticed. Keep one writer on each file.
 
 ## Messages can be removed before they are read
 
-The log is trimmed on retention — an age, a size, a count — and never on what subscribers have got through.
-That is a decision rather than an omission. Waiting for the slowest subscriber turns a bounded loss into
-unbounded growth, and the growth lands on the publisher, so one stuck reader stops every write. It also needs
-a way to forget subscribers that will never come back, which is another timer quietly making the same
-decision somewhere less visible. Apache Pulsar retains until every subscription has acknowledged and
-consequently ships a quota whose options are to block the publisher or to drop the backlog anyway. There is
-no third answer to find.
+Retention removes records from the log by age, size or count, read or unread. Retention does not wait for
+the slowest subscriber. Thus one stuck subscriber cannot stop writes to the topic.
 
-So the answer here is to make the loss bounded, attributable, and loud.
+Chimera bounds each loss, names the subscriber that had the loss, and reports it at three times: before,
+during and after the retention pass.
 
-**Before it happens.** Ask a subscriber how far behind it is. `LagAsync` reports a duration as well as a
-count, because a number of messages cannot be compared with a policy written in hours. It counts the
-scheduled table as well as the log, since the age bound removes from both. Alarm when the lag approaches the
-retention window.
+### Before a loss: lag
 
-**As it happens.** `ApplyRetentionAsync` reads the subscribers' files and names the ones that had not reached
-what it removed, and how many each lost. Log that at warning. It counts from each subscriber's position, so a
-subscriber holding a delivery it goes on to complete is named here for a message that was never lost to it —
-this number is what the log can see from outside, and the subscriber's own report below is the one that knows
-how each delivery ended.
+`LagAsync` gives the lag of one subscriber as a count and as a duration. Use the duration to compare the
+lag with a retention policy written in hours. The lag includes the scheduled table and the log, because
+the age bound removes rows from both. Set an alarm for when the lag approaches the retention window.
 
-**Afterwards.** The subscriber itself throws `MessagesLostException` on its next read, carrying the count and
-the range of sequences. Two things are counted in it: records this subscriber never read, and deliveries it
-failed. A failure is a promise that the message will come again, and only the log can keep that promise, so a
-record removed while a redelivery is owed against it is as lost as one nobody ever saw. A delivery a handler
-still has in its hands is neither, and is not counted while that is true: what became of it is not known yet.
-It is counted when the handler is finished with it and the answer is a failure — on a later read, once the
-position has already moved — and it is `false` from `FailAsync` at the time, which is that call saying it
-cannot keep the promise it would otherwise be making. Between them, every record either reaches a handler that
-deals with it or turns up in exactly one of these reports. It then moves its position over the gap and carries on, because a position stuck
-below records that will never exist again would never move again. It comes out of the read loop rather than
-out of a handler, so the loop has to be written to catch it and start reading again;
-[integrating](../how-to/integrating.md) shows the shape. It is reported on the next poll whether or not the
-topic is still busy, including when a pass removed everything and left the log empty — the sequence counter
-is durable, so an empty log still knows how far it once got. A topic going quiet is exactly when an operator
-asks whether everything was drained, and it is no time to start answering yes by default.
+### During a retention pass: the retention report
 
-The retention size and the payload limit are checked against each other when a topic is opened. A `MaxBytes`
-below `MaxPayloadBytes` describes a topic that will accept a message no retention pass can then keep: it is
-written, and removed by the next pass as the record that put the log over its size, possibly before anyone
-read it. Since nothing can make such a message survive, the configuration is refused rather than the messages.
+`ApplyRetentionAsync` reads the subscriber files. Its report names each subscriber that had not reached
+the removed records, and the count that each subscriber lost. Log this report at warning level.
 
-The same is true on the scheduled side, but only that far: a scheduled delivery that failed is reported when
-its row goes, because the subscriber holds its own record of the attempt, while a scheduled message nobody
-ever read is not. Positions there are due times rather than sequences, and a due-time position cannot tell a
-row that was removed from one that was never published — so there is no gap to notice and nothing honest to
-say. Bound the scheduled table where the messages are created, and watch `RetentionReport.ScheduledRemoved`.
+The report counts from the position of each subscriber. It can thus name a subscriber for an in-flight
+message that the subscriber later completes. This count is the view of the log from outside. The
+subscriber's report, `MessagesLostException`, knows the result of each delivery.
 
-Only a subscriber that was there is told. One created later takes its position from the oldest record still
-in the log, so records removed before it existed are not reported to it as loss, because they were never its
-to read. That is what both of the places this is meant to be swapped for do: a Service Bus subscription
-receives nothing sent before it was created, and a JetStream consumer replays the retained window without
-complaining about what has aged out of it. Which of those two a new subscriber gets is
-`SubscriptionOptions.Start`, and it applies once, when the position is first recorded.
+### After a loss: `MessagesLostException`
 
-## The other way a message can be destroyed: a full dead-letter set
+On its next read, the subscriber throws `MessagesLostException`. The exception gives the count and the
+range of sequences. The count includes:
 
-By default a subscriber that fills its dead-letter set stops delivering until somebody deals with it, and
-nothing is destroyed. `DeadLetterOverflow.DropOldest` chooses the other answer, and it is the only setting in
-this library that destroys a message to make room. It is not the default for that reason.
+- Records that this subscriber did not read.
+- Deliveries that this subscriber failed. A failed delivery is owed again, and only the log can supply it.
+  A record that retention removes while a redelivery is owed is lost.
 
-What it destroys, it chooses newest-first: the set keeps its newest dead letters and drops what they have
-pushed out. A message larger than the whole byte bound is charged to nothing on the way through that sum — it
-is over the bound on its own, so it is the row that goes, and the dead letters older than it are not
-collateral. That case is refused at the settle wherever a caller is there to refuse to. It still arrives by
-two routes with no caller: a deferral that ages out into the dead set, and a bound lowered under rows already
-filed, since `SetAsidePolicy` goes with the subscription you open and not with the rows in the file.
+A delivery that a handler holds is not counted while the handler holds it, because its result is not
+known yet. If the handler then fails it, a later read counts it, after the position has moved. At the
+time of the failure, `FailAsync` returns `false`. This result tells the caller that the redelivery cannot
+occur.
 
-What it spares is exactly one thing: a message a handler has in its hands. That handler is about to be told
-what happened to it, and telling it about a row that no longer exists is the sort of untruth the rest of this
-design goes to some length to avoid. Everything else in the set is eligible, and that includes a message you
-have replayed and not yet been given.
+Each record thus reaches a handler that settles it, or it appears once in these two reports.
 
-Worth stating plainly, because it looks like a hole. `ReplayAsync` answering true means the row was marked
-for delivery; it is a statement about the store as it stood, not a promise that the delivery happens. Nothing
-has read the row yet. A bound reached in the meantime takes the oldest, and if that is the row you replayed,
-that is the row that goes — the same relationship an append has with retention, which can remove a record
-before anybody reads it.
+After the exception, the subscriber moves its position over the gap and continues. A position below
+removed records could never move again. The exception comes from the read loop, not from a handler.
+Write the read loop to catch the exception and read again. [Integrating](../how-to/integrating.md) shows
+this loop.
 
-We could spare replayed rows too, and chose not to. In-flight deliveries are capped by `MaxInFlight`, so
-exempting them costs a known and small amount of slack. There is no cap on how many rows can be made ready at
-once, so exempting those would let a caller who replayed a whole set switch the bound off. A bound that can be
-suspended is a worse thing to have than loss that is counted, and counted is what this is: every destroyed
-dead letter lands in `SetAsideReport.DeadDropped`, which is durable, survives the process, and is reported by
-whichever pass asks next. If you need the guarantee rather than the count, `StopDelivering` is the setting
-that gives it.
+The subscriber reports the loss on the next poll, also when the topic is quiet. This includes a pass
+that removed all records and left the log empty. The sequence counter is durable, so an empty log keeps
+the highest sequence that it reached.
+
+### Retention size and payload limit
+
+When a topic opens, Chimera compares `MaxBytes` with `MaxPayloadBytes`. If `MaxBytes` is below
+`MaxPayloadBytes`, the topic can accept a message that no retention pass can keep. The next pass removes
+that message as the record that put the log over its size, possibly before a subscriber reads it.
+Chimera refuses this configuration.
+
+### Scheduled messages and retention
+
+On the scheduled side, Chimera reports one kind of loss. It reports a failed scheduled delivery when
+retention removes its row, because the subscriber keeps a record of the attempt. It does not report a
+scheduled message that no subscriber read.
+
+In the scheduled table, a position is a due time, not a sequence. A due-time position cannot tell a
+removed row from a row that was never published, so the subscriber sees no gap. Bound the scheduled
+table where your code creates the messages. Monitor `RetentionReport.ScheduledRemoved`.
+
+### New subscribers
+
+Chimera reports a loss only to a subscriber that existed when retention removed the records. A
+subscriber created later starts from the oldest record still in the log (`Start = Beginning`, the default),
+or from the next message (`Start = Next`). Records removed before it existed were never its to read, so they
+are not reported to it as loss.
+
+`SubscriptionOptions.Start` sets where a new subscriber starts. It maps to the two products that Chimera
+can replace:
+
+- A Service Bus subscription receives nothing that was sent before its creation.
+- A JetStream consumer replays the retained window and reports nothing about the records that aged out.
+
+`SubscriptionOptions.Start` applies once, when Chimera first records the position.
+
+## A full dead-letter set
+
+By default (`DeadLetterOverflow.StopDelivering`), a subscriber with a full dead-letter set stops delivery
+until somebody acts. No message is
+destroyed. `DeadLetterOverflow.DropOldest` is the other setting. It is the only setting in this library
+that destroys a message to make room. For that reason, it is not the default.
+
+### What `DropOldest` destroys
+
+The set keeps its newest dead letters and drops the oldest. A message larger than the whole byte bound
+is not added to the byte sum. It is over the bound by itself, so it is the row that goes. The older dead
+letters stay.
+
+The settle refuses this case when a caller is present. Two routes with no caller can still bring such a
+message into the set:
+
+- A deferral that ages out into the dead-letter set.
+- A bound lowered below rows already filed. `SetAsidePolicy` applies to the subscription that you open,
+  not to the rows in the file.
+
+### What `DropOldest` keeps
+
+`DropOldest` keeps one kind of message: a message that a handler holds. The handler will receive the
+result for that message, so its row must exist. All other messages in the set can be dropped. This
+includes a message that you replayed and have not received yet.
+
+### Replayed messages
+
+If `ReplayAsync` returns true, the row was marked for delivery at that time. This is a fact about the
+store, not a promise of delivery. No reader has read the row yet. If the set reaches its bound in the
+meantime, the oldest row goes. That row can be the row that you replayed. An append has the same
+relation with retention, which can remove a record before a subscriber reads it.
+
+Replayed rows are not exempt. `MaxInFlight` caps in-flight deliveries, so their exemption adds a small,
+known amount of slack. No cap limits how many rows can be made ready at once. An exemption for those rows
+would let a caller that replays a whole set disable the bound.
+
+### How you find out
+
+`SetAsideReport.DeadDropped` counts each destroyed dead letter. The count is durable and survives the
+process. The next pass that asks reports it. If you need a guarantee that no dead letter is destroyed, use
+`StopDelivering`.
 
 ## Scheduled messages stay in the file after they are delivered
 
-A scheduled message is not moved into the log and is not removed when somebody consumes it. Subscribers read
-the topic file and cannot write to it, and there may be another subscriber that has not taken the message
-yet, so only retention removes these rows. Each subscriber therefore keeps its own position in the scheduled
-table, in due-time order, exactly as it keeps a position in the log.
+A scheduled message stays in the scheduled table of the topic file. It does not move into the log.
+Delivery does not remove it. Only retention removes these rows, for two reasons:
 
-Three consequences worth knowing. A scheduled row occupies disk until retention removes it, which is
-`RetentionPolicy.MaxAge` measured from the due time, and never if you have set the policy to unbounded.
+- Subscribers read the topic file and cannot write to it.
+- Another subscriber can still be due to receive the message.
 
-`MaxBytes` and `MaxCount` never *remove* these rows — they trim the log. That is deliberate: a scheduled
-message is work somebody asked for at a time that has not arrived, and destroying it to stay under a size
-bound is not trimming history, it is cancelling the future. So the same two settings are answered at the
-other end instead. When the scheduled table is at the bound, `ScheduleAsync` throws
-`ScheduleRefusedException` and the message is not stored. Service Bus does exactly this — scheduled messages
-count against the entity quota and the send is refused — and it is the only answer that neither destroys
-work nor lets the table grow without limit.
+Each subscriber keeps a separate position in the scheduled table, in due-time order. It works the same
+as the subscriber's position in the log.
 
-Two consequences. Ordinary appends are unaffected while schedules are being refused: the log answers those
-settings by trimming, as it always did, so a full scheduled table does not stop anything being published.
-And the file's ceiling is the two bounds added together rather than either one — the log held at its bound by
-trimming, the scheduled table at its bound by refusing. What clears a refusal is due times arriving, or
-cancelling messages nobody wants any more.
+### Disk use
 
-What the quota counts is the messages still waiting for a due time, not every row in the table. A delivered
-scheduled row stays where it is — fan-out means no one subscriber may remove it — so counting rows would
-count delivered history as pending work, and a topic doing steady scheduled traffic would be refused with
-nothing whatsoever outstanding. Service Bus counts what is waiting for the same reason, having removed the
-row at enqueue.
+A scheduled row stays on the disk until retention removes it. `RetentionPolicy.MaxAge`, measured from
+the due time, sets when. If the policy is unbounded, the row stays.
 
-Which means the two settings bound *future-dated* work, and the rest of the table is bounded by time. Size
-them with both halves in mind:
+### The scheduled quota
+
+`MaxBytes` and `MaxCount` trim the log. They never *remove* scheduled rows. On the scheduled side, they
+apply when you schedule a message. When the scheduled table is at the bound, `ScheduleAsync` throws
+`ScheduleRefusedException`. Chimera does not store the message. Service Bus has the same limit:
+scheduled messages count against the entity quota, and the send is refused.
+
+The quota has these effects:
+
+- Ordinary appends continue while Chimera refuses schedules. The log applies the two settings by
+  trimming, so a full scheduled table does not stop publishing.
+- The size limit of the file is the sum of the two bounds. Trimming holds the log at its bound. Refusal
+  holds the scheduled table at its bound.
+- A refusal clears when due times arrive, or when you cancel messages that nobody needs.
+
+The quota counts the messages that wait for a due time. It does not count every row in the table. A
+delivered scheduled row stays in the table, because with fan-out no single subscriber can remove it. A
+count of all rows would count delivered history as pending work. A topic with steady scheduled traffic
+would then get refusals with no work outstanding. Service Bus also counts the messages that wait. It
+removes the row at enqueue.
+
+### Sizing the scheduled table
+
+The two settings bound *future-dated* work. Time bounds the rest of the table. Size them with both parts
+in mind:
 
     rows in the file  ≈  MaxCount  +  (rate of due-or-past-due schedules × MaxAge)
 
-The second term is the one that surprises people. A schedule whose due time has already arrived is stored as
-due now, so it is never inside the counted set — not even at the instant it is written — and `MaxCount` does
-not see it at all. Nothing is wrong with that; those rows are past-due history, the same thing the trailing
-end of a stream of short-dated schedules becomes a moment after it is written. But it means a publisher that
-schedules for now, or a second ahead, is bounded by `MaxAge` alone. If that traffic is heavy, bound it by
-lowering `MaxAge` on the topic — or publish it with `AppendAsync`, which is what a message with no waiting to
-do actually is.
+The second term often surprises people. Chimera stores a schedule whose due time has arrived as due
+now. That schedule is never in the counted set, also at the moment Chimera writes it. `MaxCount` does not
+see it. These rows are past-due history. A stream of short-dated schedules becomes the same history a
+moment after Chimera writes it.
 
-We do not count the past-due tail against the quota, and there is no option to. The bound would have to mean
-"work still owed", and no publisher can know that: whether a scheduled message has been delivered is recorded
-in each subscriber's own file, and with fan-out there is no single answer to give. Counting the whole table
-instead is the thing described above, which refuses schedules over delivered history. So the quota says what
-it can say honestly — future-dated work is bounded by count and bytes, the due tail by age — rather than
-approximating the number nobody here can compute.
+Thus `MaxAge` alone bounds a publisher that schedules for now, or for a second ahead. If that traffic is
+heavy, lower `MaxAge` on the topic. You can also publish the messages with `AppendAsync`, because a
+message with no wait is an append.
 
-And a due time already in the past means due now, and is stored as now: a row that arrived behind a position
-already passed would sit below it and never be offered. Service Bus reads a scheduled enqueue time that has
-gone the same way. The due time is read when the row is committed rather than when the call was made, so a
-publisher whose writes are queued behind a burst cannot produce a row that lands underneath a position that
-moved in the meantime.
+### The past-due tail
+
+The quota does not count the past-due tail. No option enables that count. To count it, the bound would
+have to mean "work still owed". No publisher can know that value. Each subscriber records in its own file
+whether it received a scheduled message. With fan-out, there is no single answer. A count of the whole
+table refuses schedules because of delivered history, as the section above shows. So the quota bounds
+future-dated work by count and bytes, and the due tail by age.
+
+### Due times in the past
+
+Chimera stores a due time in the past as now. Otherwise, a row could arrive behind a position that a
+subscriber has passed, and nobody would receive it. Service Bus reads a past scheduled enqueue time the
+same way. Chimera reads the due time when it commits the row, not when the call occurs. Thus a publisher
+with writes queued behind a burst cannot put a row under a position that moved in the meantime.
 
 ## A crash loses nothing that was acknowledged
 
-`AppendAsync` returns when the record is durable. The default setting survives a process crash but not a
-power cut; `Durability.PowerLoss` costs an fsync per commit and survives that too.
+`AppendAsync` returns when the record is durable. The default setting survives a process crash, but not
+a power cut. `Durability.PowerLoss` adds an fsync per commit and also survives a power cut.
 
-A delivery interrupted by a crash comes back, and it comes back counted. A message that brings the process
-down is dead-lettered rather than retried for ever.
+A delivery that a crash interrupts comes back. Chimera counts it. A message that crashes the process is
+dead-lettered. Chimera does not retry it for ever.
 
 ## Delivery order is not guaranteed
 
-Append order is total and stable. Delivery order is not, because a failed message returns after ones handed
-out later, and handlers run concurrently. Service Bus and JetStream make the same distinction, so code
-written against this keeps working when you move to one. If you need ordering, you need one of those, or a
-workflow.
+Append order is total and stable. Delivery order can differ from append order for two reasons:
 
-## No backoff, no delayed retry, no scheduler
+- A failed message returns after messages that were delivered later.
+- Handlers run concurrently.
 
-A failed message comes straight back, up to a limit. A message you defer stays deferred until you ask for
-it. Anything that has to wait durably belongs in a durable workflow, which is a different tool.
+Service Bus and JetStream make the same distinction. Code written for Chimera thus continues to work
+when you move to one of them. If you need ordering, use one of them, or a workflow.
 
-There is one wait in the library, and it is not a schedule: a reader with nothing to deliver pauses before
-looking again, for no longer than the poll interval. It is taken from `ChimeraOptions.Clock` along with
-everything else here that reads the time, which is worth knowing if you hand it a clock you drive yourself.
-Nothing wakes up in order to deliver a particular message, and there is no timer per message anywhere.
+## Retries and waits
 
-## A clock that goes backwards costs latency, not messages
+A failed message comes back at once, up to a limit. A deferred message stays deferred until you request
+it. For a durable wait, use a durable workflow.
 
-Each file holds its stamps at the newest moment it has already recorded, seeded from the file when it is
-opened, so an NTP correction or a resumed virtual machine cannot write a record that looks older than one
-already there. Without that, a due-now scheduled message written just after a step back lands underneath the
-position a subscriber has already passed and is never offered again, and age retention picks a cutoff by time
-that it then deletes by sequence, taking unexpired records with it.
+The library has one wait. A reader with nothing to deliver pauses for no longer than the poll interval
+before it reads again. The wait uses `ChimeraOptions.Clock`, as all the time reads in the library do.
+This matters if you supply a clock that you control. No timer runs per message. Nothing starts in order
+to deliver one particular message.
 
-What it costs: after a step back, a message published as due now becomes due when the wall clock catches up,
-late by the size of the step. Nothing is dropped and nothing is hidden.
+## A clock that goes backwards
 
-What it does not cover: two processes writing one topic directory have two clocks, and no single file can put
-them in order. That is the same boundary as everywhere else here — one machine.
+Each file stamps a record with a time no earlier than the newest time it has recorded. Chimera reads that
+time from the file when it opens the file. An NTP correction or a resumed virtual machine thus cannot
+write a record that looks older than a record already there. This rule prevents two faults:
+
+- A due-now scheduled message, written immediately after a step back, lands below a position that a subscriber
+  has passed. Nobody receives it.
+- Age retention picks a cutoff by time, then deletes by sequence. It removes records that have not
+  expired.
+
+The rule has a cost. After a step back, a message published as due now becomes due when the wall clock
+catches up. It is late by the size of the step. No message is dropped or hidden.
+
+The rule holds within one file. Processes that write different files in one root directory use separate
+clocks. No single file can put the stamps of two clocks in order. This is the one-machine rule again.
 
 ## Deleting is not erasing
 
-Retention removes records from the database. On an SSD the old content survives underneath until wear
-levelling reclaims it; on a copy-on-write filesystem it survives until the old extent is released, which a
-snapshot can postpone indefinitely. No setting here changes that. If bytes must be unrecoverable they have to
-be unreadable before they are written, which means encrypting above this library and destroying the key when
-the time comes.
+Retention removes records from the database. The old content stays on the disk for a time:
+
+- On an SSD, it stays until wear levelling reclaims it.
+- On a copy-on-write filesystem, it stays until the old extent is released. A snapshot can postpone this
+  indefinitely.
+
+No setting in this library changes this. If bytes must be unrecoverable, they must be unreadable before
+Chimera writes them. Encrypt them above this library. Destroy the key when the time comes.

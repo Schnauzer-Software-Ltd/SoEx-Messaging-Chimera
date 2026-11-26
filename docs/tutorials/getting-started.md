@@ -1,6 +1,13 @@
 # Getting started
 
-You need a directory. There is nothing to install and nothing to run.
+This tutorial publishes messages to a topic and reads them with two subscribers. Chimera needs one directory,
+the root directory.
+
+## Publish a message
+
+1. Set the root directory in `ChimeraOptions`.
+2. Open the topic log for the `orders` topic.
+3. Append a record to the topic.
 
 ```csharp
 var options = new ChimeraOptions { RootDirectory = "/var/lib/myapp/events" };
@@ -9,10 +16,14 @@ await using var orders = SqliteTopicLog.Open("orders", options);
 await orders.AppendAsync(Encoding.UTF8.GetBytes("order-1234 placed"));
 ```
 
-`AppendAsync` returns once the record is on disk. If your process dies immediately afterwards, that message
-is still there when it comes back.
+`AppendAsync` returns when the record is on disk. If the process stops immediately after that, the record
+stays in the topic. The record is there when the process starts again.
 
-Reading is a subscription, named after whoever is doing the reading:
+## Read the messages
+
+4. Open a subscription for the subscriber `billing` on the `orders` topic.
+5. Read the messages in a loop.
+6. Settle each message. Call `CompleteAsync` after the handler succeeds. Call `FailAsync` if the handler throws.
 
 ```csharp
 await using var worker = SqliteSubscription.Open("billing", "orders", options);
@@ -32,30 +43,32 @@ await foreach (EventEnvelope message in worker.ReadAsync(cancellationToken))
 }
 ```
 
-Every message you take must be settled — completed, failed, deferred or dead-lettered. Until you settle it,
-it occupies one of the in-flight slots, and once they are all occupied you stop being given work. That is
-deliberate: it is better to stop than to accumulate work nobody is tracking.
+The subscriber name identifies the reader. Settle every message that you read: complete, fail, defer or
+dead-letter it.
 
-This loop is the short version. A long-running one also has to survive retention removing records it had not
-reached, which ends the enumeration rather than throwing at a handler;
-[integrating](../how-to/integrating.md) has the loop to copy.
+Each message that is not settled holds one in-flight slot. When all the in-flight slots are full, delivery
+stops until you settle a message. This stop keeps all work in progress tracked.
 
-## Adding a second reader
+This loop is a short version. Retention can remove records that a long-running loop has not read yet. The
+enumeration then ends. No exception goes to a handler. [Integrating](../how-to/integrating.md) gives the full
+loop to copy.
 
-Add one. It costs nothing and the first one does not notice.
+## Add a second subscriber
+
+7. Open a subscription for a second subscriber, `audit`, on the same topic.
 
 ```csharp
 await using var audit = SqliteSubscription.Open("audit", "orders", options);
 ```
 
-Each subscriber keeps its own position, so both see every message, and one falling behind does not hold the
-other up. This is the difference between a log and a queue, and it is why adding a reader is not a change to
-anything that already exists.
+Each subscriber keeps a separate position in the topic. Both subscribers get every message. A slow subscriber
+does not delay the other subscriber. The new subscriber costs nothing. The first subscriber continues as before.
 
 ## What to do next
 
-Messages older than the retention window are removed whether or not anybody read them, so run a maintenance
-pass somewhere:
+8. Run a retention pass from a maintenance task.
+
+Retention removes messages older than the retention window, read or unread.
 
 ```csharp
 RetentionReport report = await orders.ApplyRetentionAsync();
@@ -66,7 +79,9 @@ if (report.AnyoneOvertaken)
 }
 ```
 
-And ask a subscriber how far behind it is, in the units your retention window is written in:
+9. Ask each subscriber for its lag.
+
+`LagAsync` reports the lag in the same units as the retention window.
 
 ```csharp
 SubscriptionLag lag = await worker.LagAsync();
