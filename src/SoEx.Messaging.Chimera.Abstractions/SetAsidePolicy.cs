@@ -1,100 +1,103 @@
 namespace SoEx.Messaging.Chimera;
 
-/// <summary>What to do when the dead-letter set is full. There is no third option — see the remarks.</summary>
+/// <summary>The action when the dead-letter set is full. These two values are the only options. See the remarks.</summary>
 /// <remarks>
-/// Everything else this library does when a bound is reached moves the message somewhere it can still be seen.
-/// Dead is where that ends: there is nowhere further to pass it. So the choice is between stopping and
-/// dropping, and stopping is the default because a subscriber that stops holds its position, does not block
-/// the publisher, and does not affect any other subscriber. It is a delay rather than a rescue — a subscriber
-/// that stays stopped will eventually fall off the log's retention window — but it is slow, visible, and
-/// attributable to one component.
+/// At each other bound, this library moves the message to a place where it stays visible. The dead set is the
+/// last place. There is no further place to move a message to. Thus the options are to stop or to drop. Stop is
+/// the default. A stopped subscriber keeps its position. The publisher and the other subscribers continue. A
+/// stop delays loss. If the subscriber stays stopped, it eventually falls out of the retention window of the
+/// log. That failure is slow, visible, and attributable to one component.
 /// </remarks>
 public enum DeadLetterOverflow
 {
-    /// <summary>Stop delivering to this subscriber until somebody deals with the dead letters.</summary>
+    /// <summary>Stops deliveries to this subscriber until somebody handles the dead letters.</summary>
     StopDelivering = 0,
 
     /// <summary>
-    /// Destroy the oldest dead letters to make room. Bounded, silent unless the count is watched.
+    /// Destroys the oldest dead letters to make room. The loss is bounded. Only the drop count shows it.
     /// </summary>
     /// <remarks>
-    /// The only row this spares is one a handler has in its hands, because that handler is about to be told
-    /// what happened to it. Everything else is eligible, including a message you have replayed and not yet
-    /// been given: a replay marks a row for delivery, and a bound reached before that delivery happens still
-    /// takes the oldest. Count <c>SetAsideReport.DeadDropped</c> if that matters to you, or use
-    /// <see cref="StopDelivering"/>, which destroys nothing.
+    /// This setting keeps only the row that a handler holds, because the library reports the result to that
+    /// handler. All other rows can be destroyed. This includes a replayed message that is not yet delivered. A
+    /// replay marks a row for delivery. A bound reached before that delivery still takes the oldest row. If that
+    /// is important to you, count <c>SetAsideReport.DeadDropped</c>, or use <see cref="StopDelivering"/>.
+    /// <see cref="StopDelivering"/> destroys nothing.
     /// </remarks>
     DropOldest = 1,
 }
 
 /// <summary>
-/// Bounds on what one subscriber may set aside. Set-aside rows carry their own payload copies, so without
-/// these a consumer that defers freely fills the disk.
+/// The bounds on what one subscriber can set aside.
 /// </summary>
+/// <remarks>
+/// Set-aside rows hold copies of their payloads. Without these bounds, frequent deferrals fill the disk.
+/// </remarks>
 public sealed record SetAsidePolicy
 {
     /// <summary>
-    /// How long a deferred message may sit before it becomes a dead letter. Measured from when it was set
-    /// aside, not from when it was published: <c>MaxDeferredAge</c> should mean what somebody reading it
-    /// assumes, and no handler depends on which end it is measured from — only an operator does.
+    /// The maximum time that a message stays deferred. After this time, the message becomes a dead letter.
     /// </summary>
+    /// <remarks>
+    /// The time counts from the set-aside time, not from the publish time. This is the meaning that a reader of
+    /// <c>MaxDeferredAge</c> expects. No handler depends on the start point. Only an operator does.
+    /// </remarks>
     public TimeSpan? MaxDeferredAge { get; init; } = TimeSpan.FromDays(7);
 
-    /// <summary>Deferred messages allowed at once. Beyond this, deferring dead-letters instead.</summary>
+    /// <summary>The maximum number of deferred messages at one time. Above it, a deferral dead-letters the message.</summary>
     public long? MaxDeferredCount { get; init; } = 10_000;
 
-    /// <summary>Dead letters allowed before <see cref="DeadOverflow"/> decides what happens.</summary>
+    /// <summary>The maximum number of dead letters. At this bound, <see cref="DeadOverflow"/> sets what happens.</summary>
     public long? MaxDeadCount { get; init; } = 10_000;
 
     /// <summary>
-    /// Stored payload allowed across this subscriber's deferred messages. Beyond it, deferring dead-letters
-    /// instead, exactly as it does beyond <see cref="MaxDeferredCount"/>.
+    /// The maximum stored payload bytes of the deferred messages of this subscriber. Above it, a deferral
+    /// dead-letters the message, as above <see cref="MaxDeferredCount"/>.
     /// </summary>
     public long? MaxDeferredBytes { get; init; } = 64L * 1024 * 1024;
 
     /// <summary>
-    /// Stored payload allowed across this subscriber's dead letters. Beyond it, <see cref="DeadOverflow"/>
-    /// decides what happens, the same as beyond <see cref="MaxDeadCount"/>.
+    /// The maximum stored payload bytes of the dead letters of this subscriber. Above it,
+    /// <see cref="DeadOverflow"/> sets what happens, as above <see cref="MaxDeadCount"/>.
     /// </summary>
     /// <remarks>
-    /// There are two byte bounds rather than one because the two sets answer a bound differently and a single
-    /// number could only honour one of them. A deferral that does not fit is passed along to the dead set,
-    /// which is why the deferred bound can be enforced by refusing to grow that set. Dead is where passing
-    /// along stops, so the only answers there are to stop the subscriber or to destroy something — which is
-    /// exactly the choice <see cref="DeadOverflow"/> already exists to make. One number spanning both would
-    /// have to mean both things at once, and the one it meant in practice was the deferred one: the dead set
-    /// grew past it unchecked, one payload at a time, while the option said it was bounded.
     /// <para>
-    /// Under <see cref="DeadLetterOverflow.DropOldest"/> a single dead letter larger than this whole bound
-    /// cannot be kept at all: a settle never destroys the row it is filing, so keeping this one means
-    /// destroying every other dead letter the subscriber holds and still sitting over the bound. Filing one is
-    /// refused with <c>DeadLetterTooLargeException</c> rather than emptying the set to no purpose, which is a
-    /// bound saying plainly that it cannot hold this message. Size the bound above the topic's
-    /// payload limit; under <see cref="DeadLetterOverflow.StopDelivering"/> nothing is destroyed and nothing
-    /// is refused.
+    /// There are two byte bounds, because the deferred set and the dead set respond differently to a bound. A
+    /// deferral that does not fit moves to the dead set. Thus the deferred bound works by refusing growth of the
+    /// deferred set. The dead set is the last place. Its only options are to stop the subscriber or to destroy
+    /// a message. <see cref="DeadOverflow"/> makes that choice. One number for both sets could apply only one of
+    /// these two meanings. In use, it applied the deferred meaning. The dead set then grew past the bound, one
+    /// payload at a time, while the option stated a bound.
+    /// </para>
+    /// <para>
+    /// Under <see cref="DeadLetterOverflow.DropOldest"/>, a single dead letter larger than this bound cannot be
+    /// kept. A settle never destroys the row that it files. To keep this row, the subscriber would destroy all
+    /// its other dead letters and still be over the bound. Thus the subscriber refuses to file it
+    /// and throws <c>DeadLetterTooLargeException</c>. The set stays as it is. The exception states that the bound
+    /// cannot hold this message. Set this bound above the payload limit of the topic. Under
+    /// <see cref="DeadLetterOverflow.StopDelivering"/>, nothing is destroyed or refused.
     /// </para>
     /// </remarks>
     public long? MaxDeadBytes { get; init; } = 64L * 1024 * 1024;
 
-    /// <summary>The action at a full dead-letter bound. <see cref="DeadLetterOverflow.StopDelivering"/> by default.</summary>
+    /// <summary>The action at a full dead-letter bound. The default is <see cref="DeadLetterOverflow.StopDelivering"/>.</summary>
     public DeadLetterOverflow DeadOverflow { get; init; } = DeadLetterOverflow.StopDelivering;
 }
 
-/// <summary>What one pass over a subscriber's set-aside store did.</summary>
-/// <param name="DeferredAgedOut">Deferred messages that became dead letters because they sat too long, by
-/// this pass and by any earlier pass whose report never reached anybody. Kept in the subscriber's file beside
-/// the rows it changed, exactly as the drop count is: a pass is several writes, and one that fails after the
-/// ageing has committed would otherwise take the number away with it — the messages are dead by then and no
-/// later pass can work out how many became so.</param>
-/// <param name="DeadDropped">Dead letters destroyed to stay within the bound, by this pass and by any settle
-/// since the last one. Only ever non-zero under <see cref="DeadLetterOverflow.DropOldest"/>, and worth
-/// alarming on: it is real loss, and a dead letter arriving is as likely to cause it as a maintenance pass.
-/// The count is kept in the subscriber's file beside the rows it destroyed, so closing the subscription or
-/// losing the process does not lose it; it is reported once, to whichever pass asks first. Counted rather
-/// than raised, so a subscriber that never runs a pass never learns of it — which is the trade the
-/// drop-oldest setting is.</param>
+/// <summary>What one pass over the set-aside store of a subscriber did.</summary>
+/// <param name="DeferredAgedOut">The number of deferred messages that became dead letters because they stayed
+/// deferred too long. The count includes this pass and each earlier pass whose report reached nobody. The count
+/// is stored in the subscriber file next to the changed rows, as is the drop count. A pass makes several writes.
+/// If a pass failed after the age-out committed, the count would be lost. The messages are dead by then, and no
+/// later pass can calculate the count.</param>
+/// <param name="DeadDropped">The number of dead letters destroyed to stay within the bound. The count includes
+/// this pass and each settle since the last pass. It is above zero only under
+/// <see cref="DeadLetterOverflow.DropOldest"/>. Raise an alarm on it, because it is real loss. A new dead letter
+/// can cause it as often as a maintenance pass can. The count is stored in the subscriber file next to the
+/// destroyed rows. Thus the count survives a close of the subscription or a loss of the process. The first pass
+/// that asks gets the count, once. The loss appears only in this count. If a subscriber runs no pass, it never
+/// learns of the loss. That is the trade-off of the drop-oldest setting.</param>
 public readonly record struct SetAsideReport(long DeferredAgedOut, long DeadDropped)
 {
-    /// <summary>The pass aged out or dropped at least one message.</summary>
+    /// <summary>True if the pass aged out or dropped at least one message.</summary>
     public bool DidAnything => DeferredAgedOut > 0 || DeadDropped > 0;
 }

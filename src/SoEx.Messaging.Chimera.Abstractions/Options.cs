@@ -1,147 +1,157 @@
 namespace SoEx.Messaging.Chimera;
 
-/// <summary>How durable each commit is. Neither setting affects whether a crash of the process loses data.</summary>
+/// <summary>How durable each commit is. Both settings survive a process crash.</summary>
 public enum Durability
 {
-    /// <summary>Survives a process crash but not a power loss. The default, and what SQLite calls NORMAL.</summary>
+    /// <summary>Survives a process crash. A power loss can lose data. This is the default. SQLite calls it NORMAL.</summary>
     ProcessCrash = 0,
 
-    /// <summary>Survives a power loss, at the cost of an fsync per commit. SQLite's FULL.</summary>
+    /// <summary>Survives a power loss. Each commit costs one fsync. SQLite calls it FULL.</summary>
     PowerLoss = 1,
 }
 
 /// <summary>
-/// When old records are removed. Trimming is by retention, never by what subscribers have read: gating on
-/// consumption turns bounded loss into unbounded growth that lands on the publisher, and lets one stalled
-/// subscriber stop every append.
+/// Sets when old records are removed. Retention trims by age, size and count. Reads by subscribers have no
+/// effect on it.
 /// </summary>
 /// <remarks>
-/// A topic holds two tables and these do not apply to both. <see cref="MaxBytes"/> and
-/// <see cref="MaxCount"/> trim the log and leave scheduled messages alone: a scheduled message is work
-/// somebody asked for at a time that has not arrived, and destroying it to stay under a size bound is not
-/// retention of history, it is cancelling the future. <see cref="MaxAge"/> is the one that reaches both, and
-/// on the scheduled side it is measured from the due time, so a message removes itself a retention window
-/// after it came due rather than after it was published.
 /// <para>
-/// <see cref="MaxBytes"/> and <see cref="MaxCount"/> still bound the scheduled table, but by refusing rather
-/// than by removing: when it is at the bound, <c>ScheduleAsync</c> throws <c>ScheduleRefusedException</c> and
-/// stores nothing. Destroying a scheduled message to stay under a size bound would be cancelling the future
-/// rather than trimming history, so the pressure goes back to the publisher, which is where Service Bus puts
-/// it too. Ordinary appends are unaffected. The file's ceiling is therefore these bounds counted twice — once
-/// for the log, held there by trimming, and once for the scheduled table, held there by refusing.
+/// A trim that waited for consumption would turn bounded loss into unbounded growth on the publisher. One
+/// stalled subscriber would then stop all appends.
 /// </para>
 /// <para>
-/// On the scheduled side those two bound the messages still waiting for a due time, and the rest of the table
-/// is bounded by <see cref="MaxAge"/> instead. So size it as <c>MaxCount</c> plus the rate of due-or-past-due
-/// schedules times <c>MaxAge</c>: a due time that has already arrived is stored as now, which puts the row
-/// outside the counted set from the moment it is written, and a publisher scheduling for now is bounded by age
-/// alone. There is no option that counts the past-due tail, because the bound would have to mean work still
-/// owed and no publisher can know that — delivery is recorded in each subscriber's own file, and fan-out means
-/// there is no one answer. Heavy due-now traffic belongs in <c>AppendAsync</c>, which is what a message with
-/// no waiting to do is.
+/// A topic holds two tables, and the bounds apply differently to them. <see cref="MaxBytes"/> and
+/// <see cref="MaxCount"/> trim the log only. A scheduled message is work that somebody asked for at a future
+/// time. Removal of it to stay under a size bound would cancel future work. <see cref="MaxAge"/> applies to
+/// both tables. For the scheduled table, <c>MaxAge</c> counts from the due time. Thus a scheduled message is
+/// removed one retention window after its due time.
+/// </para>
+/// <para>
+/// <see cref="MaxBytes"/> and <see cref="MaxCount"/> also bound the scheduled table, by refusal. At the bound,
+/// <c>ScheduleAsync</c> throws <c>ScheduleRefusedException</c> and stores nothing. The pressure goes back to
+/// the publisher, as in Service Bus. Ordinary appends continue. Thus the maximum file size is these bounds
+/// counted twice: once for the log, held by trimming, and once for the scheduled table, held by refusal.
+/// </para>
+/// <para>
+/// In the scheduled table, these two bounds count only the messages that wait for a due time.
+/// <see cref="MaxAge"/> bounds the rest of the table. Size the table as <c>MaxCount</c> plus the rate of due
+/// or past-due schedules multiplied by <c>MaxAge</c>. A due time that has already arrived is stored as the
+/// current time. Such a row is outside the counted set from the time of its write. Thus <c>MaxAge</c> alone
+/// bounds a publisher that schedules for now.
+/// </para>
+/// <para>
+/// No option counts the past-due rows. Such a bound would have to count work still owed, and no publisher can
+/// know that. Each subscriber records delivery in its subscriber file. With fan-out, there is no single answer.
+/// Send heavy due-now traffic with <c>AppendAsync</c>. <c>AppendAsync</c> is the operation for a message with
+/// no wait.
 /// </para>
 /// </remarks>
 public sealed record RetentionPolicy
 {
     /// <summary>
-    /// Remove log records older than this, and scheduled messages this long past their due time. Null leaves
-    /// age unbounded, which also leaves the scheduled table with no bound at all.
+    /// The maximum age of log records, and the maximum time that scheduled messages stay after their due time.
+    /// If null, age has no bound, and the scheduled table has no bound at all.
     /// </summary>
     public TimeSpan? MaxAge { get; init; } = TimeSpan.FromDays(7);
 
     /// <summary>
-    /// Remove oldest log records once their stored payload exceeds this, and refuse a scheduled message once
-    /// the scheduled table holds this many bytes. Null leaves size unbounded — see the remarks on this type.
+    /// The maximum stored payload bytes. Above it, the oldest log records are removed. At it, the scheduled table
+    /// refuses new scheduled messages. If null, size has no bound. See the remarks on this type.
     /// </summary>
     public long? MaxBytes { get; init; }
 
     /// <summary>
-    /// Remove oldest log records once this many are stored, and refuse a scheduled message once the scheduled
-    /// table holds this many. Null leaves count unbounded — see the remarks on this type.
+    /// The maximum number of stored rows. Above it, the oldest log records are removed. At it, the scheduled
+    /// table refuses new scheduled messages. If null, count has no bound. See the remarks on this type.
     /// </summary>
     public long? MaxCount { get; init; }
 
-    /// <summary>Nothing is ever removed. Sound only when something else bounds the disk.</summary>
+    /// <summary>A policy that never removes a record. Use it only if something else bounds the disk.</summary>
     public static RetentionPolicy Unbounded => new() { MaxAge = null };
 }
 
-/// <summary>Settings shared by every topic and subscriber under one root directory.</summary>
+/// <summary>Settings shared by each topic and subscriber under one root directory.</summary>
 public sealed record ChimeraOptions
 {
-    /// <summary>Directory holding the topic and subscriber files. Created if absent.</summary>
+    /// <summary>The directory that holds the topic files and the subscriber files. It is created if it is absent.</summary>
     public required string RootDirectory { get; init; }
 
-    /// <summary>How durable each commit is. <see cref="Durability.ProcessCrash"/> by default.</summary>
+    /// <summary>How durable each commit is. The default is <see cref="Durability.ProcessCrash"/>.</summary>
     public Durability Durability { get; init; } = Durability.ProcessCrash;
 
-    /// <summary>How long a connection waits for a lock before failing. Also covers checkpointing pauses.</summary>
+    /// <summary>How long a connection waits for a lock before it fails. This time also covers checkpoint pauses.</summary>
     public TimeSpan BusyTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Appends waiting at the moment the writer wakes are committed in one transaction, up to this many. At
-    /// least one, and refused below that rather than raised to it: a value that is quietly overridden is a
-    /// setting whose effect nobody can see, and here the effect is one commit per operation.
+    /// The maximum number of appends in one transaction. When the writer wakes, it commits the waiting appends
+    /// together, up to this number.
     /// </summary>
+    /// <remarks>
+    /// The minimum is 1. A lower value is refused. The library does not raise it to 1. A value that is
+    /// silently overridden has an effect that nobody can see. Here, that effect would be one commit for each operation.
+    /// </remarks>
     public int MaxAppendBatch { get; init; } = 128;
 
     /// <summary>
-    /// Where "now" comes from: stamping records, deciding what is due, and ageing things out.
+    /// The source of the current time. It stamps records, decides what is due, and ages records out.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// It is waited on in one place as well as read. A reader with nothing to deliver pauses before looking
-    /// again, for no longer than <see cref="SubscriptionOptions.PollInterval"/>, and that pause is taken from
-    /// this clock. It is a poll and not a schedule: there is no timer per message, and nothing here wakes up
-    /// in order to deliver one.
+    /// This library also waits on this clock in one place. A reader with nothing to deliver pauses before it
+    /// checks again, for no longer than <see cref="SubscriptionOptions.PollInterval"/>. That pause uses this
+    /// clock. It is a poll. Each message has no timer, and no process wakes to deliver a message.
     /// </para>
     /// <para>
-    /// Which matters when you substitute a clock. A provider that answers GetUtcNow but does not drive timers
-    /// leaves that pause on the real clock, so a reader meant to wake as a scheduled message falls due gets it
-    /// from the next poll instead and the waking path never runs. A test written against one of those passes
-    /// because the poll happened to fire, which is not what it says it checked. Under a clock you control, a
-    /// reader wakes only when you advance it, and advancing fires the timers already registered and no others,
-    /// so advance while nothing is part-way through a read.
+    /// This is important when you substitute a clock. Some providers answer GetUtcNow and do not drive timers.
+    /// With such a provider, the pause stays on the real clock. A reader that must wake when a scheduled message
+    /// falls due then gets the message from the next poll. The wake path never runs. A test against such a
+    /// provider passes because the poll fired. That test does not check what it claims to check. Under a clock
+    /// that you control, a reader wakes only when you advance the clock. An advance fires only the timers that
+    /// are already registered. Advance the clock only when no read is in progress.
     /// </para>
     /// <para>
-    /// A file's writer never sees this clock go backwards. The stamps it writes are held at the newest moment
-    /// that file has already recorded, seeded from the file itself when it is opened, so a correction that
-    /// moves the wall clock back — NTP, a resumed virtual machine, somebody setting the date — cannot write a
-    /// record that appears older than one already there. Three things depend on that: the position a
-    /// subscriber holds in the scheduled table, the cutoff age retention deletes by, and the seek for the
-    /// oldest record after a time. The cost is that a message published as due now, just after a step back,
-    /// falls due when the wall clock catches up again rather than immediately.
+    /// The writer of a file never sees this clock go backwards. The writer holds its stamps at the newest time
+    /// that the file has recorded. At open, the writer reads that time from the file. Thus a correction that
+    /// moves the wall clock back cannot write a record that seems older than an existing record. Examples of
+    /// such a correction are NTP, a resumed virtual machine, or a person who sets the date. Three things depend
+    /// on this:
+    /// <list type="bullet">
+    /// <item>The position of a subscriber in the scheduled table.</item>
+    /// <item>The age cutoff for retention deletes.</item>
+    /// <item>The seek for the oldest record after a time.</item>
+    /// </list>
+    /// The cost: after a step back, a message published as due now falls due when the wall clock catches up.
     /// </para>
     /// <para>
-    /// Two processes writing one topic directory with two clocks are still two clocks, and nothing a single
-    /// file knows can order them. One machine is the stated boundary for that reason.
+    /// The rule holds within one file. Processes that write different files in one root directory use separate
+    /// clocks. One file cannot put the stamps of two clocks in order. For this reason, the boundary is one machine.
     /// </para>
     /// </remarks>
-    /// <summary>The clock used to stamp records and to decide what is due or old. Replace it in tests.</summary>
     public TimeProvider Clock { get; init; } = TimeProvider.System;
 }
 
 /// <summary>Settings for one topic log.</summary>
 public sealed record TopicOptions
 {
-    /// <summary>When the topic's old records are removed. The defaults of <see cref="RetentionPolicy"/> apply if this is not set.</summary>
+    /// <summary>When the old records of the topic are removed. If this is not set, the defaults of <see cref="RetentionPolicy"/> apply.</summary>
     public RetentionPolicy Retention { get; init; } = new();
 
     /// <summary>
-    /// Largest payload this topic accepts, counting the message bytes and nothing else.
+    /// The largest payload that this topic accepts. The limit counts the message bytes only.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The default is Service Bus's standard-tier limit, which is also SQS's. NATS and Kafka allow a megabyte,
-    /// so 256 KB is the smallest of the places someone is likely to graduate to, and the rule here is to be no
-    /// more forgiving than the destination: a message that works locally and is rejected in production is the
-    /// failure that costs the most to find.
+    /// The default is the Service Bus standard-tier limit, which is also the SQS limit. NATS and Kafka allow one
+    /// megabyte. Thus 256 KB is the smallest limit of the likely destinations. The rule here is to be no more
+    /// lenient than the destination. A message that works locally and fails in production is the most costly
+    /// failure to find.
     /// </para>
     /// <para>
-    /// It is not exact parity, and the difference runs the wrong way. Service Bus counts the whole encoded
-    /// message — its envelope and any application properties as well as the body — against its 256 KB, whereas
-    /// this counts the payload alone, because the payload is all this library has. A message that fits here can
-    /// therefore still be refused there by the size of an envelope this library cannot see. If you routinely
-    /// publish near the cap, lower it rather than find that out after moving.
+    /// The match is not exact, and the difference is in the unsafe direction. Service Bus counts the full
+    /// encoded message against its 256 KB: the envelope, the application properties and the body. This library
+    /// counts the payload only, because the payload is all that it has. Thus Service Bus can refuse a message
+    /// that fits here, because of an envelope that this library cannot see. If you often publish near the
+    /// limit, lower the limit before a move.
     /// </para>
     /// </remarks>
     public int MaxPayloadBytes { get; init; } = 256 * 1024;

@@ -1,35 +1,35 @@
 namespace SoEx.Messaging.Chimera.Testing;
 
 /// <summary>
-/// What one subscriber is doing about one topic, at the moment it was read.
+/// The state of one subscriber for one topic, at the time of the read.
 /// </summary>
-/// <param name="Subscriber">The subscriber's name.</param>
-/// <param name="Topic">The topic it reads.</param>
+/// <param name="Subscriber">The name of the subscriber.</param>
+/// <param name="Topic">The topic that the subscriber reads.</param>
 /// <param name="Behind">
-/// Log records published that this subscriber has not finished with. It counts what it is holding right now
-/// as well as what it has not been handed, because the position only moves past a record once that record is
-/// settled — the same number <see cref="ISubscription.LagAsync"/> reports.
+/// The number of published log records that this subscriber has not settled. It includes the records that the
+/// subscriber holds now and the records not yet delivered. The position moves past a record only after the
+/// record is settled. <see cref="ISubscription.LagAsync"/> reports the same number.
 /// </param>
-/// <param name="DueScheduled">Scheduled messages that are due and that this subscriber has not settled.</param>
+/// <param name="DueScheduled">The number of due scheduled messages that this subscriber has not settled.</param>
 /// <param name="InFlight">
-/// Deliveries handed out and not yet settled. A handler is running, or has stopped without settling. This is
-/// a subset of <see cref="Behind"/> and <see cref="DueScheduled"/> rather than something in addition to them:
-/// it is here to say who is stuck on what, which is the question asked when a test does not settle.
+/// The number of unsettled delivered messages. A handler runs, or it stopped without settling. This
+/// count is a subset of <see cref="Behind"/> and <see cref="DueScheduled"/>. It shows which subscriber is stuck
+/// on which message when a test does not settle.
 /// </param>
 /// <param name="AwaitingRetry">
-/// Deliveries handed back after a failure, waiting to go out again. Also a subset of the two counts above.
+/// The number of failed deliveries that wait to go out again. This count is also a subset of
+/// <see cref="Behind"/> and <see cref="DueScheduled"/>.
 /// </param>
 /// <param name="AwaitingReplay">
-/// Set-aside messages someone has asked to be replayed and that are not finished with: waiting to go out, or
-/// out with a handler now. Both are work in motion, which is what <see cref="SubscriberActivity.Settled"/>
-/// needs to know; a count of only the ones still waiting would call a subscriber quiet while a replay was
-/// being handled.
+/// The number of set-aside messages with a replay request that are unsettled. Each one waits to go out, or a
+/// handler has it now. <see cref="SubscriberActivity.Settled"/> counts both as work in motion. A count of the
+/// waiting messages only would show a subscriber as quiet while a handler had a replayed message.
 /// </param>
-/// <param name="Deferred">Messages taken out of the flow until this subscriber asks for them.</param>
-/// <param name="DeadLettered">Messages this subscriber gave up on, with their payloads kept.</param>
+/// <param name="Deferred">The number of deferred messages. Each one stays out of delivery until this subscriber requests it.</param>
+/// <param name="DeadLettered">The number of dead letters for this subscriber. Each dead letter keeps its payload.</param>
 /// <param name="Stranded">
-/// This position belongs to a different incarnation of the log than the one now present, so the subscriber
-/// will refuse to read and none of the numbers above mean anything against the log that is there.
+/// True if this position belongs to a different incarnation of the log. The subscriber refuses to read. The
+/// numbers above have no meaning for the current log.
 /// </param>
 public sealed record SubscriberActivity(
     string Subscriber,
@@ -44,20 +44,19 @@ public sealed record SubscriberActivity(
     bool Stranded)
 {
     /// <summary>
-    /// Nothing here will move on its own.
+    /// True if this subscriber has no work in motion.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Deferred and dead-lettered messages do not count against this, deliberately. Both were parked on
-    /// purpose and neither is going anywhere until somebody asks, so a system holding them is quiet — it is
-    /// not necessarily healthy, which is a different question and worth asserting separately. Folding them in
-    /// would mean a test whose topology dead-letters everything waits for a timeout instead of failing with a
-    /// count and a reason.
+    /// Deferred messages and dead letters have no effect on this value, by design. Both are parked on purpose,
+    /// and both stay parked until a request. A system that holds them is quiet. A quiet system can be unhealthy.
+    /// Assert on health separately. With this rule, a test whose topology dead-letters every message fails with
+    /// a count and a reason. With parked messages included, the same test would wait for a timeout.
     /// </para>
     /// <para>
-    /// The in-flight and awaiting-retry terms are redundant here, since anything in either state also sits
-    /// above a position and is counted there. They are left in deliberately: if a position ever moved past
-    /// something unsettled, this would report unsettled rather than agree with the position that lied.
+    /// The in-flight and awaiting-retry terms are redundant, because a message in either state is also above a
+    /// position and in that count. The terms stay on purpose. If a position moved past an unsettled message,
+    /// this value reports unsettled and disagrees with the incorrect position.
     /// </para>
     /// </remarks>
     public bool Settled =>
@@ -65,94 +64,92 @@ public sealed record SubscriberActivity(
         && AwaitingReplay == 0;
 }
 
-/// <summary>Everything every subscriber under one root is doing, at one moment.</summary>
+/// <summary>The state of each subscriber under one root directory, at one time.</summary>
 public sealed record ChimeraOverview(IReadOnlyList<SubscriberActivity> Subscribers)
 {
     /// <summary>
-    /// Nothing anywhere under this root will move on its own.
+    /// True if no subscriber under this root directory has work in motion.
     /// </summary>
     /// <remarks>
-    /// This is a snapshot taken while everything carries on running, not a barrier: it says what was true
-    /// when the files were read. A handler that has settled its message and is about to publish what comes
-    /// next looks quiet for that instant, so a test waiting for a system to come to rest should require this
-    /// twice in a row rather than once. The window closes entirely if the binding publishes before it settles,
-    /// which is the at-least-once shape and the one worth having anyway.
+    /// This value is a snapshot. The system continues to run while the files are read. The value gives the
+    /// state at the time of the read. A handler that settled its message and will publish the next message
+    /// looks quiet for that instant. A test that waits for the system to come to rest must get this value
+    /// twice in a row. If the binding publishes before it settles, the window closes fully. That order is the
+    /// at-least-once order, and we recommend it.
     /// </remarks>
     public bool Settled => Subscribers.All(s => s.Settled);
 
-    /// <summary>Dead letters across every subscriber. Assert on this separately from <see cref="Settled"/>.</summary>
+    /// <summary>The number of dead letters for all subscribers. Assert on this value separately from <see cref="Settled"/>.</summary>
     /// <remarks>
-    /// What is being held now, which under <see cref="DeadLetterOverflow.DropOldest"/> is not the same as what
-    /// was ever given up on: a dead letter the bound destroyed has left the set and this count with it. Zero
-    /// here means nothing is parked, not that nothing was lost — <c>SetAsideReport.DeadDropped</c> is what
-    /// says that.
+    /// This value counts the dead letters held now. With <see cref="DeadLetterOverflow.DropOldest"/>, a dead
+    /// letter that the bound destroyed leaves the set and this count. Zero means that no dead letter is held now.
+    /// <c>SetAsideReport.DeadDropped</c> counts the dead letters that the bound destroyed.
     /// </remarks>
     public long DeadLettered => Subscribers.Sum(s => s.DeadLettered);
 
-    /// <summary>What one subscriber is doing about one topic, or null if it does not read that topic.</summary>
+    /// <summary>Gets the state of one subscriber for one topic. If the subscriber does not read that topic, returns null.</summary>
     public SubscriberActivity? For(string subscriber, string topic) =>
         Subscribers.FirstOrDefault(s =>
             string.Equals(s.Subscriber, subscriber, StringComparison.Ordinal)
             && string.Equals(s.Topic, topic, StringComparison.Ordinal));
 }
 
-/// <summary>Where one message has got to, as far as one subscriber is concerned.</summary>
+/// <summary>The state of one message for one subscriber.</summary>
 /// <remarks>
-/// Two of these answer from what the files still hold rather than from what happened, because the two ways a
-/// message can be destroyed destroy its evidence with it. Neither <see cref="Completed"/> nor
-/// <see cref="Unknown"/> is a promise on its own, and each says so in its own words. A test that has to rule
-/// out loss reads what <see cref="ISubscription.ApplyRetentionAsync"/> reports — every drop and every ageing
-/// is counted there, durably — or does not run <see cref="DeadLetterOverflow.DropOldest"/>, which is not the
-/// default.
+/// <see cref="Completed"/> and <see cref="Unknown"/> come from the data that the files still hold. The two
+/// ways to destroy a message also destroy the evidence of it. Each of the two values alone can include a loss,
+/// and the summary of each tells how. To rule out loss, a test reads the report from
+/// <see cref="ISubscription.ApplyRetentionAsync"/>. That report durably counts each drop and each removal by
+/// age. Alternatively, do not use <see cref="DeadLetterOverflow.DropOldest"/>. It is not the default.
 /// </remarks>
 public enum MessageState
 {
     /// <summary>
-    /// This topic holds no record with that id. It was never published, or retention has removed the
-    /// record — including the record of one this subscriber completed long ago: the answer starts from the
-    /// topic file, and a record that is gone ends it whatever the subscriber file holds.
+    /// The topic has no record with that id. The message was never published, or retention removed the record.
+    /// This includes the record of a message that this subscriber completed long ago. The answer starts from
+    /// the topic file. If the record is gone, the answer is Unknown, whatever the subscriber file holds.
     /// </summary>
     Unknown = 0,
 
-    /// <summary>Published and due, and this subscriber has not been handed it yet.</summary>
+    /// <summary>Published and due. This subscriber has not received it yet.</summary>
     Pending = 1,
 
-    /// <summary>Scheduled, and its due time has not arrived.</summary>
+    /// <summary>Scheduled. Its due time is in the future.</summary>
     NotYetDue = 2,
 
-    /// <summary>Handed out and not settled. A handler is running, or has stopped without settling.</summary>
+    /// <summary>Delivered and unsettled. A handler runs, or it stopped without settling.</summary>
     InFlight = 3,
 
-    /// <summary>Handed back after a failure. It goes out again on the next read.</summary>
+    /// <summary>Returned after a failure. It goes out again on the next read.</summary>
     AwaitingRetry = 4,
 
     /// <summary>
-    /// Settled successfully, or destroyed by a dead-letter bound. Dropping a row removes the same records
-    /// completing it removes, so afterwards there is nothing left to tell the two apart; the drop is counted
-    /// in <c>SetAsideReport.DeadDropped</c> instead, which is where a test asks about it.
+    /// Settled successfully, or destroyed by a dead-letter bound. A drop removes the same records as a
+    /// completion. After a drop, the two states look the same. <c>SetAsideReport.DeadDropped</c> counts the
+    /// drop. A test reads drops there.
     /// </summary>
     Completed = 5,
 
-    /// <summary>Taken out of the flow until this subscriber asks for it.</summary>
+    /// <summary>Deferred. It stays out of delivery until this subscriber requests it.</summary>
     Deferred = 6,
 
-    /// <summary>Given up on. The payload is kept, so it stays replayable.</summary>
+    /// <summary>A dead letter. The payload stays in the file, so a replay is possible.</summary>
     DeadLettered = 7,
 }
 
-/// <summary>What became of one message, for one subscriber.</summary>
-/// <param name="MessageId">The message asked about.</param>
-/// <param name="Topic">The topic it was published to.</param>
-/// <param name="Subscriber">The subscriber this status is for.</param>
-/// <param name="State">What has become of the message for this subscriber.</param>
+/// <summary>The state of one message for one subscriber.</summary>
+/// <param name="MessageId">The id of the message.</param>
+/// <param name="Topic">The topic that the message was published to.</param>
+/// <param name="Subscriber">The subscriber that this status is for.</param>
+/// <param name="State">The state of the message for this subscriber.</param>
 /// <param name="Attempts">
-/// Deliveries so far, as the files still record them. A message that succeeded reports zero: the row carrying
-/// its attempt count is deleted when the position absorbs it, which is what keeps a subscriber's file bounded
-/// rather than growing with the log. If a test needs the attempt history of a message that succeeded, it has
-/// to watch the deliveries as they happen — every envelope carries its own attempt number.
+/// The number of deliveries that the files still record. A successful message reports zero. When the position
+/// absorbs the message, the row with its attempt count is deleted. This keeps the subscriber file bounded as
+/// the log grows. To get the attempt history of a successful message, a test must watch the deliveries as
+/// they occur. Each envelope carries its attempt number.
 /// </param>
-/// <param name="Reason">Why it was deferred or dead-lettered, if it was.</param>
-/// <param name="UpdatedAt">When this subscriber last did something about it, if it has.</param>
+/// <param name="Reason">The reason for the deferral or the dead letter, if one occurred.</param>
+/// <param name="UpdatedAt">The time of the last action by this subscriber on the message, if one occurred.</param>
 public sealed record MessageStatus(
     string MessageId,
     string Topic,

@@ -4,29 +4,28 @@ using SoEx.Messaging.Chimera.Internal;
 namespace SoEx.Messaging.Chimera.Testing;
 
 /// <summary>
-/// Reads what every subscriber under a root is doing, from their own files, without disturbing any of them.
+/// Reads the state of each subscriber under a root directory from the subscriber files. Each file opens
+/// read-only.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This exists because a test over several components wired together cannot assert on a message count: how
-/// many messages flow is the components' business, not the test's. What it can assert is that the system came
-/// to rest, and then that the right things happened. Both are questions about state on disk, and every file
-/// here can be opened read-only while its writer carries on.
+/// Use it in a test over several connected components. The components set how many messages flow. The test
+/// asserts that the system came to rest, and then that the correct results occurred. Both are questions about
+/// the state on disk. Each file opens read-only while its writer continues to write.
 /// </para>
 /// <para>
-/// It is as useful against a system that is stuck as against one under test, which is why it reads rather than
-/// controls: there is nothing here that can advance a position, settle a delivery, or create a file. Reading
-/// still needs write permission on the directory, because SQLite creates its sidecars even for a read-only
-/// connection.
+/// The inspector only reads. It cannot advance a position, settle a delivery or create a file. Use it on a
+/// stuck system and on a system under test. Reading needs write permission on the directory, because SQLite
+/// creates its sidecar files for a read-only connection too.
 /// </para>
 /// </remarks>
 public static class ChimeraInspector
 {
-    /// <summary>What every subscriber under this root is doing, at the moment it is read.</summary>
+    /// <summary>Reads the state of each subscriber under the root directory at the time of the call.</summary>
     /// <remarks>
-    /// A file that cannot be read is not skipped. Retention skips one rather than fail over a subscriber it
-    /// only wanted to report on; here a subscriber quietly missing from the answer is a test going green
-    /// because nobody looked, so the failure is raised instead.
+    /// An unreadable subscriber file causes an exception. Retention skips an unreadable file, because retention
+    /// only reports on subscribers. In a test, a subscriber missing from the answer lets the test pass with no
+    /// check of that subscriber.
     /// </remarks>
     public static ChimeraOverview Overview(ChimeraOptions options)
     {
@@ -56,17 +55,18 @@ public static class ChimeraInspector
         return new ChimeraOverview(activities);
     }
 
-    /// <summary>What became of one message, as far as one subscriber is concerned.</summary>
+    /// <summary>Gets the state of one message for one subscriber.</summary>
     /// <remarks>
     /// <para>
-    /// Ask by message id, never by the sequence on an envelope: sequences come from two number spaces in the
-    /// topic file and only look orderable. The translation from one to the other happens here.
+    /// Identify the message by its message id. Do not use the sequence on an envelope. Sequences come from two
+    /// number spaces in the topic file, and values from different spaces have no order. This method converts
+    /// the message id to a sequence.
     /// </para>
     /// <para>
-    /// This reads the files as they are now, so what a destroyed message reads as is what its absence reads
-    /// as. <see cref="MessageState.Completed"/> and <see cref="MessageState.Unknown"/> both cover a loss for
-    /// that reason, and the remarks on <see cref="MessageState"/> say which. Asserting an expected state here
-    /// is the right assertion; asserting that nothing was lost is not one this can make.
+    /// This method reads the files as they are now. A destroyed message and an absent message give the same
+    /// result. For that reason, <see cref="MessageState.Completed"/> and <see cref="MessageState.Unknown"/>
+    /// both include a loss. The remarks on <see cref="MessageState"/> tell which loss each includes. Use this
+    /// method to assert an expected state. It cannot show that no message was lost.
     /// </para>
     /// </remarks>
     public static MessageStatus StatusOf(ChimeraOptions options, string topic, string subscriber,
@@ -91,14 +91,14 @@ public static class ChimeraInspector
         using SqliteConnection connection = Sqlite.OpenReader(path, options);
         SubscriberSchema.EnsureNotNewer(connection, null, subscriber);
 
-        // Set aside first. A deferred or dead-lettered message is also terminal in the exception set, so
-        // asking that first would answer "completed" for a message somebody is still holding a copy of.
+        // Read the set-aside rows first. The exception set also marks a deferred or dead-lettered message as
+        // terminal. A read of the exception set first gives "completed" for a message with a held copy.
         if (SetAside(connection, topic, messageId) is { } aside)
         {
-            // A replayed row being handled right now is in flight, whatever it is filed as. Reading the kind
-            // alone answers "deferred" for a message a handler is holding, which contradicts the overview:
-            // that one keeps a subscriber unsettled while a replay is running, and the two have to agree or
-            // a test waits for quiet on one number while the other says the work is parked.
+            // A replayed row that a handler holds now is in flight, whatever its kind. A read of the kind only
+            // gives "deferred" for that row. The overview shows a subscriber as unsettled while a replay runs.
+            // The two results must agree. If they disagree, a test waits for quiet on one number while the
+            // other number shows parked work.
             MessageState state = aside.Delivery == SetAsideDelivery.InFlight
                 ? MessageState.InFlight
                 : aside.Kind == SetAsideKind.Dead
@@ -118,13 +118,13 @@ public static class ChimeraInspector
             return Status(messageId, topic, subscriber, state, entry.Attempts, null, entry.Updated);
         }
 
-        // No record of it in the exception set. Either the position has passed it or it has not been handed
-        // out yet. A passed position usually means this subscriber finished with it, and cannot mean only
-        // that: the dead-letter bound destroying a filed row deletes the set-aside row, and the entry that
-        // row came from was terminal and absorbed long before. What is left is a position past the record
-        // and nothing else, which is exactly what a completion leaves. Nothing here can separate them, so
-        // this answers Completed for both and the enum says as much. The drop is counted where it can be,
-        // in the subscriber's own file, and reported by ApplyRetentionAsync.
+        // The exception set has no record of the message. The position passed it, or the message is not
+        // delivered yet. A passed position usually means that this subscriber completed the message. It can
+        // also mean that the dead-letter bound destroyed a filed row. The bound deletes the set-aside row.
+        // The entry for that row was terminal and absorbed long before. The result is a position past the
+        // record, with no other trace. A completion leaves the same state. This method cannot tell the two
+        // apart, so it answers Completed for both. The MessageState documentation discloses this. The
+        // subscriber file counts the drop, and ApplyRetentionAsync reports it.
         (long mark, ScheduledFloor floor) = Position(connection, topic);
         return Status(messageId, topic, subscriber,
             Undelivered(reader, row, floor, mark, options.Clock.GetUtcNow()), 0, null, null);
@@ -163,23 +163,23 @@ public static class ChimeraInspector
         {
             TopicReader reader = ReaderFor(topics, options, topic);
 
-            // A position belonging to a different incarnation of the log says nothing about the log now
-            // present, and the subscriber will refuse to read it. Reporting zero behind would read as settled.
+            // A position from a different incarnation of the log gives no information about the current log.
+            // The subscriber refuses to read it. A report of zero behind would look settled.
             bool stranded = reader.IsOpen && !string.Equals(reader.LogUuid, logUuid, StringComparison.Ordinal);
 
             (_, long max) = reader.Bounds();
             Dictionary<(EntrySource, EntryState), long> entries = EntryStates(connection, topic);
             (long deferred, long dead, long replaying) = SetAsideCounts(connection, topic);
 
-            // A scheduled row settled but not yet absorbed is still inside the due window, because the floor
-            // moves in the reader rather than at the moment of settling. Counting it would say work is owed
-            // for a message already handled, and a test waiting for quiet would wait for a poll that has not
-            // happened yet. The log needs no such correction: its mark advances as part of settling.
+            // A scheduled row that is settled and not yet absorbed stays inside the due window. The reader
+            // moves the floor when it polls. If this count included the row, it would show work owed for a
+            // handled message. A test that waits for quiet would then wait for the next poll. The log needs no
+            // correction, because settling advances its mark.
             //
-            // Which of those settled entries to discount is asked of the topic file rather than counted here.
-            // The two numbers then come from one predicate over one table, so an entry whose row has been
-            // removed drops out of both instead of being subtracted from a window it is no longer in — the
-            // arithmetic that made this report a message as settled while it was genuinely owed.
+            // The topic file selects which settled entries to discount. The two numbers then come from one
+            // predicate over one table. An entry whose row is removed drops out of both numbers. An earlier
+            // version subtracted such an entry from a window that no longer held it. That arithmetic reported
+            // an owed message as settled.
             List<long> settledScheduled = SettledScheduled(connection, topic);
 
             activities.Add(new SubscriberActivity(
@@ -207,7 +207,7 @@ public static class ChimeraInspector
             return reader;
 
         reader = new TopicReader(FileNames.TopicFile(options.RootDirectory, topic), options);
-        reader.TryOpen();   // a topic with no file yet reads as empty, exactly as a subscriber sees it
+        reader.TryOpen();   // a topic with no file reads as empty, as a subscriber sees it
         topics[topic] = reader;
         return reader;
     }
@@ -240,7 +240,7 @@ public static class ChimeraInspector
         return states;
     }
 
-    /// <summary>Scheduled rows this subscriber has finished with and whose entry the floor has not reached.</summary>
+    /// <summary>Gets the scheduled rows that this subscriber completed and that the floor has not reached.</summary>
     private static List<long> SettledScheduled(SqliteConnection connection, string topic)
     {
         var ids = new List<long>();
@@ -277,7 +277,7 @@ public static class ChimeraInspector
             else
                 deferred += count;
 
-            // Held is parked. Anything else is on its way out, so it is work still to happen.
+            // Held means parked. Each other delivery state means that the message goes out, so it is work to do.
             if (delivery != SetAsideDelivery.Held)
                 replaying += count;
         }
@@ -298,8 +298,8 @@ public static class ChimeraInspector
     private static (SetAsideKind Kind, SetAsideDelivery Delivery, long Attempts, string? Reason,
         DateTimeOffset AsideAt)? SetAside(SqliteConnection connection, string topic, string messageId)
     {
-        // Matched on the message id the row already carries. The origin column is provenance for a human
-        // reading the file, and parsing it here would quietly make it load-bearing.
+        // Match on the message id in the row. The origin column records provenance for a person who reads the
+        // file. If this code parsed the column, the column would become load-bearing.
         using SqliteCommand command = Sqlite.Command(connection, null,
             "SELECT kind, delivery, attempts, reason, aside_at FROM set_aside " +
             "WHERE topic = $t AND msg_id = $m ORDER BY aside_id DESC LIMIT 1;");

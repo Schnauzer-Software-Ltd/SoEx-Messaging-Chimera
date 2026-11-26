@@ -1,162 +1,194 @@
 namespace SoEx.Messaging.Chimera;
 
 /// <summary>
-/// Where a brand-new subscriber begins. It decides one thing only: what a subscriber reading a topic for the
-/// first time does about messages that were published before it existed.
+/// The start point of a new subscriber. It applies only to messages published before the subscriber existed.
 /// </summary>
 /// <remarks>
-/// The two destinations this library is meant to be swapped for disagree here, so both are offered rather than
-/// one being picked for you. A JetStream consumer created with DeliverAll replays whatever the retained window
-/// still holds; a Service Bus subscription receives nothing sent before it was created. Neither treats the
-/// messages it does not get as loss, and neither does this.
+/// The two usual replacement destinations for this library differ here. Thus this library offers both choices.
+/// A JetStream consumer created with DeliverAll replays all that the retained window holds. A Service Bus
+/// subscription receives only the messages sent after its creation. Both treat the skipped messages as no
+/// loss. This library does the same.
 /// </remarks>
 public enum StartPosition
 {
     /// <summary>
-    /// Everything the topic still holds, which is the retained window and not the whole history: records
-    /// retention has already removed are not loss to a subscriber that did not exist when they were there.
-    /// JetStream's DeliverAll.
+    /// All that the topic still holds. This is the retained window, which can be shorter than the full history.
     /// </summary>
+    /// <remarks>
+    /// Records that retention removed before the subscriber existed are no loss to that subscriber. This is the
+    /// JetStream DeliverAll option.
+    /// </remarks>
     Beginning = 0,
 
     /// <summary>
-    /// Only what arrives from now on. Scheduled messages already stored but not yet due still arrive when they
-    /// fall due, exactly as a Service Bus subscription receives a message scheduled before it was created.
+    /// Only the messages that arrive from now on.
     /// </summary>
+    /// <remarks>
+    /// Scheduled messages that are already stored and not yet due arrive at their due time. A Service Bus
+    /// subscription does the same with a message scheduled before the subscription was created.
+    /// </remarks>
     Next = 1,
 }
 
-/// <summary>Settings for one subscriber reading one topic.</summary>
+/// <summary>Settings for one subscriber that reads one topic.</summary>
 public sealed record SubscriptionOptions
 {
     /// <summary>
-    /// How many deliveries may be outstanding at once. Reading stops at this number until something is settled,
-    /// which is the backpressure: a consumer that never settles stops receiving rather than growing a backlog
-    /// of work nobody is tracking.
+    /// The maximum number of in-flight deliveries. At this number, reading stops until a delivery is settled.
     /// </summary>
     /// <remarks>
-    /// It spans every source. Counting the log, the scheduled table and replayed messages separately would give
-    /// three times the concurrency someone configured.
+    /// <para>
+    /// This limit is the backpressure. If a consumer never settles, it stops receiving messages. Thus no
+    /// untracked backlog of work grows.
+    /// </para>
+    /// <para>
+    /// The limit spans all sources: the log, the scheduled table and replayed messages. A separate limit for
+    /// each source would give three times the configured concurrency.
+    /// </para>
     /// </remarks>
     public int MaxInFlight { get; init; } = 16;
 
     /// <summary>
-    /// Deliveries of one message before <see cref="ISubscription.FailAsync"/> dead-letters it instead of
-    /// handing it back. There is no delay between attempts: nothing here schedules a later delivery, and a wait
-    /// that has to survive a restart is a workflow, not a queue.
+    /// The number of deliveries of one message before <see cref="ISubscription.FailAsync"/> dead-letters it.
+    /// Below this number, <c>FailAsync</c> gives the message back for another attempt.
     /// </summary>
+    /// <remarks>
+    /// The next attempt follows with no delay. This library schedules no later delivery. A wait that must
+    /// survive a restart belongs in a workflow.
+    /// </remarks>
     public int MaxAttempts { get; init; } = 3;
 
-    /// <summary>How long to wait before looking again when there is nothing to deliver.</summary>
+    /// <summary>The time to wait before the next check when there is nothing to deliver.</summary>
     public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>Rows read from the log in one go.</summary>
+    /// <summary>The number of rows read from the log in one operation.</summary>
     public int ReadBatchSize { get; init; } = 64;
 
     /// <summary>
-    /// Where a subscriber that has never read this topic before starts. It applies once, when the position is
-    /// first recorded; after that the stored position is what matters and this setting is ignored.
+    /// The start point of a subscriber that has not read this topic before.
     /// </summary>
+    /// <remarks>
+    /// This setting applies once, when the position is first recorded. After that, the stored position applies
+    /// and this setting has no effect.
+    /// </remarks>
     public StartPosition Start { get; init; } = StartPosition.Beginning;
 
-    /// <summary>Bounds on what this subscriber may set aside.</summary>
+    /// <summary>The bounds on the messages that this subscriber can set aside.</summary>
     public SetAsidePolicy SetAside { get; init; } = new();
 }
 
-/// <summary>How far behind a subscriber is, in the units the retention window is set in.</summary>
-/// <param name="Behind">Messages between the position and the end of the log.</param>
+/// <summary>How far behind a subscriber is, in the units of the retention window.</summary>
+/// <param name="Behind">The number of messages between the position and the end of the log.</param>
 /// <param name="OldestUnread">
-/// Age of the oldest message not yet dealt with, or null when there is nothing to read. Compare this with the
-/// retention window: a count of messages cannot be compared with a policy written in hours.
+/// The age of the oldest message that the subscriber has not finished with, or null if there is nothing to read.
+/// Compare this value with the retention window. A count of messages cannot be compared with a policy in hours.
 /// </param>
 /// <param name="DueScheduled">
-/// Scheduled messages that have come due and this subscriber has not finished with. Counted separately from
-/// <paramref name="Behind"/> because the two are held by different bounds — the log by size and count as well
-/// as age, the scheduled table by age alone — and adding them would hide which one is growing. It is here at
-/// all because <see cref="RetentionPolicy.MaxAge"/> removes from both tables, and a subscriber falling behind
-/// on the scheduled side is overtaken exactly as it is on the log side.
+/// The number of due scheduled messages that this subscriber has not finished with. This count is separate from
+/// <paramref name="Behind"/>, because different bounds hold the two tables. Size, count and age bound the log.
+/// Age alone bounds the scheduled table. A sum would hide which table grows. This count exists because
+/// <see cref="RetentionPolicy.MaxAge"/> removes rows from both tables. Retention overtakes a subscriber on the
+/// scheduled side in the same way as on the log side.
 /// </param>
 public readonly record struct SubscriptionLag(long Behind, TimeSpan? OldestUnread, long DueScheduled);
 
 /// <summary>
-/// One subscriber reading one topic — the same granularity as a Service Bus processor or a JetStream consumer,
-/// and for the same reason: it is the unit that has a position, a concurrency setting and a lifecycle.
+/// One subscriber that reads one topic.
 /// </summary>
+/// <remarks>
+/// This is the same unit as a Service Bus processor or a JetStream consumer, for the same reason. It is the unit
+/// that has a position, a concurrency setting and a lifecycle.
+/// </remarks>
 public interface ISubscription : IAsyncDisposable
 {
-    /// <summary>The subscriber this subscription reads as. Its position and set-aside messages are stored under this name.</summary>
+    /// <summary>The subscriber name of this subscription. The position and the set-aside messages are stored under this name.</summary>
     string Subscriber { get; }
 
-    /// <summary>The topic this subscription reads.</summary>
+    /// <summary>The topic that this subscription reads.</summary>
     string Topic { get; }
 
     /// <summary>
-    /// Messages to handle, in no guaranteed order. Append order is total and stable; delivery order is not,
-    /// because a failed message comes back after ones delivered later and handlers run concurrently. Service
-    /// Bus and JetStream say the same, so nothing written against this needs to change when it moves.
+    /// Gives the messages to handle, in no guaranteed order.
     /// </summary>
     /// <remarks>
-    /// Every delivery must be settled — completed, failed, deferred or dead-lettered — or it occupies one of
-    /// the in-flight slots until this subscription is closed. Closing one that is still holding deliveries
-    /// hands them back rather than stranding them: they go out again, counted as further attempts, exactly as
-    /// they would after the process had stopped.
+    /// <para>
+    /// Append order is total and stable. Delivery order can differ from append order. A failed message comes
+    /// back after messages delivered later, and handlers run concurrently. Service Bus and JetStream have the
+    /// same rule. Thus code written against this interface needs no change after a move.
+    /// </para>
+    /// <para>
+    /// Settle each delivery: complete, fail, defer or dead-letter it. An unsettled delivery holds one in-flight
+    /// slot until this subscription closes. When a subscription closes with deliveries in flight, it gives them
+    /// back. They go out again as further attempts, as after a stop of the process.
+    /// </para>
     /// </remarks>
     IAsyncEnumerable<EventEnvelope> ReadAsync(CancellationToken cancellationToken = default);
 
-    /// <summary>Handled. The position absorbs it once everything before it is settled too.</summary>
+    /// <summary>Settles the delivery as handled. The position moves past it when all earlier deliveries are settled too.</summary>
     ValueTask CompleteAsync(EventEnvelope envelope, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Handling threw. Hands the message back for another attempt, or dead-letters it once
-    /// <see cref="SubscriptionOptions.MaxAttempts"/> is reached. Redelivery is immediate.
+    /// Settles a delivery whose handler threw. At <see cref="SubscriptionOptions.MaxAttempts"/>, the message
+    /// becomes a dead letter. Below it, the message goes back for another attempt.
     /// </summary>
+    /// <remarks>Redelivery is immediate.</remarks>
     /// <returns>
-    /// True if the message will be delivered again. False if it will not: it is now a dead letter, or the
-    /// record it would have come from was removed by retention while you were holding it — the one case a
-    /// caller has no way of checking for itself. A message lost that way is counted and reported through
-    /// <see cref="MessagesLostException"/> on a later read, not silently dropped.
+    /// True if the message will be delivered again. False if the message will not be delivered again. In that
+    /// case, the message is now a dead letter, or retention removed its source record while you held the
+    /// delivery. The caller cannot check for the second case. The library counts a message lost in that way. A
+    /// later read reports it through <see cref="MessagesLostException"/>.
     /// </returns>
     ValueTask<bool> FailAsync(EventEnvelope envelope, string reason, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Not now. Takes the message out of the flow into this subscriber's own store, where it stays until
-    /// <see cref="ReplayAsync"/> asks for it. Nothing brings it back on its own, deliberately: deciding when is
-    /// the caller's job, and if that decision has to survive a restart it belongs in a workflow.
+    /// Moves the message into this subscriber's set-aside store as a deferred message. It stays there until
+    /// <see cref="ReplayAsync"/> asks for it.
     /// </summary>
+    /// <remarks>
+    /// Only a replay brings the message back. This is by design: the caller decides when. If that decision must
+    /// survive a restart, put it in a workflow.
+    /// </remarks>
     ValueTask DeferAsync(EventEnvelope envelope, string? reason = null, CancellationToken cancellationToken = default);
 
-    /// <summary>Done with, unsuccessfully. Keeps the payload so it stays replayable after the log has moved on.</summary>
+    /// <summary>
+    /// Settles the delivery as a failure that is final. The dead letter keeps the payload, so you can replay it
+    /// after the log moves on.
+    /// </summary>
     ValueTask DeadLetterAsync(EventEnvelope envelope, string reason, CancellationToken cancellationToken = default);
 
-    /// <summary>What this subscriber has set aside. A view over its own store, not a copy in another topic.</summary>
+    /// <summary>The deferred messages of this subscriber. The list is a view of this subscriber's set-aside store.</summary>
     ValueTask<IReadOnlyList<SetAsideEntry>> DeferredAsync(CancellationToken cancellationToken = default);
 
-    /// <summary>What this subscriber has dead-lettered. A view over its own store, not a copy in another topic.</summary>
+    /// <summary>The dead letters of this subscriber. The list is a view of this subscriber's set-aside store.</summary>
     ValueTask<IReadOnlyList<SetAsideEntry>> DeadLettersAsync(CancellationToken cancellationToken = default);
 
-    /// <summary>Makes a set-aside message deliverable again, from its own stored copy.</summary>
+    /// <summary>Makes a set-aside message deliverable again from its stored copy.</summary>
     /// <returns>
-    /// True if the row was marked for delivery. That is a statement about the store as it stood, not a promise
-    /// that the delivery happens: nothing has read it yet, and under
-    /// <see cref="DeadLetterOverflow.DropOldest"/> a bound reached in the meantime can still take it, as
-    /// retention can take a record between an append and a read. False if there was no such row, or a handler
-    /// has it now.
+    /// True if the row was marked for delivery. True describes the store at that time. It does not promise a
+    /// delivery, because nothing has read the row yet. Under <see cref="DeadLetterOverflow.DropOldest"/>, a
+    /// bound reached before the read can still remove the row. Retention can remove a record between an append
+    /// and a read in the same way. False if there is no such row, or if a handler has the row now.
     /// </returns>
     ValueTask<bool> ReplayAsync(long asideId, CancellationToken cancellationToken = default);
 
-    /// <summary>Destroys a set-aside message. The only deliberate loss in this library.</summary>
+    /// <summary>Destroys a set-aside message. This is the only intentional loss in this library.</summary>
     ValueTask<bool> DiscardAsync(long asideId, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// How far behind this subscriber is, for alarming before retention overtakes it. Both tables are
-    /// counted: the age bound reaches the scheduled one too, so a reading that covered only the log would be
-    /// silent about half of what it is meant to warn about.
+    /// How far behind this subscriber is. Use it to raise an alarm before retention overtakes the subscriber.
     /// </summary>
+    /// <remarks>
+    /// The lag counts both tables, because the age bound also applies to the scheduled table. A value for the log
+    /// alone would report on only half of the risk.
+    /// </remarks>
     ValueTask<SubscriptionLag> LagAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Ages out deferred messages and enforces the dead-letter bound. A maintenance pass, not a scheduler:
-    /// nothing waits on it, and calling it is the host's business, exactly like applying retention to a log.
+    /// Ages out deferred messages and enforces the dead-letter bound.
     /// </summary>
+    /// <remarks>
+    /// This is a maintenance pass. No operation waits for it. The host calls it, as the host applies retention
+    /// to a log.
+    /// </remarks>
     ValueTask<SetAsideReport> ApplyRetentionAsync(CancellationToken cancellationToken = default);
 }

@@ -13,44 +13,45 @@ public sealed class SqliteSubscription : ISubscription
     private readonly TopicReader _reader;
 
     /// <summary>
-    /// The in-flight cap, deliberately never disposed.
+    /// The in-flight cap. Do not dispose it.
     /// </summary>
     /// <remarks>
-    /// A settle frees its slot after its durable write has committed, and closing drains the writer's queue
-    /// rather than discarding it, so a settle whose write was queued when the close began commits during it
-    /// and then releases against an object the close has been through. A disposed semaphore throws there, and
-    /// the caller is told a settle that is on disk failed. Disposing buys nothing to set against that: the
-    /// only thing <see cref="SemaphoreSlim.Dispose()"/> releases is the wait handle behind
-    /// <see cref="SemaphoreSlim.AvailableWaitHandle"/>, which is never asked for here, and it does not wake
-    /// anyone already waiting.
+    /// A settle frees its slot after its durable write commits. The close drains the queue of the writer and
+    /// keeps the queued writes. If the write of a settle is in the queue when the close starts, the settle
+    /// commits during the close. The settle then releases its slot on an object that the close has already
+    /// processed. A disposed semaphore throws at that release, and the caller gets a failure for a settle that
+    /// is on disk. <see cref="SemaphoreSlim.Dispose()"/> releases only the wait handle behind
+    /// <see cref="SemaphoreSlim.AvailableWaitHandle"/>. This class never uses that handle. Disposal also does
+    /// not wake a caller that already waits.
     /// </remarks>
     private readonly SemaphoreSlim _inFlight;
     private readonly ConcurrentDictionary<DeliveryTag, byte> _outstanding = new();
 
     /// <summary>
-    /// Cancelled when the close begins, so that a reader parked on the in-flight cap or on an idle poll is
-    /// answered instead of left waiting.
+    /// The close cancels this source when it starts. A reader that waits on the in-flight cap or on an idle
+    /// poll then gets an answer.
     /// </summary>
     /// <remarks>
-    /// Never disposed, for the reason <see cref="_inFlight"/> is not: a reader can be about to link against
-    /// it at the moment the close runs, and a disposed source throws there — turning the one thing that was
-    /// meant to answer a parked reader into a different way of failing it. Cancelling is what this is for and
-    /// cancelling needs no disposal; the registrations that matter belong to the linked sources the readers
-    /// own, and those they dispose themselves.
+    /// Do not dispose it. The reason is the same as for <see cref="_inFlight"/>. A reader can link to this
+    /// source at the moment the close runs. A disposed source throws at that link. The signal that must answer
+    /// a waiting reader then fails that reader in a different way. Cancellation is the purpose of this source.
+    /// Cancellation needs no disposal. The important registrations belong to the linked sources that the
+    /// readers own. The readers dispose those sources.
     /// </remarks>
     private readonly CancellationTokenSource _closed = new();
 
     /// <summary>
-    /// Deliveries this instance has in transit: claimed but not yet recorded as outstanding, or being settled
-    /// right now. Guarded by <see cref="_gate"/> along with the seal and the quiet signal.
+    /// The deliveries in transit in this instance. A delivery in transit is claimed and not yet recorded as
+    /// outstanding, or it is in a settle now. <see cref="_gate"/> guards this count, the seal and the quiet
+    /// signal.
     /// </summary>
     /// <remarks>
-    /// It exists because <see cref="_outstanding"/> is not a complete list of what this subscription is
-    /// holding at every instant. A claim reaches the file before its tag reaches the dictionary, and a settle
-    /// takes its tag out before its write and puts it back if the write failed. A hand-back that reads the
-    /// dictionary in either window sees nothing to hand back and leaves the delivery in flight in the file
-    /// with nobody holding it — which recovery cannot repair for as long as a sibling on the same subscriber
-    /// and topic stays open, because recovery is skipped exactly then.
+    /// <see cref="_outstanding"/> can miss a delivery that this subscription holds, in two windows. A claim
+    /// reaches the file before its tag reaches the dictionary. A settle removes its tag before its write. If
+    /// the write fails, the settle puts the tag back. If a hand-back reads the dictionary in either window, it
+    /// finds nothing to hand back. The delivery then stays in flight in the file with no holder. Recovery
+    /// cannot repair this while a sibling on the same subscriber and topic stays open, because recovery is
+    /// skipped in that case.
     /// </remarks>
     private readonly object _gate = new();
     private int _inTransit;
@@ -76,27 +77,27 @@ public sealed class SqliteSubscription : ISubscription
         _inFlight = new SemaphoreSlim(subscriptionOptions.MaxInFlight, subscriptionOptions.MaxInFlight);
     }
 
-    /// <summary>What taking a delivery out of <see cref="_outstanding"/> in order to settle it found.</summary>
+    /// <summary>The result when a settle takes a delivery out of <see cref="_outstanding"/>.</summary>
     private enum Held
     {
-        /// <summary>Not this caller's to settle: already settled, handed back by the close, or never delivered.</summary>
+        /// <summary>The caller cannot settle it. It is already settled, the close handed it back, or this instance never delivered it.</summary>
         No,
 
-        /// <summary>Taken, and counted as in transit until the settle has finished one way or the other.</summary>
+        /// <summary>Taken. The delivery counts as in transit until the settle ends, with success or failure.</summary>
         Yes,
 
-        /// <summary>Still this instance's, but the close has sealed and will hand it back itself.</summary>
+        /// <summary>This instance still holds the delivery. The close has sealed and hands the delivery back itself.</summary>
         Closing,
     }
 
     /// <summary>
-    /// Takes a delivery out in order to settle it, and takes a place among the deliveries in transit with it.
+    /// Takes a delivery out for a settle. The same step counts the delivery as in transit.
     /// </summary>
     /// <remarks>
-    /// One step, under the lock the close's own sweep takes, because the two are otherwise a race with a
-    /// delivery in it. A settle that arrives after the seal has to put the tag back for the close to find,
-    /// and a sweep already part-way through the dictionary would not look at it again — which is the defect
-    /// this whole arrangement exists to close, reappearing inside its own fix.
+    /// This is one step, under the same lock as the sweep of the close. Without the lock, the two race over a
+    /// delivery. If a settle arrives after the seal, it must put the tag back for the close to find. If the
+    /// sweep is part-way through the dictionary, it does not look at that tag again. The result is the defect
+    /// that this arrangement exists to prevent, back inside its own fix.
     /// </remarks>
     private Held Take(DeliveryTag tag)
     {
@@ -117,9 +118,9 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Takes a place among the deliveries in transit, unless the close has sealed this subscription. A false
-    /// answer means the caller must not start: the close is about to read <see cref="_outstanding"/> and act
-    /// on what it finds there.
+    /// Adds the caller to the deliveries in transit. If the close has sealed this subscription, this returns
+    /// false. The caller must then not start, because the close is about to read <see cref="_outstanding"/>
+    /// and act on its contents.
     /// </summary>
     private bool Begin()
     {
@@ -132,7 +133,7 @@ public sealed class SqliteSubscription : ISubscription
         }
     }
 
-    /// <summary>Files a claimed delivery as held and gives that place up, in the one step.</summary>
+    /// <summary>Records a claimed delivery as held. The same step removes it from the deliveries in transit.</summary>
     private void Recorded(DeliveryTag tag)
     {
         lock (_gate)
@@ -143,7 +144,7 @@ public sealed class SqliteSubscription : ISubscription
         }
     }
 
-    /// <summary>Gives that place up, having left the delivery filed wherever it now belongs.</summary>
+    /// <summary>Removes the caller from the deliveries in transit. The caller has already filed the delivery where it belongs.</summary>
     private void End()
     {
         lock (_gate)
@@ -154,8 +155,8 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Seals the subscription against new claims and new settles, and answers with the wait for the ones
-    /// already in transit.
+    /// Seals the subscription against new claims and new settles. Returns the wait for the deliveries already
+    /// in transit.
     /// </summary>
     private Task SealAsync()
     {
@@ -171,8 +172,8 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// What a closed subscription tells anybody who reaches it, in the same words the store uses, so that a
-    /// caller cannot tell from the answer which of the two it got there first.
+    /// The exception that a closed subscription gives to each caller. Its message is the same as the message
+    /// from the store. A caller cannot tell from it which of the two it reached first.
     /// </summary>
     private static ChimeraException Closed() => new("The store is closed.");
 
@@ -184,17 +185,17 @@ public sealed class SqliteSubscription : ISubscription
 
     /// <summary>Opens a subscription for <paramref name="subscriber"/> on <paramref name="topic"/>.</summary>
     /// <remarks>
-    /// The first open records the subscriber's starting position. The subscriber name is a durable identity:
-    /// a new name starts from a new position. If the topic's file is absent, the subscription waits for the
-    /// publisher to create it.
+    /// The first open records the starting position of the subscriber. The subscriber name is a durable
+    /// identity. A new name starts from a new position. If the topic file is absent, the subscription waits for
+    /// the publisher to create it.
     /// </remarks>
-    /// <param name="subscriber">The subscriber's name. Its position and set-aside messages are stored under it.</param>
+    /// <param name="subscriber">The subscriber name. The store keeps its position and set-aside messages under it.</param>
     /// <param name="topic">The topic to read.</param>
-    /// <param name="options">The root directory and the settings shared by every topic and subscriber under it.</param>
-    /// <param name="subscriptionOptions">Settings for this subscription. The defaults apply if this is null.</param>
+    /// <param name="options">The root directory and the settings for all topics and subscribers under it.</param>
+    /// <param name="subscriptionOptions">The settings for this subscription. If this is null, the defaults apply.</param>
     /// <returns>The open subscription. Dispose it to close it.</returns>
     /// <exception cref="LogIdentityException">
-    /// The subscriber's stored position belongs to a different incarnation of the log, for example after a restore.
+    /// The stored position of the subscriber belongs to a different incarnation of the log, for example after a restore.
     /// </exception>
     public static SqliteSubscription Open(string subscriber, string topic, ChimeraOptions options,
         SubscriptionOptions? subscriptionOptions = null)
@@ -211,10 +212,10 @@ public sealed class SqliteSubscription : ISubscription
             throw new ArgumentOutOfRangeException(nameof(subscriptionOptions),
                 subscriptionOptions.MaxAttempts, "At least one attempt must be allowed.");
 
-        // Both of these fail quietly rather than loudly if they are wrong, which is why they are checked here.
-        // A batch size of zero delivers nothing at all and looks like an empty topic; a negative one reaches
-        // SQLite as LIMIT -1, which means no limit and reads the whole table into memory. A poll interval of
-        // zero or less turns the idle wait into a spin on a core.
+        // A wrong value in either of these fails silently, so this method checks them here. A batch size of zero
+        // delivers nothing and looks like an empty topic. A negative batch size reaches SQLite as LIMIT -1.
+        // LIMIT -1 means no limit, and SQLite then reads the whole table into memory. A poll interval of zero or
+        // less makes the idle wait spin on a core.
         if (subscriptionOptions.ReadBatchSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(subscriptionOptions),
                 subscriptionOptions.ReadBatchSize, "At least one record must be read at a time.");
@@ -222,11 +223,11 @@ public sealed class SqliteSubscription : ISubscription
             throw new ArgumentOutOfRangeException(nameof(subscriptionOptions),
                 subscriptionOptions.PollInterval, "The poll interval must be greater than zero.");
 
-        // Same reason, on the bounds that decide what this subscriber may keep. Null means unbounded, so only
-        // supplied values are checked, and zero or less is not a tight bound but a nonsensical one: a set
-        // bounded at nothing dead-letters or stops on the very first row. The deferred age is the exception
-        // and only refuses a negative — zero there means "age out the next time a pass sees it", which files
-        // the message dead rather than destroying it, and is a legitimate thing to ask for.
+        // The same reason applies to the bounds on what this subscriber can keep. Null means unbounded, so this
+        // checks only supplied values. A bound of zero or less is invalid, because a set with a bound of zero
+        // dead-letters or stops on the first row. The deferred age is the exception. It refuses only a negative
+        // value. A deferred age of zero means "age out the next time a pass sees it". That files the message as
+        // a dead letter and keeps it. This is a valid setting.
         SetAsidePolicy setAside = subscriptionOptions.SetAside;
         if (setAside.MaxDeferredAge is { } deferredAge && deferredAge < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(subscriptionOptions), deferredAge,
@@ -243,15 +244,15 @@ public sealed class SqliteSubscription : ISubscription
                     $"{what} must be greater than zero. Use null for no bound.");
         }
 
-        // The position is bound here, while the subscription is being created, rather than at its first read.
-        // That is what makes a starting position mean anything: what a subscriber is entitled to is decided by
-        // when it came into existence, not by when its consumer got round to reading.
+        // The position is bound here, when the subscription is created. Its first read comes later. This gives
+        // a starting position its meaning. The time when the subscriber came into existence decides what it can
+        // read. The time of the first read by its consumer has no effect.
         var reader = new TopicReader(FileNames.TopicFile(options.RootDirectory, topic), options);
         try
         {
-            // A topic that does not exist yet has nothing this subscriber can have missed, whichever starting
-            // position was asked for, and the position is worked out now rather than when the file turns up:
-            // messages published between here and the first read arrived after this subscriber existed.
+            // If the topic does not exist yet, this subscriber has missed nothing, for each starting position.
+            // The position is calculated now, before the file appears. Messages published between now and the
+            // first read arrive after this subscriber exists.
             bool exists = reader.TryOpen();
             StartAt start = exists ? StartOf(reader, options, subscriptionOptions) : default;
             Attachment? attach = exists ? new Attachment(topic, reader.LogUuid!, start) : null;
@@ -268,9 +269,9 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Where a position that does not exist yet begins. Reading the log's lower bound rather than starting at
-    /// zero is the difference between a subscriber that reports the retained window as loss and one that
-    /// knows records removed before it existed were never its to read.
+    /// Where a new position begins. The position starts at the lower bound of the log. With a start at zero,
+    /// a subscriber reports the retained window as loss. With a start at the lower bound, a subscriber knows
+    /// that records removed before it existed were never its records to read.
     /// </summary>
     private static StartAt StartOf(TopicReader reader, ChimeraOptions options, SubscriptionOptions subscription)
     {
@@ -282,9 +283,9 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Binds the position to the log once the file exists. A topic nobody has published to yet is simply empty,
-    /// so this waits rather than failing — and rather than creating the file, which would make a subscriber a
-    /// writer of a log it is only supposed to read.
+    /// Binds the position to the log when the file exists. If the file is absent, nobody has published to the
+    /// topic yet, and the topic is empty. This method then waits. It does not fail. It does not create the
+    /// file, because that makes the subscriber a writer of a log that it only reads.
     /// </summary>
     private async ValueTask<bool> TryAttachAsync(CancellationToken ct)
     {
@@ -302,16 +303,16 @@ public sealed class SqliteSubscription : ISubscription
     public async IAsyncEnumerable<EventEnvelope> ReadAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Linked to the close as well as to the caller's token. Every wait a reader can be parked in belongs
-        // to this loop, and none of them is woken by anything the close does to the file: a consumer that
-        // passes an uncancellable token — which this signature allows — would sit on the in-flight cap or on
-        // an idle poll for ever after its subscription was closed.
+        // This source links to the close and to the caller's token. Every wait that can hold a reader
+        // belongs to this loop. Nothing that the close does to the file wakes these waits. This signature
+        // permits a token that cannot be cancelled. Without the link, a consumer with such a token waits for
+        // ever on the in-flight cap or on an idle poll after the subscription closes.
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _closed.Token);
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            // Taking the slot first is what makes the cap real: nothing is claimed that there is no room to
-            // deliver, so a consumer that stops settling stops being read to.
+            // Take the slot first. This makes the cap real. The loop claims a message only when there is room
+            // to deliver it. If a consumer stops settling, it gets no more deliveries.
             try
             {
                 await _inFlight.WaitAsync(stop.Token).ConfigureAwait(false);
@@ -321,9 +322,9 @@ public sealed class SqliteSubscription : ISubscription
                 throw Closed();
             }
 
-            // Claimed and recorded have to happen inside one place the close can wait for. A claim reaches
-            // the file first and the tag reaches _outstanding afterwards, and a hand-back that swept between
-            // the two left the delivery in flight with nobody holding it.
+            // The claim and the record must happen inside one region that the close can wait for. A claim
+            // reaches the file first. The tag reaches _outstanding after that. If a hand-back swept between
+            // the two, the delivery stayed in flight with no holder.
             if (!Begin())
             {
                 _inFlight.Release();
@@ -359,9 +360,9 @@ public sealed class SqliteSubscription : ISubscription
 
             Recorded(next.Value.Tag);
 
-            // Recorded, so the close is now certain to hand this delivery back — which means it is going out
-            // again, to this subscriber's next reader or to a sibling. Handing it to a handler here as well
-            // would put two of them on one message, so the loop ends instead and says why.
+            // The delivery is recorded, so the close will hand it back. The delivery then goes out again, to the
+            // next reader of this subscriber or to a sibling. If this loop also gave it to a handler, two
+            // handlers would have one message. So the loop ends here and gives the reason.
             if (_closing)
             {
                 _inFlight.Release();
@@ -373,25 +374,27 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// The three sources in order of urgency. Draining the log first would starve scheduled messages under a
-    /// sustained backlog — invisible at development volumes and arbitrarily late in production — and the
-    /// set-aside and scheduled sets are both bounded, so taking them first costs nothing.
+    /// Reads the three sources in order of urgency. The set-aside set and the scheduled set are both bounded,
+    /// so a read of them first costs nothing. If the log came first, a sustained backlog would starve
+    /// scheduled messages. This starvation does not show at development volumes. In production, it makes
+    /// scheduled messages late by any amount.
     /// </summary>
     private async ValueTask<EventEnvelope?> NextAsync(CancellationToken ct)
     {
-        // The bound is on the stored set, so the stop belongs to the set and not to this object, and it is
-        // read from the set on every poll. A subscriber that stopped at a full dead set, was closed and opened
-        // again used to deliver until the next dead letter re-armed a flag the old process took with it, so a
-        // restart bought another crop of deliveries. Asking once per instance instead fixed the restart and
-        // left the same hole open sideways: a second subscription on this subscriber and topic that happened
-        // to ask while the set had room kept that answer for as long as it lived, so a set filled by one of
-        // them stopped that one and a fresh one while the warm one delivered past it indefinitely. Reading it
-        // every time is also what lets the answer go the other way — replaying or discarding the dead letters
-        // is how someone clears this, and it would be unhelpful to make them restart the process as well.
+        // The bound applies to the stored set. The stop therefore belongs to the set.
+        // This method reads the stop from the set on each poll. An earlier version kept a flag. A subscriber
+        // stopped at a full dead set, then closed and opened again. It delivered until the next dead letter
+        // set the flag again, because the old process took the flag with it. So each restart gave more
+        // deliveries. A later version asked once per instance. That fixed the restart and left the same fault
+        // open in a different direction. A second subscription on this subscriber and topic asked while the
+        // set had room, and kept that answer for its full life. A set filled by one subscription stopped that
+        // subscription and a new one. The older one delivered past the bound with no end. A read on each poll
+        // also lets the answer change back. A replay or a discard of the dead letters clears the stop. Then the
+        // operator can continue with no restart of the process.
         //
-        // It costs one indexed read of this subscriber's own file per poll, and only for a subscription that
-        // asked to be stopped by a bound. A poll cancelled before the read has an answer simply has not asked
-        // yet, which is the ordinary state of the next poll anyway.
+        // The cost is one indexed read of this subscriber's file per poll. Only a subscription with a stop
+        // at a bound pays it. If a poll is cancelled before the read answers, that poll has not asked yet. The
+        // next poll is in that same state.
         if (StopsAtBound)
         {
             SetAsideSizes size = await _store.SetAsideSizeAsync(Topic, ct).ConfigureAwait(false);
@@ -426,26 +429,26 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Takes the next due scheduled message, moving this subscriber's floor over whatever it has finished with
-    /// on the way.
+    /// Takes the next due scheduled message. On the way, it moves the floor of this subscriber over the rows
+    /// that it has finished with.
     /// </summary>
     /// <remarks>
-    /// A consumed scheduled row stays in the topic file — a subscriber reads that file and cannot delete from
-    /// it, and fan-out means it must not, since another subscriber may not have taken the row yet. So without
-    /// a floor the oldest due rows fill every batch this reads and a newer message never appears in one: the
-    /// scheduled table stops delivering entirely, and stays stopped until retention removes the rows. Moving
-    /// the floor over the settled run is what keeps the window pointed at work rather than at history, and it
-    /// is also what lets the entries recording those rows be deleted rather than kept for ever.
+    /// A consumed scheduled row stays in the topic file. A subscriber reads that file and cannot delete from
+    /// it. With fan-out, it must not delete, because another subscriber can still need the row. Without a
+    /// floor, the oldest due rows fill each batch, and a newer message never gets into a batch. The scheduled
+    /// table then stops all delivery until retention removes those rows. The floor moves over the settled run
+    /// and keeps the window on work. The floor also lets the store delete the entries that record those rows.
+    /// Without it, those entries stay for ever.
     /// </remarks>
     private async ValueTask<EventEnvelope?> TakeScheduledAsync(CancellationToken ct)
     {
         DateTimeOffset now = _options.Clock.GetUtcNow();
         ScheduledFloor floor = await _store.ReadScheduledFloorAsync(Topic, ct).ConfigureAwait(false);
 
-        // Read before the window rather than inside it, so it happens on a poll that finds nothing as well as
-        // on one that finds work. That costs one indexed query against this subscriber's own file per idle
-        // poll, and buys the only chance there is to notice an entry whose row has gone: a topic with nothing
-        // due is exactly where one sits unnoticed.
+        // Read the states before the window, outside it. Then the read happens on a poll that finds nothing,
+        // and on a poll that finds work. The cost is one indexed query on this subscriber's file per idle
+        // poll. It is the only chance to find an entry whose row has gone. Such an entry stays unnoticed in a
+        // topic with nothing due.
         Dictionary<long, EntryState> states =
             await _store.EntryStatesAsync(Topic, EntrySource.Scheduled, ct).ConfigureAwait(false);
         await ForgetRemovedScheduledAsync(states, ct).ConfigureAwait(false);
@@ -456,8 +459,8 @@ public sealed class SqliteSubscription : ISubscription
             if (candidates.Count == 0)
                 return null;
 
-            // Only the leading run, and only rows that are finished with. Absorbing the highest settled row
-            // instead would swallow everything in flight below it, and that message would never come back.
+            // Absorb only the leading run, and only rows that are finished. If this absorbed up to the highest
+            // settled row, it would also absorb each in-flight row below it. That message would never come back.
             var absorbed = new List<long>();
             while (absorbed.Count < candidates.Count
                 && states.TryGetValue(candidates[absorbed.Count].Id, out EntryState settled)
@@ -478,8 +481,8 @@ public sealed class SqliteSubscription : ISubscription
             if (taken is not null)
                 return taken;
 
-            // Nothing takeable here. Another batch is worth reading only if the floor moved past this one,
-            // which it did exactly when every candidate was absorbed.
+            // No candidate here can be taken. Read another batch only if the floor moved past this one. The
+            // floor moved past it only when this absorbed every candidate.
             if (absorbed.Count < candidates.Count)
                 return null;
 
@@ -488,19 +491,18 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Settles the log entries that came to rest under the position, reporting the ones still owed.
+    /// Settles the log entries that are now under the position. Reports the entries still owed.
     /// </summary>
     /// <remarks>
-    /// The log twin of the pass over removed scheduled rows below, and it exists for the same reason: a
-    /// delivery that was out when retention overtook this subscriber is settled after the position has moved
-    /// past the record, and where that leaves it depends on how it was settled. Neither pass can be done at
-    /// the moment the record goes, because at that moment a handler still has the message and the answer is
-    /// not known yet.
+    /// This is the log equivalent of the pass over removed scheduled rows below, and it has the same cause. If
+    /// a delivery was out when retention overtook this subscriber, the settle comes after the position moved
+    /// past the record. The result then depends on the type of settle. Neither pass can run at the moment the
+    /// record goes. At that moment a handler still has the message, and the result is unknown.
     /// <para>
-    /// The states this already read are what decides whether to run it at all. Entries under the mark are the
-    /// exception rather than the rule — a subscriber that is keeping up never has one — so the ordinary poll
-    /// pays a comparison over a dictionary it was going to read anyway rather than a write per read. The mark
-    /// is read again inside the write, so a stale reading here can only cost a pass that finds nothing.
+    /// The states that this method already read decide whether the pass runs. Entries under the mark are
+    /// rare, and a subscriber that keeps up never has one. So a normal poll costs one comparison over a
+    /// dictionary that it reads anyway. It makes no write per read. The write reads the mark again, so a
+    /// stale value here can cost only a pass that finds nothing.
     /// </para>
     /// </remarks>
     private async ValueTask ForgetStrandedAsync(long mark, Dictionary<long, EntryState> states,
@@ -518,25 +520,25 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Drops the entries for scheduled rows the topic file no longer holds.
+    /// Removes the entries for scheduled rows that are gone from the topic file.
     /// </summary>
     /// <remarks>
-    /// The floor absorbs an entry when it moves over the row that entry records, and it only moves over rows
-    /// it has seen as candidates. Retention removing a row before that happened — a settle just before a
-    /// shutdown, a subscriber offline longer than the retention window, a crash whose redelivery the window
-    /// outlived — leaves an entry nothing can absorb, so it stays for as long as the file does and is counted
-    /// for that long by everything that reads it.
+    /// The floor absorbs an entry when it moves over the row that the entry records. The floor moves only over
+    /// rows that it has seen as candidates. Retention can remove a row before that happens. Examples are a
+    /// settle just before a shutdown, a subscriber offline for longer than the retention window, and a crash
+    /// whose redelivery the window outlived. Nothing can absorb the entry that remains. It stays for the life
+    /// of the file, and each reader of the file counts it for that time.
     /// <para>
-    /// A delivery still in flight is left alone even when its row has gone. It is being handled now; forgetting
-    /// it would report this subscriber as having nothing left to do while a handler is running, and the settle
-    /// that follows would write the entry straight back. Once that settle lands the next poll takes it.
+    /// This pass leaves an in-flight delivery alone, also when its row has gone. A handler works on it now. If
+    /// this pass removed it, the subscriber would report no work left while a handler runs. The settle that
+    /// follows would also write the entry back. After that settle, the next poll removes the entry.
     /// </para>
     /// <para>
-    /// One of the entries it forgets is not a tidy-up but a loss, and is reported as one. An entry left
-    /// available is a delivery that failed and was told it would come again, and the row it would have come
-    /// from has gone. There is no position on this path to infer a loss from — which is why a scheduled
-    /// message nobody ever read goes unremarked — but an entry is not an inference: it is this subscriber's
-    /// own record that the message reached it and is still owed.
+    /// One type of entry that this pass removes is a loss, and the pass reports it as a loss. An available
+    /// entry is a delivery that failed. The failure told the caller that the message comes again. The row it
+    /// comes from has gone. This path has no position to infer a loss from, so a scheduled message that
+    /// nobody read gets no report. An entry is a direct record by this subscriber. It shows that the message
+    /// reached the subscriber and is still owed.
     /// </para>
     /// </remarks>
     private async ValueTask ForgetRemovedScheduledAsync(Dictionary<long, EntryState> states, CancellationToken ct)
@@ -546,8 +548,8 @@ public sealed class SqliteSubscription : ISubscription
         if (settled.Count == 0)
             return;
 
-        // A reader with no file to answer from says nothing, which is not the same as saying none of these
-        // rows exist — and treating the two the same would delete every entry the moment a file went missing.
+        // If the reader has no file, it gives no answer. No answer does not mean that these rows are gone. If
+        // this treated the two as the same, it would delete each entry when a file went missing.
         if (_reader.ExistingScheduled(settled) is not { } present)
             return;
 
@@ -557,12 +559,12 @@ public sealed class SqliteSubscription : ISubscription
 
         HashSet<long> owedIfForgotten = gone.Where(id => states[id] == EntryState.Available).ToHashSet();
 
-        // Forgotten first, reported second: the report is the only one there will ever be, and an entry left
-        // behind by a cancelled throw would be counted again by every poll after it.
+        // Remove first, then report. This report is the only one. If a cancelled throw left an entry behind,
+        // each later poll would count it again.
         //
-        // And reported for what was forgotten rather than for what this asked to forget. The write turns away
-        // an entry that has been claimed since these states were read, and naming that message as lost while
-        // a handler holds it would be the same mistake in the report that the guard exists to stop in the file.
+        // Report only what the write removed. The write refuses an entry that was claimed after these states
+        // were read. A report of that message as lost while a handler holds it is the same error in the report
+        // that the guard prevents in the file.
         List<long> forgotten = await _store.ForgetScheduledAsync(Topic, gone, ct).ConfigureAwait(false);
         foreach (long id in forgotten)
             states.Remove(id);
@@ -573,8 +575,8 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// The first candidate this subscriber can take. What it is already holding or has already finished with
-    /// is known from its own store, so a batch mostly made of those costs one read rather than a write per row.
+    /// The first candidate that this subscriber can take. Its own store records the rows that it holds and the
+    /// rows that it has finished. So a batch of mostly those rows costs one read. It makes no write per row.
     /// </summary>
     private async ValueTask<EventEnvelope?> TakeAsync(EntrySource source, List<Candidate> candidates, int from,
         Dictionary<long, EntryState> states, CancellationToken ct)
@@ -585,17 +587,18 @@ public sealed class SqliteSubscription : ISubscription
             if (states.TryGetValue(candidate.Id, out EntryState state) && state != EntryState.Available)
                 continue;   // in flight now, or finished with and waiting to be absorbed
 
-            // The payload is fetched before the claim, and only for the row about to be delivered. Claiming
-            // first would leave an entry recording a delivery of a record retention had already removed.
+            // Fetch the payload before the claim, and only for the row that goes out next. If the claim came
+            // first, an entry could record a delivery of a record that retention had already removed.
             byte[]? payload = _reader.PayloadOf(source, candidate.Id);
             if (payload is null)
                 continue;
 
-            // The claim re-checks the position inside its own write — the mark for a log row, the floor for
-            // a scheduled one, which is why the due time goes along. The states and candidates this loop is
-            // working from were read in earlier ops, and a second reader of the same subscriber can settle
-            // and absorb a row in between; a claim that trusted this method's reading would re-insert an
-            // entry for it below the position, and deliver the message twice on a path where nothing failed.
+            // The claim checks the position again inside its own write. For a log row, the position is the mark.
+            // For a scheduled row, it is the floor, so the claim also takes the due time. This loop works from
+            // states and candidates that earlier operations read. A second reader of the same subscriber can
+            // settle and absorb a row between them. If the claim trusted the values in this method, it would
+            // insert the entry again below the position. The message then goes out twice on a path with no
+            // failure.
             long attempt = await _store.TryClaimAsync(Topic, source, candidate.Id,
                 Sqlite.ToUnixMs(candidate.EligibleAt), ct).ConfigureAwait(false);
             if (attempt == 0)
@@ -608,9 +611,9 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Retention removing records a subscriber had not read is bounded, attributable loss rather than a
-    /// surprise — but only if somebody notices. Comparing the position with the lowest surviving sequence is
-    /// the whole detection, and it costs one query against a log this is reading anyway.
+    /// Retention can remove records that a subscriber has not read. That loss is bounded and attributable, if
+    /// the subscriber detects it. Detection compares the position with the lowest remaining sequence. It costs
+    /// one query against a log that this method reads anyway.
     /// </summary>
     private async ValueTask<long> DetectLossAsync(long mark, CancellationToken ct)
     {
@@ -618,20 +621,20 @@ public sealed class SqliteSubscription : ISubscription
         if (min <= mark + 1 || min <= _seenMinimum)
             return mark;
 
-        // Measuring the gap and moving the position over it are one write, and the gap in the report is the
-        // one that write measured — not the one this method read a moment ago. Two readers of the same
-        // subscriber can reach here together, and when they did the measurement and the move were separate
-        // ops: both measured against the un-moved mark and the same loss was reported twice. The write that
-        // finds the mark already moved measures nothing and reports nothing, so between however many readers
-        // there are, the loss is reported by exactly the one that moved the position over it.
+        // One write measures the gap and moves the position over it. The report uses the gap that this write
+        // measured. It ignores the gap that this method read before. Two readers of the same subscriber can
+        // get here at the same time. When the measure and the move were separate operations, both readers
+        // measured against the old mark and reported the same loss twice. If the write finds the mark already
+        // moved, it measures nothing and reports nothing. So, with any number of readers, only the reader that
+        // moved the position over the gap reports the loss.
         (long moved, long lost, long first, long last) =
             await _store.SettleLossAsync(Topic, min, ct).ConfigureAwait(false);
 
-        // And only now is this minimum a seen one. A detection that runs once has to be one that finished:
-        // a consumer cancelling a read is ordinary, and cancelling it above would leave the flag set with the
-        // mark unmoved, so no later poll would look again and the loss would never be reported at all. A
-        // cancelled attempt instead retries the whole detection, which is safe because it is idempotent —
-        // the mark only moves forward, and the second pass measures the gap against where it moved to.
+        // Only now does this minimum count as seen. A detection that runs once must be a detection that
+        // finished. A consumer can cancel a read at any time. If a cancel above left the flag set with the mark
+        // not moved, no later poll would look again, and nobody would report the loss. A cancelled attempt runs
+        // the whole detection again. This is safe because detection is idempotent. The mark moves only forward.
+        // The second pass measures the gap from the new mark.
         _seenMinimum = min;
         if (lost <= 0)
             return moved;
@@ -641,8 +644,8 @@ public sealed class SqliteSubscription : ISubscription
 
     private async ValueTask IdleAsync(CancellationToken ct)
     {
-        // Waiting until the next due time rather than polling for it: the timer lives here, in memory, and a
-        // restart simply reads the table again and works it out afresh.
+        // Wait until the next due time, with no poll for it. The timer is in memory here. After a restart, the
+        // reader reads the table again and calculates the time again.
         DateTimeOffset now = _options.Clock.GetUtcNow();
         TimeSpan wait = IdleWait.Until(now, _reader.NextDue(now), _subscriptionOptions.PollInterval);
         if (wait > TimeSpan.Zero)
@@ -650,53 +653,52 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Runs one settle: claims the right to settle this delivery, does the work, and frees the in-flight slot
-    /// once it is done. Claiming it is also what makes settling one twice refused rather than acted on.
+    /// Runs one settle. It claims the right to settle this delivery, does the work, and frees the in-flight
+    /// slot when the work is done. The claim also makes the subscription refuse a second settle of a delivery.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The in-flight slot is the reason the claim has to be checked. Each settle releases one, so a message
-    /// settled twice releases two and the cap quietly grows by one for the life of the subscription — or the
-    /// release throws, from a call the handler could not connect to the one that caused it. Both are worse
-    /// than being told plainly, on the second call, that this delivery is already finished with.
+    /// The in-flight slot is why the claim check is necessary. Each settle releases one slot. A message
+    /// settled twice releases two slots, and the cap silently grows by one for the life of the subscription.
+    /// Or the release throws, from a call that the handler cannot connect to its cause. The second call gets
+    /// a clear error that this delivery is already finished.
     /// </para>
     /// <para>
-    /// The slot is freed on success only, and the delivery goes back to being outstanding if the work threw.
-    /// A settle that failed has settled nothing — the entry in the file still says in flight — so the caller
-    /// has to be able to try again, and the slot it is holding is not free. Freeing it anyway would let the
-    /// cap the consumer configured drift up by one for every settle that failed, and forgetting the delivery
-    /// would leave it in flight in the file with nothing able to settle it short of opening the subscription
-    /// again.
+    /// The slot is freed only on success. If the work throws, the delivery becomes outstanding again. A failed
+    /// settle has settled nothing, and the entry in the file still shows in flight. The caller must be able to
+    /// try again. The slot that it holds stays in use. If the slot were freed anyway, the configured cap would
+    /// grow by one for each failed settle. If the delivery were forgotten, it would stay in flight in the file.
+    /// Only a new open of the subscription could then settle it.
     /// </para>
     /// <para>
-    /// Which is why what runs inside one settle is one durable write and nothing after it. Handing the claim
-    /// back is right for a settle that did nothing and a lie about one whose effect committed, and this cannot
-    /// tell the two apart: the settles below leave nothing that can throw once their write has gone in. The
-    /// release beneath them is part of that and not an exception to it, which is why the semaphore it releases
-    /// is one nothing ever disposes — a close that ran while the write was in the queue would otherwise turn
-    /// the last step of a committed settle into the report that it had failed.
+    /// For this reason, one settle runs one durable write and nothing after it. To hand the claim back is
+    /// correct for a settle that did nothing. For a settle whose effect committed, it is a false report. This
+    /// method cannot tell the two apart. So the settles below have nothing after their write that can throw.
+    /// The release under them is part of that rule. For that reason, nothing disposes the semaphore that it
+    /// releases. If a close ran while the write was in the queue, a disposed semaphore would turn the last step
+    /// of a committed settle into a failure report.
     /// </para>
     /// <para>
-    /// What is claimed is a delivery and not a message, which is why the tag carries the attempt. A tag naming
-    /// only the row would be reissued by every redelivery, so a failure and the retry behind it re-armed the
-    /// tag a stale caller was still holding: its second settle was accepted, it settled the retry out from
-    /// under the handler working on it, and that handler's own settle was refused for a mistake it had not
-    /// made.
+    /// The claim is on a delivery. For this reason, the tag carries the attempt. An earlier tag named only the
+    /// row, and each redelivery issued that tag again. A failure and its retry then made the tag of a stale
+    /// caller valid again. The second settle of the stale caller was accepted, and it settled the retry while
+    /// another handler worked on it. That handler's own settle was then refused for an error that it did not
+    /// make.
     /// </para>
     /// </remarks>
     private async ValueTask<T> SettlingAsync<T>(EventEnvelope envelope, Func<ValueTask<T>> settle)
     {
-        // A settle that starts after the close has sealed is turned away before it has done anything, and the
-        // delivery is left where the hand-back will find it. Letting it run instead is what stranded a
-        // failing settle's delivery: the tag is out of the dictionary for the length of the write, the catch
-        // below files it again, and a hand-back that has already been past never looks a second time.
+        // If a settle starts after the close has sealed, this method refuses it before it does anything. The
+        // delivery stays where the hand-back finds it. When such a settle ran, a failing settle stranded its
+        // delivery. The tag is out of the dictionary for the length of the write. The catch below files it
+        // again. If the hand-back has already gone past, it does not look a second time.
         switch (Take(envelope.Tag))
         {
             case Held.No:
-                // All three causes are named, because the caller can only act on one of them. A settle
-                // arriving after the close was told it had already settled the message, which is a lie about
-                // its own delivery: the hand-back took the claim, nothing was written, and the message is
-                // there for the next subscription to be handed. Held.No has known these apart all along.
+                // Held.No is one answer for three causes: settled already, handed back by the close, or never
+                // delivered here. The message names all three. An earlier message said only "already settled".
+                // For a settle after the close, that was false. The hand-back took the claim, nothing was
+                // written, and the message waits for the next subscription.
                 throw new InvalidOperationException(
                     $"Message '{envelope.MessageId}' on topic '{Topic}' is not this caller's to settle: it " +
                     $"has already been settled, or closing the subscription handed the delivery back, or " +
@@ -717,9 +719,9 @@ public sealed class SqliteSubscription : ISubscription
         }
         finally
         {
-            // After the catch, so that a settle which failed has re-filed its delivery before the close is
-            // told this one is finished. The whole point of the wait is that what it waits for is settled
-            // one way or the other by the time it ends.
+            // End() comes after the catch. A failed settle then files its delivery again before the close learns
+            // that this settle is finished. The purpose of the wait is that each settle it waits for ends, with
+            // success or failure, before the wait ends.
             End();
         }
 
@@ -752,11 +754,11 @@ public sealed class SqliteSubscription : ISubscription
             {
                 if (exhausted)
                 {
-                    // The same refusal the other routes into the dead set make, on this one — decided in the
-                    // write, which can tell a deferral arriving in the dead set from a dead letter being
-                    // re-filed as what it already is. Refused, nothing was written and the delivery is still
-                    // the caller's, to complete deliberately or to fail again once the bound is somewhere it
-                    // can live.
+                    // This route makes the same refusal as the other routes into the dead set. The write decides
+                    // it. The write can tell a deferral that arrives in the dead set from a dead letter that is
+                    // filed again as a dead letter. After a refusal, nothing was written and the delivery still
+                    // belongs to the caller. The caller can complete it deliberately. The caller can also fail it
+                    // again when the bound can keep the message.
                     SetAsideOutcome dead = await _store.RefileAsync(envelope.Tag.Id, Topic, SetAsideKind.Dead,
                         reason, _subscriptionOptions.SetAside, cancellationToken).ConfigureAwait(false);
                     if (dead.Refused)
@@ -767,10 +769,10 @@ public sealed class SqliteSubscription : ISubscription
                 long settled = await _store.SettleSetAsideAsync(envelope.Tag.Id, SetAsideDelivery.Ready,
                     cancellationToken).ConfigureAwait(false);
 
-                // What the settle actually did, exactly as on the log path below. A set-aside row can go
-                // while a handler holds it — a crash between the claim and the settle, or retention on the
-                // dead set — and saying it will be delivered again when there is nothing left to deliver is
-                // the one answer a caller cannot check for itself.
+                // Return what the settle did, as on the log path below. A set-aside row can go while a handler
+                // holds it, after a crash between the claim and the settle or after retention on the dead set.
+                // If nothing is left to deliver, the answer "delivered again" is false. The caller cannot check
+                // that answer itself.
                 return settled > 0;
             }
 
@@ -780,30 +782,29 @@ public sealed class SqliteSubscription : ISubscription
                 return false;
             }
 
-            // What the release actually did, not what it was asked to do. Retention can overtake a subscriber
-            // while it is holding a delivery, and the position then moves over a record that no longer exists;
-            // saying the message will come back when no read will ever offer it again is the one answer a
-            // caller cannot check for itself.
+            // Return what the release did. Retention can overtake a subscriber while it holds a delivery. The
+            // position then moves over a record that is gone. If no read will offer the message again, the
+            // answer "it comes back" is false. The caller cannot check that answer itself.
             long released = await _store.ReleaseAsync(Topic, envelope.Tag.Source, envelope.Tag.Id,
                 cancellationToken).ConfigureAwait(false);
             return released > 0 && StillInTheTopic(envelope.Tag);
         });
 
     /// <summary>
-    /// Whether the record a handed-back delivery would come from is still in the topic file.
+    /// Whether the topic file still holds the record that a handed-back delivery comes from.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The release answers about this subscriber's own entry, and the promise a failure makes is about the
-    /// record. The two part company exactly where retention overtakes a delivery: the entry is there to hand
-    /// back long after the only thing that could act on it has gone, and a caller told "it will come again"
-    /// has no way to find out that nothing will ever offer it.
+    /// The release reports on the entry of this subscriber. The promise of a failure is about the record. The
+    /// two differ when retention overtakes a delivery. The entry stays, ready for hand-back, long after the
+    /// record has gone. A caller told "it will come again" cannot find out that nothing will offer it.
     /// </para>
     /// <para>
-    /// Asked after the release rather than before it. A record removed in between is one this subscriber is
-    /// still owed and is reported as lost, which is the honest ending for it; asking first would answer about
-    /// a file the entry had not yet been handed back against, and a stale "gone" there would be the same lie
-    /// pointing the other way. A reader with no file to answer from says nothing, and nothing is not "gone".
+    /// This check runs after the release. If retention removes the record between the two, this subscriber is
+    /// still owed it, and the record is reported as lost. That is the correct result. A check before the
+    /// release answers about a file that the entry was not yet handed back against. A stale "gone" there is
+    /// the same false answer in the other direction. If the reader has no file, it gives no answer. No answer
+    /// does not mean "gone".
     /// </para>
     /// </remarks>
     private bool StillInTheTopic(DeliveryTag tag)
@@ -835,22 +836,22 @@ public sealed class SqliteSubscription : ISubscription
     private static async ValueTask Discard<T>(ValueTask<T> settle) => await settle.ConfigureAwait(false);
 
     /// <summary>
-    /// Files a message in this subscriber's own store, downgrading a deferral to a dead letter if the deferred
-    /// set is full. The downgrade is decided in the write that inserts the row, so that the set it was
-    /// measured against is the set it joined.
+    /// Files a message in this subscriber's store. If the deferred set is full, the deferral becomes a
+    /// dead letter. The write that inserts the row makes that decision. So the row joins the same set that the
+    /// decision measured.
     /// </summary>
     private async ValueTask SetAsideAsync(SetAsideKind kind, EventEnvelope envelope, string? reason,
         CancellationToken ct)
     {
         if (envelope.Tag.Source == EntrySource.SetAside)
         {
-            // Already in this subscriber's store, so this only changes what it is filed as — in both
-            // directions. A dead letter someone replayed and then deferred is filed as deferred, which is what
-            // the call says it does and what an operator working a dead set down is asking for.
+            // The row is already in this subscriber's store, so this changes only its kind, in both
+            // directions. If someone replays a dead letter and then defers it, the row is filed as deferred. The
+            // call states that result. An operator who works down a dead set asks for it.
             //
-            // Every bound is read inside the write, against the set the row is joining, and that includes the
-            // keepability refusal: whether this row is joining the dead set or is in it already is the thing
-            // the decision turns on, and it is the write that knows.
+            // The write reads each bound against the set that the row joins. This includes the keepability
+            // refusal. The decision depends on whether the row joins the dead set or is already in it. The write
+            // knows which of the two is true.
             SetAsideOutcome refiled = await _store.RefileAsync(envelope.Tag.Id, Topic, kind,
                 reason ?? (kind == SetAsideKind.Dead ? "dead-lettered" : null),
                 _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
@@ -860,48 +861,47 @@ public sealed class SqliteSubscription : ISubscription
             return;
         }
 
-        // The bounds go with the row rather than being checked here: two handlers deferring at once would
-        // both read a set with room in it and both insert into it, and the bound the consumer configured
-        // would hold only as long as nothing happened concurrently.
+        // The bounds go with the row into the write. If this method checked them here, two handlers that defer
+        // at the same time would both read a set with room and both insert into it. The configured bound would
+        // then hold only when nothing happened concurrently.
         SetAsideOutcome outcome = await _store.SetAsideAsync(kind, Topic, envelope.Tag.Source, envelope.Tag.Id,
             envelope.MessageId, envelope.EnqueuedAt, envelope.Attempt, reason, envelope.Payload,
             _subscriptionOptions.SetAside, ct).ConfigureAwait(false);
 
-        // Refused inside the write, thrown out here: nothing was stored, so this settle has done nothing and
-        // the delivery is still the caller's, exactly as after any settle that threw.
+        // The write refuses, and this method throws. Nothing was stored, so this settle did nothing. The delivery
+        // still belongs to the caller, the same as after any settle that throws.
         if (outcome.Refused)
             throw Unkeepable(envelope.Payload.Length);
     }
 
     /// <summary>
-    /// Refuses a dead letter this subscriber could not then keep: with a byte bound smaller than the message
-    /// and dropping the oldest to stay inside it, the trim destroys this row on its next pass whatever else
-    /// the set holds, so filing it would be storing a message in order to lose it. The refusal itself is made
-    /// in the write that would have filed the row — the set the row is measured against is the set it is
-    /// joining — and thrown out here, where the caller that caused it is. The caller can complete the
-    /// delivery instead and lose the message knowingly, which is a decision rather than an accident.
+    /// Refuses a dead letter that this subscriber cannot keep. If the byte bound is smaller than the message
+    /// and the overflow policy drops the oldest, the next trim pass destroys this row. Other rows in the set
+    /// have no effect on this. To file the row would store a message only to lose it. The write that would
+    /// file the row makes the refusal, because the set that the row joins is the set it is measured against.
+    /// This method throws it here, at the caller that caused it. The caller can complete the delivery and
+    /// lose the message as a deliberate decision.
     /// </summary>
     private DeadLetterTooLargeException Unkeepable(int size)
         => new(Topic, Subscriber, size, _subscriptionOptions.SetAside.MaxDeadBytes ?? 0);
 
-    /// <summary>Whether this subscriber is one a full dead set stops at all.</summary>
+    /// <summary>Whether a full dead set stops this subscriber.</summary>
     private bool StopsAtBound
         => _subscriptionOptions.SetAside.DeadOverflow == DeadLetterOverflow.StopDelivering
         && (_subscriptionOptions.SetAside.MaxDeadCount is not null
             || _subscriptionOptions.SetAside.MaxDeadBytes is not null);
 
     /// <summary>
-    /// Whether a dead set of this size is one the subscriber should stop on. Both bounds answer the same
-    /// question and reaching either is enough, so they are asked in the one place rather than at each of the
-    /// three moments a dead letter can arrive.
+    /// Whether a dead set of this size stops the subscriber. Each bound answers the same question, and either
+    /// one is enough. So one method checks both bounds for all three points where a dead letter can arrive.
     /// </summary>
     /// <remarks>
-    /// What it counts is the dead letters parked in the set, not every row filed as dead. Replaying them is
-    /// the remedy this exception names, and completing a replay is what takes one out of the set — but a
-    /// replay has to be delivered before it can be completed, and a stopped subscriber delivers nothing. On
-    /// the count of every dead row, the remedy therefore could not run: replay changes only the delivery
-    /// state, so the number never moved and the subscriber stayed stopped against the one thing that could
-    /// have cleared it. Counting the parked ones lets a replay out and re-arms the stop if it comes back.
+    /// It counts only the dead letters held in the set. It does not count every row filed as dead. Replay is
+    /// the remedy that this exception names. A completed replay takes a row out of the set. A replay must be
+    /// delivered before it can complete, and a stopped subscriber delivers nothing. With a count of every dead
+    /// row, the remedy could not run. Replay changes only the delivery state, so the count did not change. The
+    /// subscriber stayed stopped against the one action that could clear the stop. A count of held rows lets
+    /// a replay out. If the replay comes back, the stop applies again.
     /// </remarks>
     private SubscriberStoppedException? StoppedBy(SetAsideSizes size)
     {
@@ -939,18 +939,17 @@ public sealed class SqliteSubscription : ISubscription
                     cancellationToken).ConfigureAwait(false);
             }
 
-            // Nothing to arm on the other policy: this pass can be what takes the set to its limit — a
-            // deferral ageing out is a dead letter arriving — and the read that decides whether to stop
-            // happens on the next poll against the set this pass leaves behind. Arming it here as well used
-            // to be what made the bound hold, which meant a pass cancelled between the ageing and the arming
-            // left a set at its limit delivering.
+            // The other policy needs no flag here. This pass can bring the set to its limit, because a deferral
+            // that ages out is a dead letter that arrives. The next poll reads the set that this pass leaves and
+            // decides whether to stop. Earlier, the bound held only because this pass also set a flag. A pass
+            // cancelled between the ageing and the flag then left a set at its limit that still delivered.
         }
 
-        // Everything since the last pass, not only what this one did. A dead letter arriving is as likely to
-        // cause a drop as a maintenance pass is, and they are the same loss for the same reason: reporting
-        // one and not the other would put a number next to a silence. The ageing count is read the same way
-        // and from the same place, so a pass that fails after ageing leaves its number for the next one
-        // instead of taking it away with it.
+        // Report all counts since the last pass, including the counts from this pass. A dead letter that
+        // arrives can cause a drop, the same as a maintenance pass. Both are the same loss for the same reason.
+        // A report of one without the other gives a number for one loss and silence for the other. The ageing
+        // count comes from the same place, read the same way. If a pass fails after ageing, its count stays for
+        // the next pass.
         (long aged, long dropped) = await _store.TakeCountersAsync(Topic, cancellationToken)
             .ConfigureAwait(false);
         return new SetAsideReport(aged, dropped);
@@ -982,24 +981,24 @@ public sealed class SqliteSubscription : ISubscription
         (_, long max) = _reader.Bounds();
         DateTimeOffset? oldest = _reader.OldestAfter(mark);
 
-        // The scheduled side is counted as well, because the age bound removes from both tables and a call
-        // whose purpose is warning before retention overtakes a subscriber cannot be blind to half of what
-        // retention reaches. A backlog of due scheduled messages used to read as no lag at all.
+        // Count the scheduled side too. The age bound removes from both tables. This call warns before
+        // retention overtakes a subscriber, so it must see all that retention reaches. Earlier, a backlog of due
+        // scheduled messages showed as no lag.
         DateTimeOffset now = _options.Clock.GetUtcNow();
         ScheduledFloor floor = await _store.ReadScheduledFloorAsync(Topic, cancellationToken)
             .ConfigureAwait(false);
         Dictionary<long, EntryState> states =
             await _store.EntryStatesAsync(Topic, EntrySource.Scheduled, cancellationToken).ConfigureAwait(false);
 
-        // Settled rows the floor has not reached yet are inside the due window but are not owed: the floor
-        // moves in the reader rather than at the moment of settling, so counting them says work is owed for
-        // a message already handled. Asked of the topic file rather than subtracted from a number counted
-        // here, so a row that has since been removed drops out of both sides instead of one.
+        // Settled rows that the floor has not reached yet are inside the due window. They are not owed. The
+        // reader moves the floor after the settle, so a count of these rows reports work owed for a message
+        // already handled. The topic file gives both numbers in this subtraction. So if retention has removed
+        // a row since, the row leaves both sides together.
         List<long> absorbable = states.Where(entry => entry.Value == EntryState.Complete)
             .Select(entry => entry.Key).ToList();
         long due = Math.Max(0, _reader.DueCount(floor, now) - _reader.DueAmong(floor, now, absorbable));
 
-        // A duration, not a count: retention is set in hours, and a number of messages cannot be compared with it.
+        // Report a duration. Retention is set in hours, and a count of messages cannot be compared with it.
         return new SubscriptionLag(Math.Max(0, max - mark),
             oldest is null ? null : now - oldest.Value, due);
     }
@@ -1009,11 +1008,11 @@ public sealed class SqliteSubscription : ISubscription
     {
         try
         {
-            // Two phases, because a hand-back can only be right if what it reads is a complete list. Sealing
-            // stops new claims and new settles; the wait lets the ones already in transit finish filing
-            // themselves either way — a settle that commits during it keeps its true answer, one that fails
-            // puts its delivery back, and a claim that lands records its tag — and only then is _outstanding
-            // the whole of what this instance is holding.
+            // The close has two phases, because a hand-back is correct only if it reads a complete list. The
+            // seal stops new claims and new settles. The wait lets the claims and settles in transit finish
+            // filing. If a settle commits during the wait, it keeps its true result. If a settle fails, it puts
+            // its delivery back. If a claim lands, it records its tag. After the wait, _outstanding holds all
+            // the deliveries of this instance.
             Task quiet = SealAsync();
             _closed.Cancel();
             await quiet.ConfigureAwait(false);
@@ -1027,37 +1026,36 @@ public sealed class SqliteSubscription : ISubscription
     }
 
     /// <summary>
-    /// Hands back whatever this subscription is still holding, so that closing it does the same thing to its
-    /// deliveries as the process going away would.
+    /// Hands back each delivery that this subscription still holds. A close then has the same effect on its
+    /// deliveries as the end of the process.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Recovery on the next open cannot do this instead. It is skipped while anything in this process is
-    /// still reading the same subscriber and topic — it has to be, or a second subscription would reset the
-    /// deliveries the first one's handlers are working on — so a subscription closed with work in its hands
-    /// next to a sibling that stays open leaves that work in flight in the file with nobody holding it, and
-    /// nothing would offer it again until every instance had closed. In a host that keeps running, that is
-    /// indefinite. What this instance holds is known exactly here, so it hands it back itself.
+    /// Recovery at the next open cannot do this work. Recovery is skipped while another reader in this process
+    /// reads the same subscriber and topic. The skip is necessary, because otherwise a second subscription
+    /// would reset deliveries that handlers of the first one work on. A subscription can close with work in
+    /// hand next to an open sibling. That work then stays in flight in the file with no holder. Nothing offers
+    /// it again until each instance has closed. In a host that keeps running, that wait has no end. This
+    /// instance knows what it holds, so it hands that back itself.
     /// </para>
     /// <para>
-    /// The attempt count stays where it is, exactly as recovery leaves it, and a failure to write is not
-    /// swallowed: a release that did not happen is the same stranding by a quieter route.
+    /// The attempt count does not change, the same as after recovery. A write failure goes to the caller. A
+    /// release that did not happen strands the delivery in the same way, with less sign of it.
     /// </para>
     /// <para>
-    /// It runs on a sealed and quiet subscription, which is what makes one pass enough. Reading this
-    /// dictionary while claims and settles are still moving through it is reading a snapshot rather than a
-    /// list: a claim reaches the file before its tag arrives here, and a settle takes its tag out for the
-    /// length of its write. Both were being missed, and a delivery this instance is holding that nobody hands
-    /// back is one no other instance may touch either — recovery is skipped while a sibling on the same
-    /// subscriber and topic is open, which is precisely the case that makes the strand indefinite.
+    /// This method runs on a sealed and quiet subscription, so one pass is enough. While claims and settles
+    /// still move through this dictionary, a read of it gives a snapshot that can be incomplete. A claim
+    /// reaches the file before its tag arrives here. A settle removes its tag for the length of its write.
+    /// Earlier reads missed both cases. No other instance can touch a delivery that this instance holds, so a
+    /// delivery that nobody hands back is stranded. Recovery is skipped while a sibling on the same subscriber
+    /// and topic is open. That case makes the strand last with no end.
     /// </para>
     /// </remarks>
     private async ValueTask ReleaseOutstandingAsync()
     {
-        // Taken whole, under the lock a settle takes to claim one, so that this and a handler settling at the
-        // same moment cannot both act on a delivery and cannot both miss one. Emptying the dictionary here is
-        // also what makes a settle arriving afterwards say "already settled", which is the true answer: this
-        // is about to hand the delivery back.
+        // Take the whole list under the lock that a settle takes to claim one delivery. Then this method and a
+        // concurrent settle cannot both act on a delivery or both miss one. After the clear, a later
+        // settle gets Held.No. Its message names the hand-back by the close as one of its causes.
         List<DeliveryTag> holding;
         lock (_gate)
         {

@@ -1,25 +1,30 @@
 namespace SoEx.Messaging.Chimera;
 
 /// <summary>
-/// One delivered message. The same shape whatever it was read from — the log, the scheduled table, or a
-/// set-aside row that was replayed — because consuming code has no reason to care which.
+/// One delivered message.
 /// </summary>
+/// <remarks>
+/// The envelope has the same shape for each source: the log, the scheduled table, or a replayed set-aside row.
+/// Consumer code thus has no need to know the source.
+/// </remarks>
 /// <param name="MessageId">
-/// Opaque, stable and unique across sources. Use this to identify a message; do not use <see cref="Sequence"/>,
-/// which comes from three different number spaces and only looks orderable.
+/// The identifier of the message. It is opaque, stable and unique across all sources. Use it to identify a
+/// message. Do not use <see cref="Sequence"/> for this. A sequence comes from one of three number spaces, and
+/// its order has no meaning.
 /// </param>
 /// <param name="EnqueuedAt">
-/// When the message was originally published. Stable across deferral and replay, so it gives end-to-end latency.
+/// The time of the original publish. It stays the same after deferral and replay. Use it to measure end-to-end
+/// latency.
 /// </param>
 /// <param name="EligibleAt">
-/// When this delivery became available: append time for a logged message, due time for a scheduled one, replay
-/// time for a set-aside one. Lag is measured against this.
+/// The time when this delivery became available: the append time for a logged message, the due time for a
+/// scheduled message, and the replay time for a set-aside message. Lag is measured from this time.
 /// </param>
-/// <param name="Attempt">Delivery attempt, starting at 1.</param>
-/// <param name="Payload">The message body, exactly as it was published.</param>
+/// <param name="Attempt">The delivery attempt. The first attempt is 1.</param>
+/// <param name="Payload">The message body as it was published.</param>
 /// <param name="Tag">
-/// Names this delivery. Pass the envelope back to settle it; the tag is how the subscription knows which
-/// delivery is being settled.
+/// Identifies this delivery. To settle the delivery, pass the envelope back. The subscription uses the tag to
+/// find the delivery that you settle.
 /// </param>
 public readonly record struct EventEnvelope(
     string MessageId,
@@ -30,26 +35,33 @@ public readonly record struct EventEnvelope(
     DeliveryTag Tag)
 {
     /// <summary>
-    /// The row this delivery came from, for diagnostics and for finding it with an external tool. Sequences
-    /// from different sources are not comparable and carry no ordering guarantee between them, so this is for
-    /// reading in a log line, not for reasoning with.
+    /// The row that this delivery came from. Use it for diagnostics and to find the row with an external tool.
     /// </summary>
+    /// <remarks>
+    /// Sequences from different sources cannot be compared and have no order between them. Write this value in
+    /// a log line. Do not use it in program logic.
+    /// </remarks>
     public long Sequence => Tag.Id;
 }
 
 /// <summary>
-/// Identifies one delivery to the subscription that produced it. Opaque on purpose: it names a row in a
-/// particular table, which is the subscription's business and nobody else's. Hold it, hand it back, and do not
-/// try to read it — a handler that branches on where a message came from is one that will behave differently
-/// after a move to a real broker.
+/// Identifies one delivery to the subscription that produced it. The tag is opaque by design.
 /// </summary>
 /// <remarks>
-/// A delivery, not a message. The attempt is part of it because a message that fails is handed out again, and
-/// a tag naming only the row would be the same tag for both deliveries: a stale settle of the first one would
-/// then be accepted and would settle the second out from under the handler working on it, whose own settle was
-/// refused for a mistake it had not made. Service Bus draws the same line with its lock token. The attempt is
-/// unique per delivery within a store's lifetime — claiming a row is what increments it — so the two are
-/// distinguishable wherever they are compared.
+/// <para>
+/// The tag names a row in a specific table. Only the subscription uses that information. Keep the tag and give
+/// it back. Do not read it. A handler that branches on the source of a message will behave differently after a
+/// move to a network broker.
+/// </para>
+/// <para>
+/// A tag identifies a delivery. A failed message is delivered again, so one message can have more than one
+/// delivery. Thus the tag includes the attempt. If the tag named only the row, both deliveries would have the
+/// same tag. A stale settle of the first delivery would then succeed. It would settle the second delivery while
+/// a handler works on it. The settle from that handler would then fail for an error that the handler did not
+/// make. The Service Bus lock token makes the same distinction. The attempt is unique for each delivery during
+/// the lifetime of a store, because each claim of a row increments it. Thus two deliveries always have
+/// different tags.
+/// </para>
 /// </remarks>
 public readonly record struct DeliveryTag
 {
@@ -67,7 +79,7 @@ public readonly record struct DeliveryTag
     internal int Attempt { get; }
 }
 
-/// <summary>Which table a delivery came from. Plumbing, deliberately not part of the public surface.</summary>
+/// <summary>The table that a delivery came from. This type is internal plumbing by design.</summary>
 internal enum EntrySource
 {
     Log = 0,
